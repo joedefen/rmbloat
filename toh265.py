@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from datetime import timedelta
 import send2trash
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
-
+# pylint: disable=no-else-return
 
 class Converter:
     """ TBD """
@@ -144,7 +144,7 @@ class Converter:
 
         # 3. Check Bitrate (with tolerance)
         bitrate_ok = bool(bitrate <= self.MAX_BITRATE_KBPS)
-        
+
         summary = f'  {width}x{height} {codec} {bitrate:.0f} kbps {size}'
 
         if res_ok and bitrate_ok:
@@ -275,20 +275,20 @@ class Converter:
         """
         if size_bytes is None:
             return "0 Bytes"
-        
+
         if size_bytes == 0:
             return "0 Bytes"
-        
+
         # Define the unit list (using 1024 for base-2, which is standard for file sizes)
         size_names = ("Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-        
+
         # Use a loop to find the appropriate unit index (i)
         i = 0
         size = size_bytes
         while size >= 1024 and i < len(size_names) - 1:
             size /= 1024
             i += 1
-        
+
         # Format the number, keeping two decimal places if it's not the 'Bytes' unit
         if i == 0:
             return f"{size_bytes} {size_names[i]}"
@@ -305,10 +305,10 @@ class Converter:
         try:
             # Get the size in bytes
             size_bytes = os.path.getsize(filepath)
-            
+
             # Convert bytes to human-readable format
             return Converter.human_readable_size(size_bytes)
-            
+
         except FileNotFoundError:
             return f"Error: File not found at '{filepath}'"
         except Exception as e:
@@ -339,56 +339,58 @@ class Converter:
         # The file meets all criteria
         return True
 
-    def standard_name(self, filename: str) -> str:
+    def standard_name(self, filename: str, height: int) -> str:
         """
         Replaces common H.264/AVC/Xvid/DivX codec strings in a filename
         with 'x265' or 'X265', preserving the original case where possible.
-
-        Args:
-            filename: The original filename string.
-
-        Returns:
-            The filename string with standardized codec strings.
+        Also change the height indicator if not in agreement with actual.
+        Returns: Whether changed and filename string with x265 codec.
         """
 
-        # 1. Define the codec strings to be replaced, grouped by standard.
-        # Note: We are ignoring 'mp4 mobile', 'full-bluray', etc., as those
-        # are descriptive tags, not the codec identifiers themselves.
-
+        new_filename = filename
         # Regular expressions for the codecs to be replaced.
         # The groups will capture the exact string for case-checking later.
-        codec_patterns = [
-            # H.264/AVC family
-            r'(x\.?264)',
-            r'(h\.?264)',
-            r'(avc)',
-            # Xvid/DivX family (MPEG-4 Part 2)
-            r'(xvid)',
-            r'(divx)',
-        ]
+        pattern = r'\b([xh]\.?264|avc|xvid|divx)\b'
+        regex = re.compile(pattern, re.IGNORECASE)
+        end = 0
+        while True:
+            match = re.search(regex, new_filename[end:])
+            if not match:
+                break
+            sub = 'X265' if match.group(1).isupper() else 'x265'
+            start, end = match.span(1)
+            new_filename = new_filename[:start] + sub + new_filename[end:]
 
-        new_filename = filename
+        pattern = r'\b(\d+[pi]|UHD|4K|2160p|1440p|2K|8K)\b'
+        regex = re.compile(pattern, re.IGNORECASE)
+        height_str = f'{height}p' # e.g., '1080p'
 
-        # 2. Iterate through each pattern and perform a case-sensitive replacement.
-        for pattern in codec_patterns:
-            # Compile the regex to perform case-insensitive search (re.IGNORECASE)
-            # while still capturing the exact matched string.
-            # We also need to search for word boundaries (\b) to avoid replacing
-            # parts of other words (e.g., 'avc' in 'save_camera').
-            regex = re.compile(r'\b' + pattern + r'\b', re.IGNORECASE)
-            
-            while True:
-                match = re.search(regex, new_filename)
-                if not match:
-                    break
-                sub = 'X265' if match.string.isupper() else 'x265'
-                new_filename = new_filename[:match.start()] + sub + new_filename[match.end():]
+        end = 0
+        while True:
+            match = re.search(regex, new_filename[end:])
+            if not match:
+                break
+            matched_group = match.group(1) # The matched string (e.g., '4K' or '720i')
+            start, end = match.span(1)
+
+            if matched_group.lower().endswith(('k', 'hd')):
+                # For '4K', 'UHD', etc. you can't rely on 'height_str' being correct, 
+                # so you must manually format the replacement based on the original's case.
+                is_upper = matched_group.isupper() # Check if '4K' was '4K' or '4k'
+                # The canonical replacement should be f'{height}p'
+                sub = height_str.upper() if is_upper else height_str
+            else:
+                # Standard p/i resolution match (e.g., '720p', '1080i')
+                sub = height_str.upper() if matched_group.isupper() else height_str
+
+            new_filename = new_filename[:start] + sub + new_filename[end:]
+
 
         # nail down extension
         different = bool(new_filename != filename)
         base, _ = os.path.splitext(new_filename)
         new_filename = base + '.mkv'
-        
+
         if self.opts.debug:
             print(f'standard_name: {different=} {new_filename=})')
 
@@ -466,7 +468,6 @@ class Converter:
                     # Catch other unexpected errors
                     print(f"  An unexpected error occurred with '{full_old_path}': {e}")
 
-
     def process_one_file(self, input_file):
         """ Handle just one """
         dry_run = self.opts.dry_run
@@ -479,6 +480,14 @@ class Converter:
         if not self.probe:
             print("SKIP: did not get probe metadata")
             return
+        # --- File names for the safe replacement process ---
+        do_rename, standard_name = self.standard_name(input_file, self.probe.height)
+        
+        if self.opts.rename_only:
+            if do_rename:
+                would = 'WOULD ' if dry_run else ''
+                self.bulk_rename(input_file, standard_name)
+            return
 
         # 1. Quality Check
         if self.already_converted():
@@ -486,8 +495,6 @@ class Converter:
         if self.opts.info_only:
             return
 
-        # --- File names for the safe replacement process ---
-        do_rename, standard_name = self.standard_name(input_file)
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
         temp_file = f"TEMP.{standard_name}"
         orig_backup_file = f"ORIG.{input_file}"
@@ -495,7 +502,7 @@ class Converter:
         # 2. Get total video duration for ETA calculation
         duration = self.probe.duration
         if duration == 0.0:
-            print(f"WARNING: Could not determine video duration. Progress monitor will only show elapsed time.")
+            print("WARNING: Cannot determine video duration. Progress monitor will only show elapsed time.")
 
         # 3. Transcode with monitored progress
         success = self.monitor_transcode_progress(input_file, temp_file, duration)
@@ -583,6 +590,8 @@ def main(args=None):
                 help='Perform a trial run with no changes made.')
     parser.add_argument('-f', '--force', action='store_true',
                 help='Force the operation to proceed.')
+    parser.add_argument('-r', '--rename-only', action='store_true',
+                help='just look for re-names')
     parser.add_argument('-D', '--debug', action='store_true',
                 help='Enable debug output.')
     parser.add_argument('files', nargs='*',
