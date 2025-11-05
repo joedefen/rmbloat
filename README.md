@@ -14,7 +14,7 @@ The project in python:
 * showing the complete list of video files in a curses "window" with those chosen to run automatically checked and have the ability to change what is checked
 * it would show the resolution, the kbps, file size, and codec for each,
 * it would then a GO command which would spawn the conversions in the background up to some number of jobs, showing status on each, allow aborting jobs not done
-* it would automatically scrolling if needed to show the eldest job running, and, of course, job status as percent done, ETA, etc.
+* it would automatically scroll if needed to show the eldest job running, and, of course, job status as percent done, ETA, etc.
 * it would have a .json file (in its config directory) that has the last set of criteria which can be changed in the gui
 
 

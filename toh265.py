@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 from datetime import timedelta
 import send2trash
+from console_window import ConsoleWindow, OptionSpinner
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return
 
@@ -115,7 +116,7 @@ class Converter:
             print(f"An unexpected error occurred: {e}")
             return None
 
-    def already_converted(self):
+    def already_converted(self, probe, video_file):
         """
         Checks if a video file already meets the updated conversion criteria:
         1. Resolution is at least TARGET_WIDTH x TARGET_HEIGHT.
@@ -129,11 +130,11 @@ class Converter:
             bool: True if the file meets all criteria, False otherwise.
         """
         # shorthand
-        width = self.probe.width
-        height = self.probe.height
-        codec = self.probe.codec
-        bitrate = self.probe.bitrate
-        size = self.probe.size
+        width = probe.width
+        height = probe.height
+        codec = probe.codec
+        bitrate = probe.bitrate
+        size = probe.size
 
         # 1. Check Resolution
         # Assuming resolution check is 'at least' the target
@@ -146,14 +147,23 @@ class Converter:
         bitrate_ok = bool(bitrate <= self.MAX_BITRATE_KBPS)
 
         summary = f'  {width}x{height} {codec} {bitrate:.0f} kbps {size}'
+        ns = SimpleNamespace(doit='', summary=summary, filepath=video_file)
+        self.videos.append(ns)
 
         if res_ok and bitrate_ok:
-            print(f'     ok: {summary}')
+            if self.opts.window_mode:
+                ns.doit = 'ok'
+            else:
+                print(f'     ok: {summary}')
             return True
         else:
             why = '' if res_ok else f'>{self.TARGET_HEIGHT}p '
             why += '' if bitrate_ok else f'>{self.MAX_BITRATE_KBPS} kbps'
-            print(f'CONVERT: {summary}: {why}')
+            if self.opts.window_mode:
+                ns.doit = 'CONVERT'
+                ns.summary += f' [{why}]'
+            else:
+                print(f'CONVERT: {ns.summary}')
             return False
 
     def monitor_transcode_progress(self, input_file, temp_file, duration_seconds):
@@ -324,7 +334,7 @@ class Converter:
 
         # 1. Check for prefixes to skip
         if filename.startswith(self.SKIP_PREFIXES):
-            print(f"Skipping '{filename}': Starts with a forbidden prefix.")
+            # print(f"Skipping '{filename}': Starts with a forbidden prefix.")
             return False
 
         # Get the file extension and convert to lowercase for case-insensitive check
@@ -333,7 +343,7 @@ class Converter:
 
         # 2. Check if the extension is a recognized video format
         if ext.lower() not in self.VIDEO_EXTENSIONS:
-            print(f"Skipping '{filename}': Not a recognized video file extension ('{ext.lower()}').")
+            # print(f"Skipping '{filename}': Not a recognized video file extension ('{ext.lower()}').")
             return False
 
         # The file meets all criteria
@@ -468,20 +478,18 @@ class Converter:
                     # Catch other unexpected errors
                     print(f"  An unexpected error occurred with '{full_old_path}': {e}")
 
-    def process_one_file(self, input_file):
+    def process_one_file(self, ns):
         """ Handle just one """
+        input_file = ns.video_file
         dry_run = self.opts.dry_run
         if not self.is_valid_video_file(input_file):
             return  # Skip to the next file in the loop
-        print("\n" + "=" * 80)
-        print(f"{input_file}")
+        if not self.opts.window_mode:
+            print("\n" + "=" * 80)
+            print(f"{input_file}")
 
-        self.probe = self.get_video_metadata(input_file)
-        if not self.probe:
-            print("SKIP: did not get probe metadata")
-            return
         # --- File names for the safe replacement process ---
-        do_rename, standard_name = self.standard_name(input_file, self.probe.height)
+        do_rename, standard_name = self.standard_name(input_file, ns.probe.height)
         
         if self.opts.rename_only:
             if do_rename:
@@ -490,9 +498,11 @@ class Converter:
             return
 
         # 1. Quality Check
-        if self.already_converted():
+        if self.already_converted(ns.probe, input_file):
             return
         if self.opts.info_only:
+            return
+        if self.opts.window_mode:
             return
 
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
@@ -500,7 +510,7 @@ class Converter:
         orig_backup_file = f"ORIG.{input_file}"
 
         # 2. Get total video duration for ETA calculation
-        duration = self.probe.duration
+        duration = ns.probe.duration
         if duration == 0.0:
             print("WARNING: Cannot determine video duration. Progress monitor will only show elapsed time.")
 
@@ -540,15 +550,177 @@ class Converter:
                 os.remove(temp_file)
                 print(f"FFmpeg failed. Deleted incomplete {temp_file}.")
 
+    def create_video_file_list(self):
+        video_files_out = []
+        enqueued_paths = set() 
+        
+        # 1. Gather all unique, absolute paths from arguments and stdin
+        paths_from_args = []
+        
+        for file_arg in self.opts.files:
+            if file_arg == "-":
+                # Handle STDIN
+                paths_from_args.extend(sys.stdin.read().splitlines())
+            else:
+                # Convert to absolute path immediately
+                abs_path = os.path.abspath(file_arg)
+                if abs_path not in enqueued_paths:
+                    paths_from_args.append(abs_path)
+                    enqueued_paths.add(abs_path)
+
+        # 2. Separate into directories and individual files, and sort for processing order
+        directories = []
+        immediate_files = []
+        
+        for path in paths_from_args:
+            # Ignore empty lines from stdin
+            if not path:
+                continue
+                
+            if os.path.isdir(path):
+                directories.append(path)
+            else:
+                immediate_files.append(path)
+
+        # Sort the list of directories to be processed (case-insensitively)
+        directories.sort(key=str.lower)
+        
+        # Sort the list of individual files (case-insensitively)
+        immediate_files.sort(key=str.lower)
+        
+        # List to hold all file paths in the final desired, grouped, and sorted order
+        paths_to_probe = []
+
+        # 3. Process Directories: Find and group files recursively
+        for dir_path in directories:
+            # This list will hold all valid video files found in the current directory group
+            group_files = [] 
+            
+            # Recursively walk the directory structure
+            for root, dirs, files in os.walk(dir_path):
+                
+                # Sort the directory names before os.walk processes them (case-insensitive)
+                # This ensures predictable traversal order of subdirectories
+                dirs.sort(key=str.lower) 
+                
+                # Sort the files within the current directory (case-insensitive)
+                files.sort(key=str.lower)
+                
+                for file_name in files:
+                    full_path = os.path.join(root, file_name)
+                    
+                    # Check for validity and duplicates
+                    if self.is_valid_video_file(full_path):
+                        if full_path not in enqueued_paths:
+                            group_files.append(full_path)
+                            enqueued_paths.add(full_path)
+                            
+            # Append all grouped and sorted file paths for the current directory
+            paths_to_probe.extend(group_files)
+                
+        # 4. Process Individual Files: Append sorted immediate files
+        paths_to_probe.extend(immediate_files)
+
+        # 5. Final Probing and Progress Indicator 🎬
+        total_files = len(paths_to_probe)
+        probe_count = 0
+        update_interval = 10  # Update the line every 10 probes
+        
+        if total_files > 0:
+            # Print the initial line to start the progress bar
+            sys.stderr.write(f"probing: 0% 0 of {total_files}\r")
+            sys.stderr.flush()
+
+        for video_file_path in paths_to_probe:
+            probe_count += 1
+            
+            probe = self.get_video_metadata(video_file_path)
+            
+            if probe:
+                ns = SimpleNamespace(video_file=video_file_path, probe=probe)
+                video_files_out.append(ns)
+
+            # Update the progress indicator every N probes or on the last file
+            if probe_count % update_interval == 0 or probe_count == total_files:
+                percent = int((probe_count / total_files) * 100)
+                
+                # \r (carriage return) moves the cursor to the start of the line for overwrite
+                sys.stderr.write(f"probing: {percent}% {probe_count} of {total_files}\r")
+                sys.stderr.flush()
+                
+        # Print a final newline character to clean the console after completion
+        if total_files > 0:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+            
+        return video_files_out
+
+    def do_window_mode(self):
+        """ TBD """
+        def make_lines():
+            lines = []
+            wid1 = len('CONVERT')
+            wid2 = 0
+            for ns in self.videos:
+                wid2 = max(wid2, len(ns.summary))
+
+            for ns in self.videos:
+                basename = os.path.basename(ns.filepath)
+                dirname = os.path.dirname(ns.filepath)
+                line = f'{ns.doit:>{wid1}}  {ns.summary:<{wid2}}  {basename} ON {dirname}'
+                lines.append(line)
+                # print(line)
+            return lines
+
+        spin = OptionSpinner()
+        spin.add_key('set_all', 's - set all to "CONVERT"', vals=[False, True])
+        spin.add_key('reset_all', 'r - reset all to "ok"', vals=[False, True])
+        spin.add_key('init_all', 'i,SP - set all initial state', vals=[False, True])
+        spin.add_key('toggle', 't - toggle current line state', vals=[False, True])
+        spin.add_key('quit', 'q - exit the program', vals=[False, True])
+        others={ord(' '), }
+        vals = spin.default_obj
+
+        win = ConsoleWindow(keys=spin.keys^others)
+
+        win.set_pick_mode(True, 1)
+
+        while True:
+            win.add_header('[s]etAll [r]setAll [i]nit SPACE:toggle [G]o [q]uit')
+            lines = make_lines()
+            for line in lines:
+                win.add_body(line)
+            win.render()
+            key = win.prompt(seconds=0.5) # Wait for half a second or a keypress
+            if key in spin.keys:
+                spin.do_key(key, win)
+            if vals.set_all:
+                for ns in self.videos:
+                    ns.doit = 'CONVERT'
+                vals.set_all = False
+            if vals.reset_all:
+                for ns in self.videos:
+                    ns.doit = 'ok'
+                self.reset_all = False
+            if vals.init_all:
+                for ns in self.videos:
+                    ns.doit = 'CONVERT' if '[' in ns.summary else 'ok'
+                self.init_all = False
+            if vals.toggle:
+                idx = win.pick_pos
+                if 0 <= idx < len(self.videos):
+                    ns = self.videos[idx]
+                    ns.doit = 'CONVERT' if ns.doit == 'ok' else 'ok'
+                    vals.toggle = False
+            if vals.quit:
+                sys.exit(0)
+
+            win.clear()
+
     def main_loop(self):
         """ TBD """
         # sys.argv is the list of command-line arguments. sys.argv[0] is the script name.
-        video_files = []
-
-        for video_file in self.opts.files:
-            if not self.is_valid_video_file(video_file):
-                continue  # Skip to the next file in the loop
-            video_files.append(video_file)
+        video_files = self.create_video_file_list()
 
         if not video_files:
             print("Usage: toh265 {options} {video_file}...")
@@ -556,7 +728,8 @@ class Converter:
 
         # --- The main loop change is here ---
         original_cwd = os.getcwd()
-        for input_file_path_str in video_files:
+        for ns in video_files:
+            input_file_path_str = ns.video_file
             file_dir, file_basename = os.path.split(input_file_path_str)
             if not file_dir:
                 file_dir = os.path.abspath(os.path.dirname(input_file_path_str))
@@ -564,17 +737,19 @@ class Converter:
             # Use a try...finally block to ensure you always change back.
             try:
                 os.chdir(file_dir)
-                self.process_one_file(file_basename)
+                self.process_one_file(ns)
 
             except Exception as e:
                 print(f"An error occurred while processing {file_basename}: {e}")
             finally:
                 os.chdir(original_cwd)
+        if self.opts.window_mode:
+            self.do_window_mode()
 
 
     def __init__(self, opts):
         self.opts = opts
-        self.probe = None
+        self.videos = []
 
 def main(args=None):
     """
@@ -592,11 +767,16 @@ def main(args=None):
                 help='Force the operation to proceed.')
     parser.add_argument('-r', '--rename-only', action='store_true',
                 help='just look for re-names')
+    parser.add_argument('-w', '--window-mode', action='store_false',
+                help='just look for re-names')
     parser.add_argument('-D', '--debug', action='store_true',
                 help='Enable debug output.')
     parser.add_argument('files', nargs='*',
         help='Non-option arguments (e.g., file paths or names).')
     opts = parser.parse_args(args)
+
+    if opts.window_mode:
+        opts.dry_run = True
 
     Converter(opts).main_loop()
 
