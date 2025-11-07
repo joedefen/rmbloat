@@ -2,11 +2,13 @@
 """ TBD """
 import sys
 import os
+import math
 import argparse
 import subprocess
 import json
 import re
 import time
+from copy import copy
 from types import SimpleNamespace
 from datetime import timedelta
 import send2trash
@@ -186,7 +188,7 @@ class Converter:
             ns.height = int(video_stream.get('height', 0))
             ns.codec = video_stream.get('codec_name', 'unk_codec')
             ns.bitrate = int(int(metadata["format"].get('bit_rate', 0))/1000) # in KBPS
-            ns.duration = float(metadata["format"].get('duration', 0.0)) # in KBPS
+            ns.duration = float(metadata["format"].get('duration', 0.0)) # in secs
             ns.gb = self.get_file_size_gb(file_path)
 
             return ns
@@ -251,10 +253,11 @@ class Converter:
                              filedir=os.path.dirname(video_file),
                              filebase=os.path.basename(video_file),
                              standard_name=basic_ns.standard_name,
-                             do_rename=basic_ns.do_rename, probe=basic_ns.probe)
+                             do_rename=basic_ns.do_rename, probe=basic_ns.probe,
+                             texts=[])
         self.videos.append(ns)
 
-        if res_ok and bitrate_ok:
+        if (res_ok and bitrate_ok) or ns.filebase.startswith('SAMPLE.'):
             if self.opts.window_mode:
                 ns.doit = '[ ]'
             else:
@@ -271,7 +274,7 @@ class Converter:
                 print(f'CONVERT: {summary}{why}')
             return False
 
-    def monitor_transcode_progress(self, input_file, temp_file, duration_seconds):
+    def monitor_transcode_progress(self, ns, temp_file):
         """
         Runs the FFmpeg transcode command and monitors its output for a non-scrolling display.
         """
@@ -279,14 +282,31 @@ class Converter:
             if string.startswith('0:'):
                 return string[2:]
             return string
+        def duration_spec(secs):
+            secs = int(round(secs))
+            hours = math.floor(secs / 3600)
+            minutes = math.floor((secs % 3600) / 60)
+            secs = secs % 60
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+        pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
+        input_file, duration_seconds = ns.filebase, ns.probe.duration
+
+        if self.opts.sample:
+            start_secs = max(120, duration_seconds)*.20
+            pre_i_opts += [ '-ss', duration_spec(start_secs) ]
+            post_i_opts += [ '-t', '30']
 
         # Define the FFmpeg command
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',                           # Overwrite temp file if exists
+            # '-v', 'error',                  # suppress INFO/WARNINGS
+            * pre_i_opts,
             '-i', input_file,
+            * post_i_opts,
             '-c:v', 'libx265',
-            '-crf', str(self.OUTPUT_CRF),
+            '-crf', str(self.opts.quality),
             '-preset', 'medium',
             # '-preset', 'fast',
             '-c:a', 'copy',
@@ -301,7 +321,7 @@ class Converter:
         else:
             # Start FFmpeg subprocess
             # We pipe stderr to capture progress updates
-            print(f'+ {ffmpeg_cmd}')
+            # print(f'+ {ffmpeg_cmd}')
             process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.DEVNULL,  # Discard normal stdout output
@@ -318,7 +338,7 @@ class Converter:
             for line in process.stderr:
                 match = self.PROGRESS_RE.search(line)
                 if not match:
-                    print(line)
+                    ns.texts.append(line)
 
                 # Check if the line contains progress data and if the update interval has passed
                 if match and (time.time() - last_update_time) >= self.PROGRESS_UPDATE_INTERVAL:
@@ -426,7 +446,7 @@ class Converter:
             size_bytes = os.path.getsize(filepath)
 
             # Convert bytes to human-readable format
-            return round(size_bytes / (1024*1024*1024), 2)
+            return round(size_bytes / (1024*1024*1024), 3)
             # return Converter.human_readable_size(size_bytes)
 
         except FileNotFoundError:
@@ -625,22 +645,18 @@ class Converter:
         os.chdir(ns.filedir)
 
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
-        temp_file = f"TEMP.{ns.standard_name}"
+        prefix = 'SAMPLE' if self.opts.sample else 'TEST'
+        temp_file = f"{prefix}.{ns.standard_name}"
         orig_backup_file = f"ORIG.{ns.filebase}"
 
         if os.path.exists(temp_file):
             os.unlink(temp_file)
 
-        # 2. Get total video duration for ETA calculation
-        duration = ns.probe.duration
-        if duration == 0.0:
-            print("WARNING: Cannot determine video duration. Progress monitor will only show elapsed time.")
-
         # 3. Transcode with monitored progress
-        success = self.monitor_transcode_progress(ns.filebase, temp_file, duration)
+        success = self.monitor_transcode_progress(ns, temp_file)
 
         # 4. Atomic Swap (Safe Replacement)
-        if success:
+        if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
             try:
                 # Rename original to backup
@@ -666,7 +682,7 @@ class Converter:
             except OSError as e:
                 print(f"ERROR during swap of {ns.filepath}: {e}")
                 print(f"Original: {orig_backup_file}, New: {temp_file}. Manual cleanup required.")
-        else:
+        elif not success:
             # Transcoding failed, delete the temporary file
             if os.path.exists(temp_file):
                 os.remove(temp_file)
@@ -789,7 +805,7 @@ class Converter:
                 res = f'{ns.width}x{ns.height}'
                 ht_over = ' ' if ns.res_ok else '^' # '■'
                 br_over = ' ' if ns.bitrate_ok else '^' # '■'
-                line = f'{ns.doit:>3} {res:>9}{ht_over} {ns.bitrate:5}{br_over} {ns.gb:>5}   {basename} ON {dirname}'
+                line = f'{ns.doit:>3} {res:>9}{ht_over} {ns.bitrate:5}{br_over} {ns.gb:>6}   {basename} ON {dirname}'
                 lines.append(line)
                 # print(line)
             return lines
@@ -808,8 +824,8 @@ class Converter:
         win.set_pick_mode(True, 1)
 
         while True:
-            win.add_header('[s]etAll [r]setAll [i]nit SPACE:toggle [G]o [q]uit')
-            win.add_header(f'CVT {"RES":>9}  {"KPBS":>5}  {"GB":>5}   VIDEO')
+            win.add_header('[s]etAll [r]setAll [i]nit SP:toggle [G]o [q]uit')
+            win.add_header(f'CVT {"RES":>9}  {"KPBS":>5}  {"GB":>6}   VIDEO')
             lines = make_lines()
             for line in lines:
                 win.add_body(line)
@@ -820,7 +836,8 @@ class Converter:
 
             if vals.set_all:
                 for ns in self.videos:
-                    ns.doit = '[X]'
+                    if not ns.filebase.startswith('SAMPLE.'):
+                        ns.doit = '[X]'
                 vals.set_all = False
 
             if vals.reset_all:
@@ -837,7 +854,8 @@ class Converter:
                 idx = win.pick_pos
                 if 0 <= idx < len(self.videos):
                     ns = self.videos[idx]
-                    ns.doit = '[X]' if ns.doit == '[ ]' else '[ ]'
+                    if not ns.filebase.startswith('SAMPLE.'):
+                        ns.doit = '[X]' if ns.doit == '[ ]' else '[ ]'
                     vals.toggle = False
                     win.pick_pos += 1
 
@@ -852,7 +870,7 @@ class Converter:
         
         for ns in self.videos:
             if 'X' in ns.doit:
-                print(f'Would DoIt:  {ns.filepath} {ns.standard_name}')
+                print(f'>>> {ns.filebase}')
                 self.convert_one_file(ns)
 
     def main_loop(self):
@@ -888,6 +906,8 @@ class Converter:
         self.opts = opts
         self.videos = []
         self.original_cwd = os.getcwd()
+        self.ff_pre_i_opts = []
+        self.ff_post_i_opts = []
 
 def main(args=None):
     """
@@ -905,13 +925,19 @@ def main(args=None):
                 help='Force the operation to proceed.')
     parser.add_argument('-r', '--rename-only', action='store_true',
                 help='just look for re-names')
+    parser.add_argument('-s', '--sample', action='store_false',
+                help='produce 30s samples called SAMPLE.{input-file}')
     parser.add_argument('-w', '--window-mode', action='store_false',
                 help='just look for re-names')
+    parser.add_argument('-q', '--quality', default=23,
+                help='output quality (CRF) [dflt=23]')
     parser.add_argument('-D', '--debug', action='store_true',
                 help='Enable debug output.')
     parser.add_argument('files', nargs='*',
         help='Non-option arguments (e.g., file paths or names).')
     opts = parser.parse_args(args)
+    if opts.sample:
+        opts.dry_run = False
 
     Converter(opts).main_loop()
 
