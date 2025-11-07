@@ -8,6 +8,8 @@ import subprocess
 import json
 import re
 import time
+import fcntl
+from typing import Optional, Union
 from copy import copy
 from types import SimpleNamespace
 from datetime import timedelta
@@ -112,6 +114,192 @@ from console_window import ConsoleWindow, OptionSpinner
 ###     # Target value {CRF_VALUE_AGGRESSIVE} for aggressive (low bitrate) compression.
 ###     QUALITY_ARG = ['-crf', str(CRF_VALUE_AGGRESSIVE)]
 
+class FfmpegMon:
+    """
+    Monitors an FFmpeg subprocess non-blockingly.
+
+    Provides a clean .start() and .poll() interface for use in a
+    single-threaded interactive loop (like a curses application).
+    """
+
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self.partial_line: bytes = b""
+        self.output_queue: list[str] = []  # <--- NEW: Queue for complete lines
+        self.return_code: Optional[int] = None
+
+    def start(self, command_line: list[str]) -> None:
+        """
+        Starts the FFmpeg subprocess.
+        
+        Args:
+            command_line: The full FFmpeg command as a list of strings.
+        """
+        if self.process:
+            raise RuntimeError("FfmpegMon is already monitoring a process.")
+
+        try:
+            # Start the process, piping stderr for progress updates
+            self.process = subprocess.Popen(
+                command_line,
+                stdout=subprocess.DEVNULL,  # Discard normal output
+                stderr=subprocess.PIPE,     # Capture progress messages
+                text=False,                  # Read output as text
+                bufsize=0
+            )
+            
+            # --- CRITICAL: Make stderr non-blocking ---
+            # Get the file descriptor number for the stderr pipe
+            fd = self.process.stderr.fileno()
+            # Get the current flags
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            # Set the O_NONBLOCK flag
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            
+        except Exception as e:
+            # Handle common errors like 'ffmpeg' not found
+            print(f"Error starting FFmpeg process: {e}")
+            self.return_code = 127
+            
+    def poll(self) -> Union[Optional[int], str]:
+        """
+        Reads and processes data. Returns the next item from the internal queue
+        (string output) or the final return code (integer).
+        """
+        # --- Stage 0: Process Queue First ---
+        if self.output_queue:
+            return self.output_queue.pop(0)
+
+        if not self.process:
+            return self.return_code
+
+        # Check for termination status, but don't act on it yet.
+        process_status = self.process.poll()
+
+        # 1. Read available data non-blockingly
+        try:
+            chunk = self.process.stderr.read()
+        except (IOError, OSError):
+            chunk = b""
+        
+        # 2. Process NEW DATA
+        if chunk:
+            # Append the new chunk to the existing buffer
+            data = self.partial_line + chunk
+            
+            # Split by the byte newline character
+            lines = data.split(b'\n')
+            
+            # The last element is the new partial line; the rest are complete lines
+            self.partial_line = lines[-1]
+            
+            # Put all complete lines onto the output queue
+            for line_bytes in lines[:-1]:
+                line_str = line_bytes.decode('utf-8', errors='ignore').lstrip('\r')
+                self.output_queue.append(line_str)
+                
+            # --- PROGRESS LINE LOGIC (if no newline was found) ---
+            # If we received new data but didn't find any newlines, it's likely a progress update.
+            # We treat the accumulated partial_line as the progress line.
+            if not self.output_queue and self.partial_line:
+                # Return the progress line and clear the partial_line buffer.
+                output_to_caller = self.partial_line.decode('utf-8', errors='ignore').lstrip('\r')
+                self.partial_line = b"" # Assume the caller consumes this progress line
+                return output_to_caller
+
+        # --- Stage 3: Handle Termination (Last resort) ---
+        if process_status is not None:
+            # The process is done. Process any remaining data in partial_line.
+            if self.partial_line:
+                # The remaining partial line is the final output/error.
+                final_output = self.partial_line.decode('utf-8', errors='ignore').lstrip('\r')
+                self.partial_line = b"" # Buffer consumed
+                self.output_queue.append(final_output) # Add the final line to the queue
+            
+            # If the queue now has items, return the first one.
+            if self.output_queue:
+                 self.return_code = process_status # Store code for *after* the queue is empty
+                 return self.output_queue.pop(0)
+            
+            # If the queue is empty, we return the final code.
+            self.return_code = process_status
+            self.process = None
+            return self.return_code
+
+        # --- Stage 4: Final Check ---
+        # If running and the queue is still empty after the read attempt:
+        if self.output_queue:
+            return self.output_queue.pop(0)
+
+        return None
+            
+    
+    def _read_remaining(self):
+        """
+        Helper to read any final buffered output after termination.
+        """
+        # Read all remaining output
+        try:
+            remaining_data = self.process.stderr.read()
+            self.partial_line += remaining_data
+        except (IOError, OSError):
+            pass # Ignore if stream is already closed or empty
+            
+        # Check if the final output contains a full line we missed
+        if self.partial_line:
+            # This logic is a bit simple, but assumes the final chunk is mostly an error message.
+            # You may want to store this in a separate error buffer for later dump.
+            # For now, we'll just discard it if it's not a complete line.
+            pass
+            
+    def stop(self):
+        """
+        Terminates the subprocess if it is still running.
+        """
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=5) # Wait for it to die gracefully
+        self.process = None
+        self.partial_line = ""
+        self.return_code = None
+
+    def __del__(self):
+        """Ensure the subprocess is terminated when the object is destroyed."""
+        self.stop()
+
+# --- Example Usage in Your Curses Loop ---
+
+# # ... (Setup your FFmpeg command line) ...
+# ffmpeg_cmd = [
+#     'ffmpeg', '-i', 'input.mp4', '-c:v', 'libx265', '-crf', '30', 'output.mp4'
+# ]
+# 
+# monitor = FfmpegMon()
+# monitor.start(ffmpeg_cmd)
+# 
+# while True:
+#     # 1. Poll the process
+#     status = monitor.poll()
+# 
+#     # 2. Handle the status
+#     if isinstance(status, int):
+#         # Process is done. Handle success/failure based on the return code.
+#         # print(f"FFmpeg finished with code: {status}")
+#         break
+#     elif isinstance(status, str):
+#         # New progress line received!
+#         # progress_line = status 
+#         # Match your PROGRESS_RE and update your curses window here
+#         pass 
+#     elif status is None:
+#         # No new line. Use this time to handle user input (getch()), 
+#         # update your UI's clock, or refresh the screen to prevent flickering.
+#         # time.sleep(0.01)
+#         pass
+# 
+#     # CRITICAL: Sleep briefly to prevent a busy-loop from consuming CPU
+#     time.sleep(0.01)
+
 class Converter:
     """ TBD """
     # --- Conversion Criteria Constants (Customize these) ---
@@ -140,6 +328,15 @@ class Converter:
     }
     # Prefixes to skip (case-sensitive as requested)
     SKIP_PREFIXES = ('TEMP.', 'ORIG.')
+    sample_seconds = 30
+
+    def __init__(self, opts):
+        self.opts = opts
+        self.videos = []
+        self.original_cwd = os.getcwd()
+        self.ff_pre_i_opts = []
+        self.ff_post_i_opts = []
+        self.ffsubproc = FfmpegMon()
 
     def get_video_metadata(self, file_path):
         """
@@ -291,11 +488,13 @@ class Converter:
 
         pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
         input_file, duration_seconds = ns.filebase, ns.probe.duration
+        if self.opts.sample:
+            duration_seconds = self.sample_seconds
 
         if self.opts.sample:
             start_secs = max(120, duration_seconds)*.20
             pre_i_opts += [ '-ss', duration_spec(start_secs) ]
-            post_i_opts += [ '-t', '30']
+            post_i_opts += [ '-t', str(self.sample_seconds)]
 
         # Define the FFmpeg command
         ffmpeg_cmd = [
@@ -316,32 +515,36 @@ class Converter:
         ]
         # The libx265 software encoding command
         start_time = time.time()
+
         if self.opts.dry_run:
             print(f"SKIP RUNNING {ffmpeg_cmd}\n")
         else:
-            # Start FFmpeg subprocess
-            # We pipe stderr to capture progress updates
-            # print(f'+ {ffmpeg_cmd}')
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.DEVNULL,  # Discard normal stdout output
-                stderr=subprocess.PIPE,     # Capture progress messages from stderr
-                text=True,                  # Read output as text (string)
-                bufsize=1
-            )
+            self.ffsubproc.start(ffmpeg_cmd)
 
             last_update_time = start_time
             total_duration_formatted = trim0(str(timedelta(seconds=int(duration_seconds))))
+            return_code = 0
 
             # --- Progress Monitoring Loop ---
             # Read stderr line-by-line until the process finishes
-            for line in process.stderr:
-                match = self.PROGRESS_RE.search(line)
-                if not match:
-                    ns.texts.append(line)
+            skip_sleep = False
+            while True:
+                if not skip_sleep:
+                    time.sleep(0.1)
+                    skip_sleep = False
 
-                # Check if the line contains progress data and if the update interval has passed
-                if match and (time.time() - last_update_time) >= self.PROGRESS_UPDATE_INTERVAL:
+                got = self.ffsubproc.poll()
+                if isinstance(got, str):
+                    skip_sleep = True
+                    line = got
+                    match = self.PROGRESS_RE.search(line)
+                    if not match:
+                        ns.texts.append(line)
+                        continue
+
+                    # Check if the line contains progress data and if the update interval has passed
+                    if time.time() - last_update_time <= self.PROGRESS_UPDATE_INTERVAL:
+                        continue
 
                     # 1. Extract values from the regex match
                     try:
@@ -360,7 +563,7 @@ class Converter:
 
                     elapsed_time_sec = int(time.time() - start_time)
 
-                    # 2. Calculate remaining time
+                        # 2. Calculate remaining time
                     if duration_seconds > 0:
                         percent_complete = (time_encoded_seconds / duration_seconds) * 100
 
@@ -389,14 +592,14 @@ class Converter:
                     # 4. Print and reset timer
                     print(progress_line, end='', flush=True)
                     last_update_time = time.time()
-
-            # Wait for the process to truly finish and get the return code
-            process.wait()
+                elif isinstance(got, int):
+                    return_code = got
+                    break
 
             # Clear the progress line and print final status
             print('\r' + ' ' * 120, end='', flush=True) # Overwrite last line with spaces
 
-        if self.opts.dry_run or process.returncode == 0:
+        if self.opts.dry_run or return_code == 0:
             print(f"\r{input_file}: Transcoding FINISHED (Elapsed: {timedelta(seconds=int(time.time() - start_time))})")
             return True # Success
         else:
@@ -902,12 +1105,6 @@ class Converter:
             self.do_window_mode()
 
 
-    def __init__(self, opts):
-        self.opts = opts
-        self.videos = []
-        self.original_cwd = os.getcwd()
-        self.ff_pre_i_opts = []
-        self.ff_post_i_opts = []
 
 def main(args=None):
     """
