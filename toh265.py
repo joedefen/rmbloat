@@ -6,10 +6,12 @@ import os
 import math
 import argparse
 import subprocess
+import traceback
 import json
 import re
 import time
 import fcntl
+from textwrap import indent
 from typing import Optional, Union
 from copy import copy
 from types import SimpleNamespace
@@ -272,10 +274,11 @@ class FfmpegMon:
 
 class Job: # class FfmpegJob:
     """ TBD """
-    def __init__(self, input_file, orig_backup_file, temp_file, duration_secs):
+    def __init__(self, ns, orig_backup_file, temp_file, duration_secs):
+        self.ns = ns
         self.start_time=time.time()
         self.progress='Started'
-        self.input_file = input_file
+        self.input_file = ns.filebase
         self.orig_backup_file=orig_backup_file
         self.temp_file=temp_file
         self.duration_secs=duration_secs
@@ -362,13 +365,19 @@ class Converter:
     # Prefixes to skip (case-sensitive as requested)
     SKIP_PREFIXES = ('TEMP.', 'ORIG.')
     sample_seconds = 30
+    singleton = None
 
     def __init__(self, opts):
+        assert Converter.singleton is None
+        Converter.singleton = self
         self.opts = opts
         self.videos = []
         self.original_cwd = os.getcwd()
         self.ff_pre_i_opts = []
         self.ff_post_i_opts = []
+        self.state = 'probe' # 'select', 'convert'
+        self.job = None
+        self.win = None
 
     def get_video_metadata(self, file_path):
         """
@@ -483,7 +492,7 @@ class Converter:
                              filebase=os.path.basename(video_file),
                              standard_name=basic_ns.standard_name,
                              do_rename=basic_ns.do_rename, probe=basic_ns.probe,
-                             texts=[])
+                             return_code=None, texts=[])
         self.videos.append(ns)
 
         if (res_ok and bitrate_ok) or ns.filebase.startswith('SAMPLE.'):
@@ -509,7 +518,7 @@ class Converter:
         os.chdir(ns.filedir)
 
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
-        prefix = 'SAMPLE' if self.opts.sample else 'TEST'
+        prefix = '/tmp/SAMPLE' if self.opts.sample else 'TEST'
         temp_file = f"{prefix}.{ns.standard_name}"
         orig_backup_file = f"ORIG.{ns.filebase}"
 
@@ -519,7 +528,7 @@ class Converter:
         if self.opts.sample:
             duration_secs = self.sample_seconds
 
-        job = Job(ns.filebase, orig_backup_file, temp_file, duration_secs)
+        job = Job(ns, orig_backup_file, temp_file, duration_secs)
         pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
         job.input_file = ns.filebase
 
@@ -551,7 +560,7 @@ class Converter:
             job.ffsubproc.start(ffmpeg_cmd)
         return job
 
-    def monitor_transcode_progress(self, ns, job):
+    def monitor_transcode_progress(self, job):
         """
         Runs the FFmpeg transcode command and monitors its output for a non-scrolling display.
         """
@@ -561,7 +570,7 @@ class Converter:
             while True:
                 time.sleep(0.1)
 
-                got = self.get_job_progress(ns, job)
+                got = self.get_job_progress(job)
 
                     # 4. Print and reset timer
                 if isinstance(got, str):
@@ -583,8 +592,9 @@ class Converter:
             # In a real script, you'd save or display the full error output from stderr here.
             return False
 
-    def get_job_progress(self, ns, job):
+    def get_job_progress(self, job):
         """ TBD """
+        ns = job.ns
         while True:
             got = job.ffsubproc.poll()
             if isinstance(got, str):
@@ -630,13 +640,16 @@ class Converter:
                 # \r at the start makes the console cursor go back to the beginning of the line
                 cur_time_formatted = job.trim0(str(timedelta(seconds=int(time_encoded_seconds))))
                 progress_line = (
-                    f"\r{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} | "
+                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} | "
                     f"{percent_complete:.1f}% | "
                     f"ETA {remaining_time_formatted} | "
                     f"Speed {speed:.1f}x | "
                     f"Time {cur_time_formatted}/{job.total_duration_formatted}"
                 )
                 return progress_line
+            elif isinstance(got, int):
+                ns.return_code = got 
+                return got
             else:
                 return got
 
@@ -877,13 +890,14 @@ class Converter:
 
         # 3. Transcode with monitored progress
         job = self.start_transcode_job(ns)
-        success = self.monitor_transcode_progress(ns, job)
-        self.finish_transcode_job(success, ns, job)
+        success = self.monitor_transcode_progress(job)
+        self.finish_transcode_job(success, job)
 
-    def finish_transcode_job(self, success, ns, job):
+    def finish_transcode_job(self, success, job):
         """ TBD """
         # 4. Atomic Swap (Safe Replacement)
         dry_run = self.opts.dry_run
+        ns = job.ns
         if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
             try:
@@ -906,10 +920,15 @@ class Converter:
 
                 if ns.do_rename:
                     self.bulk_rename(ns.filebase, ns.standard_name)
+                
+                if not dry_run:
+                    ns.probe = self.get_video_metadata(ns.standard_name)
 
             except OSError as e:
                 print(f"ERROR during swap of {ns.filepath}: {e}")
                 print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
+        elif success and self.opts.sample:
+                ns.probe = self.get_video_metadata(job.temp_file)
         elif not success:
             # Transcoding failed, delete the temporary file
             if os.path.exists(job.temp_file):
@@ -1024,10 +1043,12 @@ class Converter:
 
     def do_window_mode(self):
         """ TBD """
-        def make_lines():
-            lines = []
+        def make_lines(doit_skips=None):
+            lines, nses, progress_idx = [], [], 0
 
-            for ns in self.videos:
+            for idx, ns in enumerate(self.videos):
+                if doit_skips and ns.doit in doit_skips:
+                    continue
                 basename = os.path.basename(ns.filepath)
                 dirname = os.path.dirname(ns.filepath)
                 res = f'{ns.width}x{ns.height}'
@@ -1035,8 +1056,13 @@ class Converter:
                 br_over = ' ' if ns.bitrate_ok else '^' # '■'
                 line = f'{ns.doit:>3} {res:>9}{ht_over} {ns.bitrate:5}{br_over} {ns.gb:>6}   {basename} ON {dirname}'
                 lines.append(line)
+                nses.append(ns)
+                if self.job and self.job.ns == ns:
+                    lines.append(f'-----> {self.job.progress}')
+                    progress_idx = 1+idx
+
                 # print(line)
-            return lines
+            return lines, nses, progress_idx
 
         spin = OptionSpinner()
         spin.add_key('set_all', 's - set all to "[X]"', vals=[False, True])
@@ -1047,14 +1073,17 @@ class Converter:
         others={ord(' '), ord('g')}
         vals = spin.default_obj
 
-        win = ConsoleWindow(keys=spin.keys^others)
+        self.win = win = ConsoleWindow(keys=spin.keys^others)
+        self.state = 'select'
 
         win.set_pick_mode(True, 1)
 
         while True:
             win.add_header('[s]etAll [r]setAll [i]nit SP:toggle [G]o [q]uit')
             win.add_header(f'CVT {"RES":>9}  {"KPBS":>5}  {"GB":>6}   VIDEO')
-            lines = make_lines()
+            lines, _, progress_idx = make_lines()
+            if self.state == 'convert':
+                win.pick_pos = progress_idx
             for line in lines:
                 win.add_body(line)
             win.render()
@@ -1062,44 +1091,87 @@ class Converter:
             if key in spin.keys:
                 spin.do_key(key, win)
 
-            if vals.set_all:
-                for ns in self.videos:
-                    if not ns.filebase.startswith('SAMPLE.'):
-                        ns.doit = '[X]'
-                vals.set_all = False
+            if self.state == 'select':
+                if vals.set_all:
+                    for ns in self.videos:
+                        if not ns.filebase.startswith('SAMPLE.'):
+                            ns.doit = '[X]'
+                    vals.set_all = False
 
-            if vals.reset_all:
-                for ns in self.videos:
-                    ns.doit = '[ ]'
-                vals.reset_all = False
+                if vals.reset_all:
+                    for ns in self.videos:
+                        ns.doit = '[ ]'
+                    vals.reset_all = False
 
-            if vals.init_all:
-                for ns in self.videos:
-                    ns.doit = '[X]' if '[' in ns.over else '[ ]'
-                vals.init_all = False
+                if vals.init_all:
+                    for ns in self.videos:
+                        ns.doit = '[X]' if '[' in ns.over else '[ ]'
+                    vals.init_all = False
 
-            if vals.toggle or key == ord(' '):
-                idx = win.pick_pos
-                if 0 <= idx < len(self.videos):
-                    ns = self.videos[idx]
-                    if not ns.filebase.startswith('SAMPLE.'):
-                        ns.doit = '[X]' if ns.doit == '[ ]' else '[ ]'
-                    vals.toggle = False
-                    win.pick_pos += 1
+                if vals.toggle or key == ord(' '):
+                    idx = win.pick_pos
+                    if 0 <= idx < len(self.videos):
+                        ns = self.videos[idx]
+                        if not ns.filebase.startswith('SAMPLE.'):
+                            ns.doit = '[X]' if ns.doit == '[ ]' else '[ ]'
+                        vals.toggle = False
+                        win.pick_pos += 1
 
-            if key == ord('g'):
-                win.stop_curses()
-                break
+                if key == ord('g'):
+                    if self.opts.keep_window:
+                        self.state = 'convert'
+                        # self.win.set_pick_mode(False, 1)
+                    else:
+                        win.stop_curses()
+                        break
 
-            if vals.quit:
-                sys.exit(0)
+                if vals.quit:
+                    sys.exit(0)
+            elif self.state == 'convert':
+                if vals.quit:
+                    if self.job:
+                        self.job.ffsubproc.stop()
+                        self.job.ns.doit = 'ABT'
+                        self.job = None
+                        break
+                if self.job:
+                    while True:
+                        got = self.get_job_progress(self.job)
+                        if isinstance(got, str):
+                            self.job.progress = got
+                        elif isinstance(got, int):
+                            self.job.ns.doit = ' OK' if got == 0 else 'ERR'
+                            self.finish_transcode_job(
+                                success=bool(got == 0), job=self.job)
+                            self.job = None
+                            break
+                        else:
+                            break
+                if not self.job:
+                    for ns in self.videos:
+                        if ns.doit == '[X]':
+                            self.job = self.start_transcode_job(ns)
+                            ns.doit = 'IP '
+                            break
+                    if not self.job:
+                        win.stop_curses()
+                        break
 
             win.clear()
 
-        for ns in self.videos:
-            if 'X' in ns.doit:
-                print(f'>>> {ns.filebase}')
-                self.convert_one_file(ns)
+        if not self.opts.keep_window:
+            for ns in self.videos:
+                if 'X' in ns.doit:
+                    print(f'>>> {ns.filebase}')
+                    self.convert_one_file(ns)
+        else:
+            lines, nses, _ = make_lines(doit_skips={'[ ]', '[X]'})
+            for idx, line in enumerate(lines):
+                ns = nses[idx]
+                print(line)
+                if ns.return_code:
+                    indent('\n'.join(ns.texts), '  ')
+
 
     def main_loop(self):
         """ TBD """
@@ -1135,33 +1207,48 @@ def main(args=None):
     """
     Convert video files to desired form
     """
-    parser = argparse.ArgumentParser(
-        description="A script that accepts dry-run, force, and debug flags.")
-    parser.add_argument('-b', '--keep-backup', action='store_true',
-                help='rather than recycle, rename to ORIG.{videofile}')
-    parser.add_argument('-i', '--info-only', action='store_true',
-                help='print just basic info')
-    parser.add_argument('-n', '--dry-run', action='store_true',
-                help='Perform a trial run with no changes made.')
-    parser.add_argument('-f', '--force', action='store_true',
-                help='Force the operation to proceed.')
-    parser.add_argument('-r', '--rename-only', action='store_true',
-                help='just look for re-names')
-    parser.add_argument('-s', '--sample', action='store_false',
-                help='produce 30s samples called SAMPLE.{input-file}')
-    parser.add_argument('-w', '--window-mode', action='store_false',
-                help='just look for re-names')
-    parser.add_argument('-q', '--quality', default=23,
-                help='output quality (CRF) [dflt=23]')
-    parser.add_argument('-D', '--debug', action='store_true',
-                help='Enable debug output.')
-    parser.add_argument('files', nargs='*',
-        help='Non-option arguments (e.g., file paths or names).')
-    opts = parser.parse_args(args)
-    if opts.sample:
-        opts.dry_run = False
+    try:
+        parser = argparse.ArgumentParser(
+            description="A script that accepts dry-run, force, and debug flags.")
+        parser.add_argument('-b', '--keep-backup', action='store_true',
+                    help='rather than recycle, rename to ORIG.{videofile}')
+        parser.add_argument('-i', '--info-only', action='store_true',
+                    help='print just basic info')
+        parser.add_argument('-n', '--dry-run', action='store_true',
+                    help='Perform a trial run with no changes made.')
+        parser.add_argument('-f', '--force', action='store_true',
+                    help='Force the operation to proceed.')
+        parser.add_argument('-r', '--rename-only', action='store_true',
+                    help='just look for re-names')
+        parser.add_argument('-s', '--sample', action='store_false',
+                    help='produce 30s samples called SAMPLE.{input-file}')
+        parser.add_argument('-w', '--window-mode', action='store_false',
+                    help='just look for re-names')
+        parser.add_argument('-q', '--quality', default=23,
+                    help='output quality (CRF) [dflt=23]')
+        parser.add_argument('-W', '--keep-window', action='store_false',
+                    help='run conversions in window mode')
+        parser.add_argument('-D', '--debug', action='store_true',
+                    help='Enable debug output.')
+        parser.add_argument('files', nargs='*',
+            help='Non-option arguments (e.g., file paths or names).')
+        opts = parser.parse_args(args)
+        if opts.sample:
+            opts.dry_run = False
+        if opts.dry_run or opts.rename_only:
+            opts.keep_window = False
 
-    Converter(opts).main_loop()
+        Converter(opts).main_loop()
+    except Exception as exc:
+        # Note: We no longer call Window.exit_handler(), as ConsoleWindow handles it
+        # and there is no guarantee the Window class was ever initialized.
+        if Converter.singleton and Converter.singleton.win:
+            Converter.singleton.win.stop_curses()
+
+        print("exception:", str(exc))
+        print(traceback.format_exc())
+
+
 
 
 if __name__ == '__main__':
