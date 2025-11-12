@@ -452,6 +452,23 @@ class Converter:
             print(f"An unexpected error occurred: {e}")
             return None
 
+    def apply_probe(self, vid, probe):
+        """ TBD """
+        # shorthand
+        vid.probe = probe
+        vid.width = probe.width
+        vid.height = probe.height
+        vid.codec = probe.codec
+        vid.bitrate = probe.bitrate
+        vid.gb = probe.gb
+
+        vid.res_ok = bool(vid.height is not None and vid.height <= self.TARGET_HEIGHT)
+        vid.bitrate_ok = bool(vid.bitrate <= self.MAX_BITRATE_KBPS)
+        vid.all_ok = bool(vid.res_ok and vid.bitrate_ok)
+
+        vid.summary = (f'  {vid.width}x{vid.height}' +
+                        f' {vid.codec} {vid.bitrate:.0f} kbps {vid.gb}G')
+
     def already_converted(self, basic_ns, video_file):
         """
         Checks if a video file already meets the updated conversion criteria:
@@ -465,51 +482,33 @@ class Converter:
         Returns:
             bool: True if the file meets all criteria, False otherwise.
         """
-        # shorthand
-        probe = basic_ns.probe
-        width = probe.width
-        height = probe.height
-        codec = probe.codec
-        bitrate = probe.bitrate
-        gb = probe.gb
 
-        # 1. Check Resolution
-        # Assuming resolution check is 'at least' the target
-        res_ok = bool(height is not None and height <= self.TARGET_HEIGHT)
-
-        # 2. Check Codec
-        # codec_ok = (codec is not None and codec.lower() in self.TARGET_CODECS)
-
-        # 3. Check Bitrate (with tolerance)
-        bitrate_ok = bool(bitrate <= self.MAX_BITRATE_KBPS)
-        all_ok = bool(res_ok and bitrate_ok)
-
-        summary = f'  {width}x{height} {codec} {bitrate:.0f} kbps {gb}G'
-        vid = SimpleNamespace(doit='', width=width, height=height, res_ok=res_ok,
-                             codec=codec, bitrate=bitrate, bitrate_ok=bitrate_ok,
-                             gb=gb, all_ok=all_ok, filepath=video_file,
+        vid = SimpleNamespace(doit='', width=None, height=None, res_ok=None,
+                             codec=None, bitrate=None, bitrate_ok=None,
+                             gb=None, all_ok=None, filepath=video_file,
                              filedir=os.path.dirname(video_file),
                              filebase=os.path.basename(video_file),
                              standard_name=basic_ns.standard_name,
-                             do_rename=basic_ns.do_rename, probe=basic_ns.probe,
+                             do_rename=basic_ns.do_rename, probe=None,
                              return_code=None, texts=[])
+        self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
-        if (res_ok and bitrate_ok) or vid.filebase.startswith('SAMPLE.'):
+        if (vid.res_ok and vid.bitrate_ok) or vid.filebase.startswith('SAMPLE.'):
             if self.opts.window_mode:
                 vid.doit = '[ ]'
             else:
-                print(f'      -: {summary}')
+                print(f'      -: {vid.summary}')
             return True
         else:
-            why = '' if res_ok else f'>{self.TARGET_HEIGHT}p '
-            why += '' if bitrate_ok else f'>{self.MAX_BITRATE_KBPS} kbps'
+            why = '' if vid.res_ok else f'>{self.TARGET_HEIGHT}p '
+            why += '' if vid.bitrate_ok else f'>{self.MAX_BITRATE_KBPS} kbps'
             if why:
                 why = f' [{why}]'
             if self.opts.window_mode:
                 vid.doit = '[X]'
             else:
-                print(f'CONVERT: {summary}{why}')
+                print(f'CONVERT: {vid.summary}{why}')
             return False
 
     def start_transcode_job(self, vid):
@@ -922,13 +921,15 @@ class Converter:
                     self.bulk_rename(vid.filebase, vid.standard_name)
                 
                 if not dry_run:
-                    vid.probe = self.get_video_metadata(vid.standard_name)
+                    probe = self.get_video_metadata(vid.standard_name)
+                    self.apply_probe(vid, probe)
 
             except OSError as e:
                 print(f"ERROR during swap of {vid.filepath}: {e}")
                 print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
         elif success and self.opts.sample:
-                vid.probe = self.get_video_metadata(job.temp_file)
+                probe = self.get_video_metadata(job.temp_file)
+                self.apply_probe(vid, probe)
         elif not success:
             # Transcoding failed, delete the temporary file
             if os.path.exists(job.temp_file):
@@ -1073,7 +1074,8 @@ class Converter:
         others={ord(' '), ord('g')}
         vals = spin.default_obj
 
-        self.win = win = ConsoleWindow(keys=spin.keys^others)
+        self.win = win = ConsoleWindow(
+            keys=spin.keys^others, body_rows=10+len(self.vids))
         self.state = 'select'
 
         win.set_pick_mode(True, 1)
