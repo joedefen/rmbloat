@@ -312,39 +312,6 @@ class Job: # class FfmpegJob:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-# --- Example Usage in Your Curses Loop ---
-
-# # ... (Setup your FFmpeg command line) ...
-# ffmpeg_cmd = [
-#     'ffmpeg', '-i', 'input.mp4', '-c:v', 'libx265', '-crf', '30', 'output.mp4'
-# ]
-#
-# monitor = FfmpegMon()
-# monitor.start(ffmpeg_cmd)
-#
-# while True:
-#     # 1. Poll the process
-#     status = monitor.poll()
-#
-#     # 2. Handle the status
-#     if isinstance(status, int):
-#         # Process is done. Handle success/failure based on the return code.
-#         # print(f"FFmpeg finished with code: {status}")
-#         break
-#     elif isinstance(status, str):
-#         # New progress line received!
-#         # progress_line = status
-#         # Match your PROGRESS_RE and update your curses window here
-#         pass
-#     elif status is None:
-#         # No new line. Use this time to handle user input (getch()),
-#         # update your UI's clock, or refresh the screen to prevent flickering.
-#         # time.sleep(0.01)
-#         pass
-#
-#     # CRITICAL: Sleep briefly to prevent a busy-loop from consuming CPU
-#     time.sleep(0.01)
-
 class Converter:
     """ TBD """
     # --- Conversion Criteria Constants (Customize these) ---
@@ -384,6 +351,11 @@ class Converter:
         self.original_cwd = os.getcwd()
         self.ff_pre_i_opts = []
         self.ff_post_i_opts = []
+        self.ff_thread_opts = []
+        if self.opts.thread_cnt > 0:
+            self.ff_thread_opts = [
+                "-x265-params", "threads={self.opts.thread_cnt}"]
+        self.ff_thread_opts = []
         self.state = 'probe' # 'select', 'convert'
         self.job = None
         self.win = None
@@ -392,79 +364,6 @@ class Converter:
         self.probe_cache.store()
         atexit.register(store_cache_on_exit)
 
-#   def get_video_metadata(self, file_path):
-#       """
-#       Extracts video metadata using ffprobe and returns it as a Python dictionary.
-#       Returns: dict or None: A dictionary containing the ffprobe output, or None if an
-#                         error occurs (e.g., file not found, ffprobe fails).
-#       """
-#       # Check if the file exists
-#       if not os.path.exists(file_path):
-#           print(f"Error: File not found at '{file_path}'")
-#           return None
-
-#       # ffprobe command to output format and stream information in JSON format
-#       # -v error: Suppress all non-error messages (like the banner)
-#       # -print_format json: Output in JSON format
-#       # -show_format: Include container format information
-#       # -show_streams: Include stream (video, audio, etc.) information
-#       command = [
-#           'ffprobe',
-#           '-v', 'error',
-#           '-print_format', 'json',
-#           '-show_format',
-#           '-show_streams',
-#           file_path
-#       ]
-
-#       try:
-#           # Execute the command
-#           result = subprocess.run(
-#               command,
-#               stdout=subprocess.PIPE,
-#               stderr=subprocess.PIPE,
-#               text=True,
-#               check=True  # Raise a CalledProcessError for non-zero exit codes
-#           )
-
-#           # Parse the JSON output
-#           if self.opts.debug:
-#               print(result.stdout)
-#           metadata = json.loads(result.stdout)
-#           # Extract values for comparison
-#           video_stream = next((s for s in metadata.get('streams', [])
-#                                if s.get('codec_type') == 'video'), None)
-#           meta = SimpleNamespace()
-#           meta.width = int(video_stream.get('width', 0))
-#           meta.height = int(video_stream.get('height', 0))
-#           meta.codec = video_stream.get('codec_name', 'unk_codec')
-#           meta.bitrate = int(int(metadata["format"].get('bit_rate', 0))/1000) # in KBPS
-#           meta.duration = float(metadata["format"].get('duration', 0.0)) # in secs
-#           meta.gb = self.get_file_size_gb(file_path)
-
-#           return meta
-
-#       except FileNotFoundError:
-#           # This occurs if 'ffprobe' is not found in the system's PATH
-#           print("Error: ffprobe command not found. Ensure FFmpeg/ffprobe is installed and in your system PATH.")
-#           return None
-#       except subprocess.CalledProcessError as e:
-#           # This occurs if ffprobe runs but returns an error code (e.g., file is corrupt)
-#           print(f"Error running ffprobe for '{file_path}':")
-#           print(f"  Command: {' '.join(e.cmd)}")
-#           print(f"  Return Code: {e.returncode}")
-#           print(f"  Stderr: {e.stderr.strip()}")
-#           return None
-#       except json.JSONDecodeError:
-#           # This occurs if the output is not valid JSON
-#           print(f"Error: Failed to decode JSON from ffprobe output for '{file_path}'.")
-#           # print(f"Raw output: {result.stdout.strip()}") # Uncomment for debugging
-#           return None
-#       except Exception as e:
-#           # Catch any other unexpected errors
-#           print(f"An unexpected error occurred: {e}")
-#           return None
-
     def apply_probe(self, vid, probe):
         """ TBD """
         # shorthand
@@ -472,22 +371,23 @@ class Converter:
         vid.width = probe.width
         vid.height = probe.height
         vid.codec = probe.codec
-        vid.bitrate = probe.bitrate
+        vid.bloat = probe.bloat
+        vid.duration = probe.duration
         vid.gb = probe.gb
 
         vid.res_ok = bool(vid.height is not None and vid.height <= self.TARGET_HEIGHT)
-        vid.bitrate_ok = bool(vid.bitrate <= self.MAX_BITRATE_KBPS)
-        vid.all_ok = bool(vid.res_ok and vid.bitrate_ok)
+        vid.bloat_ok = bool(vid.bloat < self.opts.bloat_thresh)
+        vid.all_ok = bool(vid.res_ok and vid.bloat_ok)
 
         vid.summary = (f'  {vid.width}x{vid.height}' +
-                        f' {vid.codec} {vid.bitrate:.0f} kbps {vid.gb}G')
+                        f' {vid.codec} {vid.bloat}b {vid.gb}G')
 
     def already_converted(self, basic_ns, video_file):
         """
         Checks if a video file already meets the updated conversion criteria:
         1. Resolution is at least TARGET_WIDTH x TARGET_HEIGHT.
         2. Video codec is TARGET_CODECS (e.g., 'h264').
-        3. Video bitrate is below MAX_BITRATE_KBPS.
+        3. Video "bloat" is below bloat_thresh.
 
         Args:
             filepath (str): The path to the video file.
@@ -497,17 +397,17 @@ class Converter:
         """
 
         vid = SimpleNamespace(doit='', width=None, height=None, res_ok=None,
-                             codec=None, bitrate=None, bitrate_ok=None,
-                             gb=None, all_ok=None, filepath=video_file,
-                             filedir=os.path.dirname(video_file),
-                             filebase=os.path.basename(video_file),
-                             standard_name=basic_ns.standard_name,
-                             do_rename=basic_ns.do_rename, probe=None,
-                             return_code=None, texts=[])
+                 duration=None, codec=None, bitrate=None, bloat_ok=None,
+                 gb=None, all_ok=None, filepath=video_file,
+                 filedir=os.path.dirname(video_file),
+                 filebase=os.path.basename(video_file),
+                 standard_name=basic_ns.standard_name,
+                 do_rename=basic_ns.do_rename, probe=None,
+                 return_code=None, texts=[])
         self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
-        if (vid.res_ok and vid.bitrate_ok) or vid.filebase.startswith('SAMPLE.'):
+        if (vid.res_ok and vid.bloat_ok) or vid.filebase.startswith('SAMPLE.'):
             if self.opts.window_mode:
                 vid.doit = '[ ]'
             else:
@@ -515,7 +415,7 @@ class Converter:
             return True
         else:
             why = '' if vid.res_ok else f'>{self.TARGET_HEIGHT}p '
-            why += '' if vid.bitrate_ok else f'>{self.MAX_BITRATE_KBPS} kbps'
+            why += '' if vid.bloat_ok else f'>{self.opts.bloat_thresh} kbps'
             if why:
                 why = f' [{why}]'
             if self.opts.window_mode:
@@ -558,6 +458,7 @@ class Converter:
             '-i', job.input_file,
             * post_i_opts,
             '-c:v', 'libx265',
+            * self.ff_thread_opts,
             '-crf', str(self.opts.quality),
             '-preset', 'medium',
             # '-preset', 'fast',
@@ -693,27 +594,6 @@ class Converter:
             return f"{size_bytes} {size_names[i]}"
         else:
             return f"{size:.2f} {size_names[i]}"
-
-#   @staticmethod
-#   def get_file_size_gb(filepath: str) -> str:
-#       """
-#       Gets the size of a given file path and returns it in a human-readable format.
-#       Returns:
-#           A string with the file size (e.g., "1.2 MB") or an error message.
-#       """
-#       try:
-#           # Get the size in bytes
-#           size_bytes = os.path.getsize(filepath)
-
-#           # Convert bytes to human-readable format
-#           return round(size_bytes / (1024*1024*1024), 3)
-#           # return Converter.human_readable_size(size_bytes)
-
-#       except FileNotFoundError:
-#           return f"Error: File not found at '{filepath}'"
-#       except Exception as e:
-#           return f"Error getting file size: {e}"
-
 
     def is_valid_video_file(self, filename):
         """
@@ -1068,10 +948,12 @@ class Converter:
                     continue
                 basename = os.path.basename(vid.filepath)
                 dirname = os.path.dirname(vid.filepath)
-                res = f'{vid.width}x{vid.height}'
+                res = f'{vid.height}p'
                 ht_over = ' ' if vid.res_ok else '^' # '■'
-                br_over = ' ' if vid.bitrate_ok else '^' # '■'
-                line = f'{vid.doit:>3} {res:>9}{ht_over} {vid.bitrate:5}{br_over} {vid.gb:>6}   {basename} ON {dirname}'
+                br_over = ' ' if vid.bloat_ok else '^' # '■'
+                mins = int(round(vid.duration / 60))
+                line = f'{vid.doit:>3} --- {vid.bloat:5}{br_over} {res:>5}{ht_over}'
+                line += f' {mins:>5} {vid.gb:>6}   {basename} ON {dirname}'
                 lines.append(line)
                 nses.append(vid)
                 if self.job and self.job.vid == vid:
@@ -1098,7 +980,7 @@ class Converter:
 
         while True:
             win.add_header('[s]etAll [r]setAll [i]nit SP:toggle [G]o [q]uit')
-            win.add_header(f'CVT {"RES":>9}  {"KPBS":>5}  {"GB":>6}   VIDEO')
+            win.add_header(f'CVT {"RED":>3} {"BLOAT":>5}  {"RES":>5}  {"MINS":>4}  {"GB":>6}   VIDEO')
             lines, _, progress_idx = make_lines()
             if self.state == 'convert':
                 win.pick_pos = progress_idx
@@ -1229,8 +1111,10 @@ def main(args=None):
     try:
         parser = argparse.ArgumentParser(
             description="A script that accepts dry-run, force, and debug flags.")
-        parser.add_argument('-b', '--keep-backup', action='store_true',
+        parser.add_argument('-B', '--keep-backup', action='store_true',
                     help='rather than recycle, rename to ORIG.{videofile}')
+        parser.add_argument('-b', '--bloat-thresh', default=1000, type=int,
+                    help='bloat threshold to convert [dflt=1000,min=500]')
         parser.add_argument('-i', '--info-only', action='store_true',
                     help='print just basic info')
         parser.add_argument('-n', '--dry-run', action='store_true',
@@ -1241,6 +1125,8 @@ def main(args=None):
                     help='just look for re-names')
         parser.add_argument('-s', '--sample', action='store_false',
                     help='produce 30s samples called SAMPLE.{input-file}')
+        parser.add_argument('-t', '--threads', default=0, type=int,
+                    help='thread count for ffmpeg conversions')
         parser.add_argument('-w', '--window-mode', action='store_false',
                     help='just look for re-names')
         parser.add_argument('-q', '--quality', default=23,
@@ -1256,6 +1142,8 @@ def main(args=None):
             opts.dry_run = False
         if opts.dry_run or opts.rename_only:
             opts.keep_window = False
+        if opts.bloat_thresh < 500:
+            opts.bloat_thresh = 500
 
         Converter(opts).main_loop()
     except Exception as exc:
