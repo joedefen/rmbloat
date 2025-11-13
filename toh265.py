@@ -19,6 +19,7 @@ from datetime import timedelta
 import send2trash
 from console_window import ConsoleWindow, OptionSpinner
 from ProbeCache import ProbeCache
+from VideoParser import VideoParser
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return,too-many-branches
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
@@ -346,7 +347,9 @@ class Converter:
     def __init__(self, opts):
         assert Converter.singleton is None
         Converter.singleton = self
+        self.win = None
         self.opts = opts
+        self.vals = None # spinner values
         self.vids = []
         self.original_cwd = os.getcwd()
         self.ff_pre_i_opts = []
@@ -358,7 +361,6 @@ class Converter:
         self.ff_thread_opts = []
         self.state = 'probe' # 'select', 'convert'
         self.job = None
-        self.win = None
         self.probe_cache = ProbeCache()
         self.probe_cache.load()
         self.probe_cache.store()
@@ -467,7 +469,7 @@ class Converter:
             '-map', '0',
             job.temp_file
         ]
-        if self.opts.dry_run:
+        if self.vals.dry_run:
             print(f"SKIP RUNNING {ffmpeg_cmd}\n")
         else:
             job.ffsubproc.start(ffmpeg_cmd)
@@ -477,7 +479,7 @@ class Converter:
         """
         Runs the FFmpeg transcode command and monitors its output for a non-scrolling display.
         """
-        if not self.opts.dry_run:
+        if not self.vals.dry_run:
             # --- Progress Monitoring Loop ---
             # Read stderr line-by-line until the process finishes
             while True:
@@ -495,7 +497,7 @@ class Converter:
             # Clear the progress line and print final status
             print('\r' + ' ' * 120, end='', flush=True) # Overwrite last line with spaces
 
-        if self.opts.dry_run or return_code == 0:
+        if self.vals.dry_run or return_code == 0:
             print(f"\r{job.input_file}: Transcoding FINISHED"
                   f" (Elapsed: {timedelta(seconds=int(time.time() - job.start_time))})")
             return True # Success
@@ -619,27 +621,43 @@ class Converter:
         # The file meets all criteria
         return True
 
-    def standard_name(self, filename: str, height: int) -> str:
+    def standard_name(self, pathname: str, height: int) -> str:
         """
+        If "parsed" create a simple standard name from the titile
+        and episode number (if episode) OR title and year (if movie).
+        Otherwise ...
         Replaces common H.264/AVC/Xvid/DivX codec strings in a filename
         with 'x265' or 'X265', preserving the original case where possible.
         Also change the height indicator if not in agreement with actual.
         Returns: Whether changed and filename string with x265 codec.
         """
 
-        new_filename = filename
+        basename = os.path.basename(pathname)
+        parsed = VideoParser(pathname)
+        if parsed.is_movie_year() or parsed.is_tv_episode():
+            if parsed.is_tv_episode():
+                name = parsed.episode_key().replace('"', '')
+            else:
+                name = f'{parsed.title} {parsed.year}'
+
+            name +=  f' {height}p x265 recode'
+            name = re.sub(r'[\s\.\-]+', '.', name.lower()) + '.mkv'
+
+            return bool(name != basename), name
+
+        new_basename = basename
         # Regular expressions for the codecs to be replaced.
         # The groups will capture the exact string for case-checking later.
         pattern = r'\b([xh]\.?264|avc|xvid|divx)\b'
         regex = re.compile(pattern, re.IGNORECASE)
         end = 0
         while True:
-            match = re.search(regex, new_filename[end:])
+            match = re.search(regex, new_basename[end:])
             if not match:
                 break
             sub = 'X265' if match.group(1).isupper() else 'x265'
             start, end = match.span(1)
-            new_filename = new_filename[:start] + sub + new_filename[end:]
+            new_basename = new_basename[:start] + sub + new_basename[end:]
 
         pattern = r'\b(\d+[pi]|UHD|4K|2160p|1440p|2K|8K)\b'
         regex = re.compile(pattern, re.IGNORECASE)
@@ -647,7 +665,7 @@ class Converter:
 
         end = 0
         while True:
-            match = re.search(regex, new_filename[end:])
+            match = re.search(regex, new_basename[end:])
             if not match:
                 break
             matched_group = match.group(1) # The matched string (e.g., '4K' or '720i')
@@ -663,18 +681,18 @@ class Converter:
                 # Standard p/i resolution match (e.g., '720p', '1080i')
                 sub = height_str.upper() if matched_group.isupper() else height_str
 
-            new_filename = new_filename[:start] + sub + new_filename[end:]
+            new_basename = new_basename[:start] + sub + new_basename[end:]
 
 
         # nail down extension
-        different = bool(new_filename != filename)
-        base, _ = os.path.splitext(new_filename)
-        new_filename = base + '.mkv'
+        different = bool(new_basename != basename)
+        base, _ = os.path.splitext(new_basename)
+        new_basename = base + '.mkv'
 
         if self.opts.debug:
-            print(f'standard_name: {different=} {new_filename=})')
+            print(f'standard_name: {different=} {new_basename=})')
 
-        return different, new_filename
+        return different, new_basename
 
     def bulk_rename(self, old_file_name: str, new_file_name: str):
         """
@@ -690,7 +708,7 @@ class Converter:
             new_file_name: A sample filename (e.g., 'newbie.mkv') used to define
                            the base name to rename to ('newbie').
         """
-        dry_run = self.opts.dry_run
+        dry_run = self.vals.dry_run
 
         old_base_name, _ = os.path.splitext(old_file_name)
         new_base_name, _ = os.path.splitext(new_file_name)
@@ -738,7 +756,8 @@ class Converter:
                 full_new_path = os.path.join(root, new_item_name)
                 try:
                     if dry_run:
-                        print(f"  WOULD rename as: '{full_new_path}'")
+                        if os.path.basename(new_item_name) != os.path.basename(old_file_name):
+                            print(f"  WOULD rename as: '{full_new_path}'")
                     else:
                         os.rename(full_old_path, full_new_path)
                 except OSError as e:
@@ -758,7 +777,7 @@ class Converter:
             print(f"{input_file}")
 
         # --- File names for the safe replacement process ---
-        do_rename, standard_name = self.standard_name(os.path.basename(input_file), vid.probe.height)
+        do_rename, standard_name = self.standard_name(input_file, vid.probe.height)
 
         vid.do_rename = do_rename
         vid.standard_name = standard_name
@@ -788,7 +807,7 @@ class Converter:
     def finish_transcode_job(self, success, job):
         """ TBD """
         # 4. Atomic Swap (Safe Replacement)
-        dry_run = self.opts.dry_run
+        dry_run = self.vals.dry_run
         vid = job.vid
         if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
@@ -938,6 +957,12 @@ class Converter:
 
         return video_files_out
 
+    def do_keep_window(self):
+        """ Computed do keep window based on that option and others """
+        if self.vals.dry_run or self.opts.rename_only:
+            return False
+        return self.opts.keep_window
+
     def do_window_mode(self):
         """ TBD """
         def make_lines(doit_skips=None):
@@ -969,8 +994,10 @@ class Converter:
         spin.add_key('init_all', 'i,SP - set all initial state', vals=[False, True])
         spin.add_key('toggle', 't - toggle current line state', vals=[False, True])
         spin.add_key('quit', 'q - exit the program', vals=[False, True])
+        spin.add_key('dry_run', 'd - dry-run', vals=[False, True])
         others={ord(' '), ord('g')}
-        vals = spin.default_obj
+        self.vals = vals = spin.default_obj
+        vals.dry_run = self.opts.dry_run
 
         self.win = win = ConsoleWindow(
             keys=spin.keys^others, body_rows=10+len(self.vids))
@@ -979,7 +1006,14 @@ class Converter:
         win.set_pick_mode(True, 1)
 
         while True:
-            win.add_header('[s]etAll [r]setAll [i]nit SP:toggle [G]o [q]uit')
+            if self.state == 'select':
+                head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o [q]uit'
+                if vals.dry_run:
+                    head += ' [d]ry-run'
+                win.add_header(head)
+            else:
+                win.add_header('q[uit]')
+
             win.add_header(f'CVT {"RED":>3} {"BLOAT":>5}  {"RES":>5}  {"MINS":>4}  {"GB":>6}   VIDEO')
             lines, _, progress_idx = make_lines()
             if self.state == 'convert':
@@ -990,6 +1024,8 @@ class Converter:
             key = win.prompt(seconds=0.5) # Wait for half a second or a keypress
             if key in spin.keys:
                 spin.do_key(key, win)
+            if self.opts.sample:
+                self.vals.dry_run = False
 
             if self.state == 'select':
                 if vals.set_all:
@@ -1017,8 +1053,9 @@ class Converter:
                         vals.toggle = False
                         win.pick_pos += 1
 
+
                 if key == ord('g'):
-                    if self.opts.keep_window:
+                    if self.do_keep_window():
                         self.state = 'convert'
                         # self.win.set_pick_mode(False, 1)
                     else:
@@ -1027,7 +1064,7 @@ class Converter:
 
                 if vals.quit:
                     sys.exit(0)
-            elif self.state == 'convert':
+            if self.state == 'convert':
                 if vals.quit:
                     if self.job:
                         self.job.ffsubproc.stop()
@@ -1059,7 +1096,7 @@ class Converter:
 
             win.clear()
 
-        if not self.opts.keep_window:
+        if not self.do_keep_window():
             for vid in self.vids:
                 if 'X' in vid.doit:
                     print(f'>>> {vid.filebase}')
@@ -1123,9 +1160,9 @@ def main(args=None):
                     help='Force the operation to proceed.')
         parser.add_argument('-r', '--rename-only', action='store_true',
                     help='just look for re-names')
-        parser.add_argument('-s', '--sample', action='store_false',
+        parser.add_argument('-s', '--sample', action='store_true',
                     help='produce 30s samples called SAMPLE.{input-file}')
-        parser.add_argument('-t', '--threads', default=0, type=int,
+        parser.add_argument('-t', '--thread_cnt', default=0, type=int,
                     help='thread count for ffmpeg conversions')
         parser.add_argument('-w', '--window-mode', action='store_false',
                     help='just look for re-names')
@@ -1140,8 +1177,6 @@ def main(args=None):
         opts = parser.parse_args(args)
         if opts.sample:
             opts.dry_run = False
-        if opts.dry_run or opts.rename_only:
-            opts.keep_window = False
         if opts.bloat_thresh < 500:
             opts.bloat_thresh = 500
 

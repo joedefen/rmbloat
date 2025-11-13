@@ -222,8 +222,8 @@ class VideoParser():
     def episode_key(self) -> str:
         """Just the title and episode number/range."""
         return (f'"{self.title}"'
-                + (f' s{self.season:}e{self.episode}' if self.episode is not None else '')
-                + (f'-{self.episode_hi}' if self.episode_hi else ''))
+                + (f' s{self.season:02d}e{self.episode:02d}' if self.episode is not None else '')
+                + (f'-{self.episode_hi:02d}' if self.episode_hi else ''))
 
 
     # --- Internal Core Logic ---
