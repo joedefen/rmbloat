@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # pylint: disable=too-many-statements
-""" TBD """
+"""
+TBD
+TODO:
+- allow /search in select mode
+- disallow /search is convert mode
+- hide unselected in convert mode
+- ensure the 10% better is enforced and the RED is computed
+- have a "save-my-options" option to create defaults
+"""
 import sys
 import os
 import math
@@ -409,7 +417,7 @@ class Converter:
         self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
-        if (vid.res_ok and vid.bloat_ok) or vid.filebase.startswith('SAMPLE.'):
+        if (vid.res_ok and vid.bloat_ok) or self.dont_doit(vid):
             if self.opts.window_mode:
                 vid.doit = '[ ]'
             else:
@@ -432,7 +440,7 @@ class Converter:
         os.chdir(vid.filedir)
 
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
-        prefix = '/tmp/SAMPLE' if self.opts.sample else 'TEST'
+        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEST'
         temp_file = f"{prefix}.{vid.standard_name}"
         orig_backup_file = f"ORIG.{vid.filebase}"
 
@@ -640,7 +648,7 @@ class Converter:
             else:
                 name = f'{parsed.title} {parsed.year}'
 
-            name +=  f' {height}p x265 recode'
+            name +=  f' {height}p x265-cmf{self.opts.quality} recode'
             name = re.sub(r'[\s\.\-]+', '.', name.lower()) + '.mkv'
 
             return bool(name != basename), name
@@ -694,7 +702,8 @@ class Converter:
 
         return different, new_basename
 
-    def bulk_rename(self, old_file_name: str, new_file_name: str):
+    def bulk_rename(self, old_file_name: str, new_file_name: str,
+                    trashes: set):
         """
         Renames files and directories in the current working directory (CWD).
 
@@ -728,6 +737,8 @@ class Converter:
 
                 full_old_path = os.path.join(root, item_name)
                 current_base, extension = os.path.splitext(item_name)
+                current_base2, extension2 = os.path.splitext(current_base)
+                extension2 = extension2 + extension
 
                 new_item_name = None
 
@@ -740,6 +751,9 @@ class Converter:
                 elif (item_name.lower().endswith(special_ext.lower())
                       and item_name[:-len(special_ext)] == old_base_name):
                     new_item_name = new_base_name + special_ext
+
+                elif current_base2 == old_base_name:
+                    new_item_name = new_base_name + extension2
 
                 # --- Rule 3: General Case - Base Name Match ---
                 # Applies if the non-extension part matches the intended old base name,
@@ -756,7 +770,7 @@ class Converter:
                 full_new_path = os.path.join(root, new_item_name)
                 try:
                     if dry_run:
-                        if os.path.basename(new_item_name) != os.path.basename(old_file_name):
+                        if os.path.basename(item_name) not in trashes:
                             print(f"  WOULD rename as: '{full_new_path}'")
                     else:
                         os.rename(full_old_path, full_new_path)
@@ -811,6 +825,7 @@ class Converter:
         vid = job.vid
         if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
+            trashes = set()
             try:
                 # Rename original to backup
                 if not dry_run:
@@ -823,6 +838,7 @@ class Converter:
                         print(f"{would}Move Original to {job.orig_backup_file}")
                     else:
                         print(f"{would}Trash {vid.filebase}")
+                        trashes.add(vid.filebase)
 
                 # Rename temporary file to the original filename
                 if not dry_run:
@@ -830,7 +846,8 @@ class Converter:
                 print(f"OK: {would}Replace {vid.standard_name}")
 
                 if vid.do_rename:
-                    self.bulk_rename(vid.filebase, vid.standard_name)
+                    self.bulk_rename(vid.filebase, vid.standard_name,
+                                     trashes)
 
                 if not dry_run:
                     # probe = self.get_video_metadata(vid.standard_name)
@@ -963,6 +980,14 @@ class Converter:
             return False
         return self.opts.keep_window
 
+    def dont_doit(self, vid):
+        """ Returns true if prohibited from re-encoding """
+        base = vid.filebase.lower()
+        if (base.startswith('sample.')
+                or base.startswith('test.')
+                or base.endswith('.recode.mkv')):
+            return True
+
     def do_window_mode(self):
         """ TBD """
         def make_lines(doit_skips=None):
@@ -987,6 +1012,12 @@ class Converter:
 
                 # print(line)
             return lines, nses, progress_idx
+
+        def toggle_doit(vid):
+            if self.dont_doit(vid):
+                vid.doit = '[ ]'
+            else:
+                vid.doit = '[X]' if vid.doit == '[ ]' else '[ ]'
 
         spin = OptionSpinner()
         spin.add_key('set_all', 's - set all to "[X]"', vals=[False, True])
@@ -1047,9 +1078,7 @@ class Converter:
                 if vals.toggle or key == ord(' '):
                     idx = win.pick_pos
                     if 0 <= idx < len(self.vids):
-                        vid = self.vids[idx]
-                        if not vid.filebase.startswith('SAMPLE.'):
-                            vid.doit = '[X]' if vid.doit == '[ ]' else '[ ]'
+                        toggle_doit(self.vids[idx])
                         vals.toggle = False
                         win.pick_pos += 1
 
@@ -1150,8 +1179,8 @@ def main(args=None):
             description="A script that accepts dry-run, force, and debug flags.")
         parser.add_argument('-B', '--keep-backup', action='store_true',
                     help='rather than recycle, rename to ORIG.{videofile}')
-        parser.add_argument('-b', '--bloat-thresh', default=1000, type=int,
-                    help='bloat threshold to convert [dflt=1000,min=500]')
+        parser.add_argument('-b', '--bloat-thresh', default=1600, type=int,
+                    help='bloat threshold to convert [dflt=1600,min=500]')
         parser.add_argument('-i', '--info-only', action='store_true',
                     help='print just basic info')
         parser.add_argument('-n', '--dry-run', action='store_true',
@@ -1166,8 +1195,8 @@ def main(args=None):
                     help='thread count for ffmpeg conversions')
         parser.add_argument('-w', '--window-mode', action='store_false',
                     help='just look for re-names')
-        parser.add_argument('-q', '--quality', default=23,
-                    help='output quality (CRF) [dflt=23]')
+        parser.add_argument('-q', '--quality', default=28,
+                    help='output quality (CRF) [dflt=28]')
         parser.add_argument('-W', '--keep-window', action='store_false',
                     help='run conversions in window mode')
         parser.add_argument('-D', '--debug', action='store_true',

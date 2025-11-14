@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import math
 from types import SimpleNamespace
 from typing import Optional, Dict, Any, Union
 
@@ -66,7 +67,9 @@ class ProbeCache:
             meta.bitrate = int(int(metadata["format"].get('bit_rate', 0))/1000) 
             meta.duration = float(metadata["format"].get('duration', 0.0))
 
-            meta.bloat = int(round((1000*1000*meta.bitrate)/(meta.height*meta.width)))
+            # meta.bloat = int(round((1000*1000*meta.bitrate)/(meta.height*meta.width)))
+            area = meta.width * meta.height
+            meta.bloat = int(round((meta.bitrate / math.sqrt(area)) * 1000))
             
             size_info = self._get_file_size_info(file_path)
             if size_info is None:
@@ -101,6 +104,10 @@ class ProbeCache:
             except (IOError, json.JSONDecodeError):
                 print(f"Warning: Could not read cache file at {self.cache_path}. Starting fresh.")
                 self.cache_data = {}
+            for filepath in list(self.cache_data.keys()):
+                # in effect, purge invalid entries
+                _ = self._get_valid_entry(filepath)
+
 
     def store(self):
         """Writes the current cache data to the temporary JSON file ONLY IF it is dirty."""
@@ -111,12 +118,14 @@ class ProbeCache:
                 
                 # Success! Clear the dirty count.
                 self._dirty_count = 0
-                print(f"Cache stored successfully (dirty count cleared).")
+                # print(f"Cache stored successfully (dirty count cleared).")
                 
             except IOError as e:
-                print(f"Error writing cache file: {e}")
+                pass
+                # print(f"Error writing cache file: {e}")
         else:
-            print("Cache is clean. Disk write skipped.")
+            pass
+            # print("Cache is clean. Disk write skipped.")
 
 
     def _set_cache(self, filepath: str, meta: SimpleNamespace):
@@ -134,12 +143,10 @@ class ProbeCache:
         # New: Increment the dirty count
         self._dirty_count += 1 
 
-    def get(self, filepath: str) -> Optional[SimpleNamespace]:
+    def _get_valid_entry(self, filepath: str):
+        """ If the entry for the path is not valid, remove it.
+            Return the cached entry if valid, else None
         """
-        Primary entry point. Tries cache first. If invalid, runs ffprobe, 
-        stores result, and returns it (Read-Through Cache).
-        """
-        
         # 1. Check if file exists on disk
         current_size_info = self._get_file_size_info(filepath)
         if current_size_info is None:
@@ -149,13 +156,30 @@ class ProbeCache:
                 self._dirty_count += 1
             return None
 
-        # 2. Check for valid cache hit
         if filepath in self.cache_data:
             cached_bytes = self.cache_data[filepath]['validation']['size_bytes']
             
-            if cached_bytes == current_size_info['size_bytes']:
-                # Cache is VALID. Return the stored data.
-                return SimpleNamespace(**self.cache_data[filepath]['probe_data'])
+            if cached_bytes != current_size_info['size_bytes']:
+                # File deleted, invalidate cache entry (mark as dirty)
+                del self.cache_data[filepath]
+                self._dirty_count += 1
+                return None
+
+            # Cache is VALID. Return the stored data.
+            return SimpleNamespace(**self.cache_data[filepath]['probe_data'])
+        return None
+
+    def get(self, filepath: str) -> Optional[SimpleNamespace]:
+        """
+        Primary entry point. Tries cache first. If invalid, runs ffprobe, 
+        stores result, and returns it (Read-Through Cache).
+        """
+        
+        # 1. Check if file exists on disk
+        # 2. Check for valid cache hit
+        meta = self._get_valid_entry(filepath)
+        if meta:
+            return meta
         
         # 3. Cache miss/invalid: Run ffprobe
         # print(f"Cache miss/invalid for '{os.path.basename(filepath)}'. Running ffprobe...")
