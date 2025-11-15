@@ -6,8 +6,7 @@ TODO:
 - allow /search in select mode
 - disallow /search in convert mode
 - hide unselected in convert mode
-- ensure the 10% better is enforced and the RED is computed
-- have a "save-my-options" option to create defaults
+x ensure the 10% better is enforced and the NET is computed
 - expose/spin samples as option -- make samples-dir and option
 - make cmf (or quality) a spinner / expose it
 - expose bloat thresh (change by 100? or prompt for it)
@@ -31,6 +30,8 @@ import send2trash
 from console_window import ConsoleWindow, OptionSpinner
 from ProbeCache import ProbeCache
 from VideoParser import VideoParser
+from ConfigManager import ConfigManager
+
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return,too-many-branches
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
@@ -414,7 +415,7 @@ class Converter:
             bool: True if the file meets all criteria, False otherwise.
         """
 
-        vid = SimpleNamespace(doit='', width=None, height=None, res_ok=None,
+        vid = SimpleNamespace(doit='', net=' ---', width=None, height=None, res_ok=None,
                  duration=None, codec=None, bitrate=None, bloat=None, bloat_ok=None,
                  codec_ok=None, gb=None, all_ok=None, filepath=video_file,
                  filedir=os.path.dirname(video_file),
@@ -706,8 +707,6 @@ class Converter:
         base, _ = os.path.splitext(new_basename)
         new_basename = base + '.mkv'
 
-        if self.opts.debug:
-            print(f'standard_name: {different=} {new_basename=})')
 
         return different, new_basename
 
@@ -832,6 +831,18 @@ class Converter:
         # 4. Atomic Swap (Safe Replacement)
         dry_run = self.vals.dry_run
         vid = job.vid
+        probe = None
+        if success:
+            probe = self.probe_cache.get(vid.temp_file)
+            if not probe:
+                success = False
+                vid.doit = 'ERR'
+            net = (vid.gb - probe.gb) / vid.gb
+            net = int(round(-net*100))
+            if net > -10:
+                success = False
+            vid.net = f'{net}%'
+
         if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
             trashes = set()
@@ -860,7 +871,6 @@ class Converter:
 
                 if not dry_run:
                     # probe = self.get_video_metadata(vid.standard_name)
-                    probe = self.probe_cache.get(vid.standard_name)
                     self.apply_probe(vid, probe)
 
             except OSError as e:
@@ -868,7 +878,6 @@ class Converter:
                 print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
         elif success and self.opts.sample:
             # probe = self.get_video_metadata(job.temp_file)
-            probe = self.probe_cache.get(job.temp_file)
             self.apply_probe(vid, probe)
         elif not success:
             # Transcoding failed, delete the temporary file
@@ -1013,7 +1022,7 @@ class Converter:
                 br_over = ' ' if vid.bloat_ok else '^' # '■'
                 co_over = ' ' if vid.codec_ok else '^'
                 mins = int(round(vid.duration / 60))
-                line = f'{vid.doit:>3} --- {vid.bloat:5}{br_over} {res:>5}{ht_over}'
+                line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
                 line += f' {vid.codec:>5}{co_over} {mins:>4} {vid.gb:>6}   {basename} ON {dirname}'
                 lines.append(line)
                 nses.append(vid)
@@ -1056,7 +1065,7 @@ class Converter:
             else:
                 win.add_header('q[uit]')
 
-            win.add_header(f'CVT {"RED":>3} {"BLOAT":>5}  {"RES":>5}  {"CODEC":>5}  {"MINS":>4} {"GB":>6}   VIDEO')
+            win.add_header(f'CVT {"NET":>4} {"BLOAT":>5}  {"RES":>5}  {"CODEC":>5}  {"MINS":>4} {"GB":>6}   VIDEO')
             lines, _, progress_idx = make_lines()
             if self.state == 'convert':
                 win.pick_pos = progress_idx
@@ -1189,37 +1198,64 @@ def main(args=None):
     Convert video files to desired form
     """
     try:
+        cfg = ConfigManager(app_name='toh265',
+                               keep_backup=False,
+                               bloat_thresh=1600,
+                               thread_cnt=0,
+                               quality=28,
+                               allowed_codecs='x26*')
+        vals = cfg.vals
         parser = argparse.ArgumentParser(
             description="A script that accepts dry-run, force, and debug flags.")
-        parser.add_argument('-B', '--keep-backup', action='store_true',
-                    help='rather than recycle, rename to ORIG.{videofile}')
-        parser.add_argument('-b', '--bloat-thresh', default=1600, type=int,
-                    help='bloat threshold to convert [dflt=1600,min=500]')
+        # config options
+        parser.add_argument('-B', '--keep-backup',
+                    action='store_false' if vals.keep_backup else 'store_true',
+                    help='rename to ORIG.{videofile} rather than recycle'
+                         + f' [dflt={vals.keep_backup}]')
+        parser.add_argument('-b', '--bloat-thresh',
+                    default=vals.bloat_thresh, type=int,
+                    help='bloat threshold to convert'
+                        + f' [dflt={vals.bloat_thresh},min=500]')
+        parser.add_argument('-t', '--thread-cnt',
+                    default=vals.thread_cnt, type=int,
+                    help='thread count for ffmpeg conversions'
+                        + f' [dflt={vals.thread_cnt}]')
+        parser.add_argument('-q', '--quality',
+                    default=vals.quality, type=int,
+                    help=f'output quality (CRF) [dflt={vals.quality}]')
+        parser.add_argument('-a', '--allowed-codecs',
+                    default=vals.allowed_codecs,
+                    choices=('x26*', 'x265', 'all'),
+                    help=f'allowed codecs [dflt={vals.allowed_codecs}]')
+
+        # run-time options
+        parser.add_argument('-S', '--save-defaults', action='store_true',
+                    help='save the -B/-b/-t/-q/-a options as defaults')
         parser.add_argument('-i', '--info-only', action='store_true',
                     help='print just basic info')
         parser.add_argument('-n', '--dry-run', action='store_true',
                     help='Perform a trial run with no changes made.')
-        parser.add_argument('-f', '--force', action='store_true',
-                    help='Force the operation to proceed.')
         parser.add_argument('-r', '--rename-only', action='store_true',
                     help='just look for re-names')
         parser.add_argument('-s', '--sample', action='store_true',
                     help='produce 30s samples called SAMPLE.{input-file}')
-        parser.add_argument('-t', '--thread_cnt', default=0, type=int,
-                    help='thread count for ffmpeg conversions')
         parser.add_argument('-w', '--window-mode', action='store_false',
                     help='disable window mode')
-        parser.add_argument('-a', '--allowed-codecs', choices=('x26*', 'x265', 'all'),
-                    default='x26*', help='allowed codecs')
-        parser.add_argument('-q', '--quality', default=28,
-                    help='output quality (CRF) [dflt=28]')
         parser.add_argument('-W', '--keep-window', action='store_false',
                     help='run conversions in window mode')
-        parser.add_argument('-D', '--debug', action='store_true',
-                    help='Enable debug output.')
+
         parser.add_argument('files', nargs='*',
             help='Non-option arguments (e.g., file paths or names).')
         opts = parser.parse_args(args)
+        if opts.save_defaults:
+            print('Setting new defaults:')
+            for key in vars(vals):
+                new_value = getattr(opts, key)
+                setattr(vals, key, new_value)
+                print(f'- {key} {new_value}')
+            cfg.write()
+            sys.exit(0)
+
         if opts.sample:
             opts.dry_run = False
         opts.bloat_thresh = max(500, opts.bloat_thresh)
