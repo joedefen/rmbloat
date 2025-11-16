@@ -362,6 +362,7 @@ class Converter:
         self.opts = opts
         self.vals = None # spinner values
         self.vids = []
+        self.visible_vids = []
         self.original_cwd = os.getcwd()
         self.ff_pre_i_opts = []
         self.ff_post_i_opts = []
@@ -450,7 +451,7 @@ class Converter:
         os.chdir(vid.filedir)
 
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
-        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEST'
+        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
         temp_file = f"{prefix}.{vid.standard_name}"
         orig_backup_file = f"ORIG.{vid.filebase}"
 
@@ -833,7 +834,7 @@ class Converter:
         vid = job.vid
         probe = None
         if success:
-            probe = self.probe_cache.get(vid.temp_file)
+            probe = self.probe_cache.get(job.temp_file)
             if not probe:
                 success = False
                 vid.doit = 'ERR'
@@ -1010,9 +1011,13 @@ class Converter:
     def do_window_mode(self):
         """ TBD """
         def make_lines(doit_skips=None):
+            nonlocal self
             lines, nses, progress_idx = [], [], 0
+            self.visible_vids = []
 
             for idx, vid in enumerate(self.vids):
+                if self.state == 'convert' and vid.doit == '[ ]':
+                    continue
                 if doit_skips and vid.doit in doit_skips:
                     continue
                 basename = os.path.basename(vid.filepath)
@@ -1024,14 +1029,21 @@ class Converter:
                 mins = int(round(vid.duration / 60))
                 line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
                 line += f' {vid.codec:>5}{co_over} {mins:>4} {vid.gb:>6}   {basename} ON {dirname}'
+                if self.vals.search and self.state == 'select':
+                    match = re.search(self.vals.search, line, re.IGNORECASE)
+                    if not match:
+                        continue
+
                 lines.append(line)
                 nses.append(vid)
+                self.visible_vids.append(vid)
                 if self.job and self.job.vid == vid:
                     lines.append(f'-----> {self.job.progress}')
                     progress_idx = 1+idx
+                    self.visible_vids.append(None)
 
                 # print(line)
-            return lines, nses, progress_idx
+            return lines, progress_idx
 
         def toggle_doit(vid):
             if self.dont_doit(vid):
@@ -1046,6 +1058,9 @@ class Converter:
         spin.add_key('toggle', 't - toggle current line state', vals=[False, True])
         spin.add_key('quit', 'q - exit the program', vals=[False, True])
         spin.add_key('dry_run', 'd - dry-run', vals=[False, True])
+        spin.add_key('search', '/ - search string',
+                          prompt='Set search string, then Enter')
+
         others={ord(' '), ord('g')}
         self.vals = vals = spin.default_obj
         vals.dry_run = self.opts.dry_run
@@ -1061,12 +1076,14 @@ class Converter:
                 head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o [q]uit'
                 if vals.dry_run:
                     head += ' [d]ry-run'
+                if vals.search:
+                    head += f' /{vals.search}'
                 win.add_header(head)
             else:
                 win.add_header('q[uit]')
 
             win.add_header(f'CVT {"NET":>4} {"BLOAT":>5}  {"RES":>5}  {"CODEC":>5}  {"MINS":>4} {"GB":>6}   VIDEO')
-            lines, _, progress_idx = make_lines()
+            lines, progress_idx = make_lines()
             if self.state == 'convert':
                 win.pick_pos = progress_idx
             for line in lines:
@@ -1100,8 +1117,8 @@ class Converter:
 
                 if vals.toggle or key == ord(' '):
                     idx = win.pick_pos
-                    if 0 <= idx < len(self.vids):
-                        toggle_doit(self.vids[idx])
+                    if 0 <= idx < len(self.visible_vids):
+                        toggle_doit(self.visible_vids[idx])
                         vals.toggle = False
                         win.pick_pos += 1
 
@@ -1154,12 +1171,13 @@ class Converter:
                     print(f'>>> {vid.filebase}')
                     self.convert_one_file(vid)
         else:
-            lines, nses, _ = make_lines(doit_skips={'[ ]', '[X]'})
+            lines, _ = make_lines(doit_skips={'[ ]', '[X]'})
             for idx, line in enumerate(lines):
-                vid = nses[idx]
-                print(line)
-                if vid.return_code:
-                    indent('\n'.join(vid.texts), '  ')
+                vid = self.visible_vids[idx]
+                if vid:
+                    print(line)
+                    if vid.return_code:
+                        indent('\n'.join(vid.texts), '  ')
 
 
     def main_loop(self):
