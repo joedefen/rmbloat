@@ -35,7 +35,7 @@ class IniManager:
 
         self.app_name = app_name
         self._default_values = kwargs
-        self._config_file_path = self._determine_config_path()
+        self.config_file_path = self._determine_config_path()
         self._ensure_directory_exists()
         
         # New: Initialize SimpleNamespace to hold all configuration values
@@ -59,36 +59,35 @@ class IniManager:
 
             # If the file is missing keys or has extra keys, a write is needed.
             if file_keys != default_keys:
-                print(f"INFO: Config mismatch detected in '{self._config_file_path}'. Updating INI file.")
+                print(f"INFO: Config mismatch detected in '{self.config_file_path}'. Updating INI file.")
                 is_file_missing_or_mismatch = True
             else:
-                print(f"INFO: Config file read successfully from '{self._config_file_path}'.")
+                print(f"INFO: Config file read successfully from '{self.config_file_path}'.")
 
         # 3. If file was missing or structure didn't match, write the current state
         if is_file_missing_or_mismatch:
             self.write()
 
-
     def _determine_config_path(self):
         """Calculates the full path to the config.ini file."""
         home_dir = Path.home()
-        app_dir = home_dir / self.app_name
+        app_dir = home_dir / ".config" / self.app_name
         return app_dir / 'config.ini'
 
     def _ensure_directory_exists(self):
         """Creates the application configuration directory if it doesn't exist."""
         try:
-            os.makedirs(self._config_file_path.parent, exist_ok=True)
+            os.makedirs(self.config_file_path.parent, exist_ok=True)
         except OSError as e:
-            print(f"ERROR: Could not create directory {self._config_file_path.parent}. Error: {e}")
+            print(f"ERROR: Could not create directory {self.config_file_path.parent}. Error: {e}")
             raise
 
     def _read_config_file(self):
         """Reads the INI file into a ConfigParser object."""
         config = configparser.ConfigParser()
-        if os.path.exists(self._config_file_path):
+        if os.path.exists(self.config_file_path):
             try:
-                config.read(self._config_file_path)
+                config.read(self.config_file_path)
             except Exception as e:
                 print(f"WARNING: Failed to read config file: {e}. Using defaults.")
         return config
@@ -126,9 +125,9 @@ class IniManager:
         config = self._read_config_file()
         if self.SECTION in config:
             self._update_vals_from_config(config)
-            print(f"Read operation complete. Object attributes updated from {self._config_file_path}")
+            print(f"Read operation complete. Object attributes updated from {self.config_file_path}")
         else:
-            print(f"Read failed: Section '{self.SECTION}' not found in {self._config_file_path}")
+            print(f"Read failed: Section '{self.SECTION}' not found in {self.config_file_path}")
 
     def write(self):
         """
@@ -144,11 +143,11 @@ class IniManager:
             config[self.SECTION][key] = str(value)
 
         try:
-            with open(self._config_file_path, 'w') as configfile:
+            with open(self.config_file_path, 'w') as configfile:
                 config.write(configfile)
-            print(f"Write operation complete. Configuration saved to {self._config_file_path}")
+            print(f"Write operation complete. Configuration saved to {self.config_file_path}")
         except Exception as e:
-            print(f"ERROR: Failed to write config file to {self._config_file_path}. Error: {e}")
+            print(f"ERROR: Failed to write config file to {self.config_file_path}. Error: {e}")
 
 
 # --- Example Usage ---
@@ -207,4 +206,4 @@ if __name__ == '__main__':
 
     # Clean up the test files/folder (optional)
     # import shutil
-    # shutil.rmtree(manager3._config_file_path.parent)
+    # shutil.rmtree(manager3.config_file_path.parent)

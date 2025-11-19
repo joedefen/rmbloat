@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from typing import Optional, Dict, Any, Union
 
 class ProbeCache:
-    def __init__(self, cache_file_name="video_probes.json"):
-        self.cache_path = os.path.join("/tmp", cache_file_name)
+    def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp"):
+        self.cache_path = os.path.join(cache_dir_name, cache_file_name)
         self.cache_data: Dict[str, Dict[str, Any]] = {}
         # New: Tracks changes since the last store()
         self._dirty_count = 0 

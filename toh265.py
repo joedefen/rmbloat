@@ -18,6 +18,7 @@ import argparse
 import subprocess
 import traceback
 import atexit
+import shlex
 import re
 import time
 import fcntl
@@ -31,6 +32,9 @@ from console_window import ConsoleWindow, OptionSpinner
 from ProbeCache import ProbeCache
 from VideoParser import VideoParser
 from IniManager import IniManager
+from RotatingLogger import RotatingLogger
+
+lg = RotatingLogger('toh265')
 
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return,too-many-branches
@@ -279,7 +283,7 @@ class FfmpegMon:
             # For now, we'll just discard it if it's not a complete line.
             pass
 
-    def stop(self):
+    def stop(self, return_code=255):
         """
         Terminates the subprocess if it is still running.
         """
@@ -288,7 +292,7 @@ class FfmpegMon:
             self.process.wait(timeout=5) # Wait for it to die gracefully
         self.process = None
         self.partial_line = ""
-        self.return_code = None
+        self.return_code = return_code
 
     def __del__(self):
         """Ensure the subprocess is terminated when the object is destroyed."""
@@ -352,7 +356,7 @@ class Converter:
     sample_seconds = 30
     singleton = None
 
-    def __init__(self, opts):
+    def __init__(self, opts, cache_dir='/tmp'):
         assert Converter.singleton is None
         Converter.singleton = self
         self.win = None
@@ -364,16 +368,14 @@ class Converter:
         self.ff_pre_i_opts = []
         self.ff_post_i_opts = []
         self.ff_thread_opts = []
-        if self.opts.thread_cnt > 0:
-            self.ff_thread_opts = [
-                "-x265-params", "threads={self.opts.thread_cnt}"]
-        self.ff_thread_opts = []
         self.state = 'probe' # 'select', 'convert'
         self.job = None
         self.prev_time_encoded_secs = -1
-        self.probe_cache = ProbeCache()
+        self.probe_cache = ProbeCache(cache_dir_name=cache_dir)
         self.probe_cache.load()
         self.probe_cache.store()
+        self.progress_line_mono = 0
+        self.start_job_mono = 0
         atexit.register(store_cache_on_exit)
 
     def apply_probe(self, vid, probe):
@@ -414,14 +416,15 @@ class Converter:
             bool: True if the file meets all criteria, False otherwise.
         """
 
-        vid = SimpleNamespace(doit='', net=' ---', width=None, height=None, res_ok=None,
-                 duration=None, codec=None, bitrate=None, bloat=None, bloat_ok=None,
-                 codec_ok=None, gb=None, all_ok=None, filepath=video_file,
-                 filedir=os.path.dirname(video_file),
-                 filebase=os.path.basename(video_file),
-                 standard_name=basic_ns.standard_name,
-                 do_rename=basic_ns.do_rename, probe=None,
-                 return_code=None, texts=[])
+        vid = SimpleNamespace(doit='', net=' ---', width=None, height=None,
+                    command=None, res_ok=None,
+                    duration=None, codec=None, bitrate=None, bloat=None, bloat_ok=None,
+                    codec_ok=None, gb=None, all_ok=None, filepath=video_file,
+                    filedir=os.path.dirname(video_file),
+                    filebase=os.path.basename(video_file),
+                    standard_name=basic_ns.standard_name,
+                    do_rename=basic_ns.do_rename, probe=None,
+                return_code=None, texts=[])
         self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
@@ -442,6 +445,21 @@ class Converter:
             else:
                 print(f'CONVERT: {vid.summary}{why}')
             return False
+    
+    @staticmethod
+    def bash_quote(args):
+        """
+        Converts a Python list of arguments into a single, properly quoted 
+        Bash command string.
+        """
+        quoted_args = []
+        for arg in args:
+            # 1. Check if simple quoting is enough (no need to handle embedded quotes)
+            # shlex.quote is the preferred, robust way in Python 3.3+
+            quoted_arg = shlex.quote(arg)
+            quoted_args.append(quoted_arg)
+            
+        return ' '.join(quoted_args)
 
     def start_transcode_job(self, vid):
         """ TBD """
@@ -463,13 +481,23 @@ class Converter:
         pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
         job.input_file = vid.filebase
 
+        nice_opts, thread_opts = [], []
+        if not self.opts.full_speed:
+            nice_opts = 'ionice -c3 nice -n19'.split()
+            if self.opts.thread_cnt > 0:
+                thread_opts = ['-threads', f'{self.opts.thread_cnt}']
+
         if self.opts.sample:
             start_secs = max(120, job.duration_secs)*.20
             pre_i_opts += [ '-ss', job.duration_spec(start_secs) ]
-            post_i_opts += [ '-t', str(self.sample_seconds)]
+            post_i_opts =  ['-t', str(self.sample_seconds)]
+            # post_i_opts += [ '-copyts', '-avoid_negative_ts', 'make_zero',
+            #   '-t', str(self.sample_seconds)]
+            # post_i_opts += [ '-ss', '1:15', '-t', str(self.sample_seconds)]
 
         # Define the FFmpeg command
         ffmpeg_cmd = [
+            * nice_opts,
             'ffmpeg',
             '-y',                           # Overwrite temp file if exists
             # '-v', 'error',                  # suppress INFO/WARNINGS
@@ -477,7 +505,7 @@ class Converter:
             '-i', job.input_file,
             * post_i_opts,
             '-c:v', 'libx265',
-            * self.ff_thread_opts,
+            * thread_opts,
             '-crf', str(self.opts.quality),
             '-preset', 'medium',
             # '-preset', 'fast',
@@ -486,10 +514,14 @@ class Converter:
             '-map', '0',
             job.temp_file
         ]
+        vid.command = self.bash_quote(ffmpeg_cmd)
         if self.vals.dry_run:
             print(f"SKIP RUNNING {ffmpeg_cmd}\n")
         else:
+            if not self.opts.keep_window:
+                print(' '.join(ffmpeg_cmd))
             job.ffsubproc.start(ffmpeg_cmd)
+            self.progress_line_mono = time.monotonic() - 15.0
         return job
 
     def monitor_transcode_progress(self, job):
@@ -506,7 +538,7 @@ class Converter:
 
                     # 4. Print and reset timer
                 if isinstance(got, str):
-                    print(got, end='', flush=True)
+                    print('\r' + got, end='', flush=True)
                 elif isinstance(got, int):
                     return_code = got
                     break
@@ -527,14 +559,27 @@ class Converter:
     def get_job_progress(self, job):
         """ TBD """
         vid = job.vid
+        err = False
         while True:
             got = job.ffsubproc.poll()
+            delta = time.monotonic() - self.progress_line_mono
+            # print(f'\r{delta=} {got=}')
+            if time.monotonic() - self.progress_line_mono > 30.0:
+                got = 254
+                vid.texts.append('PROGRESS TIMEOUT')
+                job.ffsubproc.stop(return_code=got)
+                self.progress_line_mono = time.monotonic() + 1000000000
+                continue
+            
             if isinstance(got, str):
                 line = got
                 match = self.PROGRESS_RE.search(line)
                 if not match:
                     vid.texts.append(line)
                     continue
+
+                self.progress_line_mono = time.monotonic()
+                # print(f'\r{self.progress_line_mono=} {line}')
 
                 # 1. Extract values from the regex match
                 try:
@@ -575,11 +620,11 @@ class Converter:
                 # \r at the start makes the console cursor go back to the beginning of the line
                 cur_time_formatted = job.trim0(str(timedelta(seconds=time_encoded_seconds)))
                 progress_line = (
-                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} | "
                     f"{percent_complete:.1f}% | "
-                    f"ETA {remaining_time_formatted} | "
-                    f"Speed {speed:.1f}x | "
-                    f"Time {cur_time_formatted}/{job.total_duration_formatted}"
+                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} | "
+                    f"-{remaining_time_formatted} | "
+                    f"{speed:.1f}x | "
+                    f"At {cur_time_formatted}/{job.total_duration_formatted}"
                 )
                 return progress_line
             elif isinstance(got, int):
@@ -1029,7 +1074,7 @@ class Converter:
             for vid in self.vids:
                 if vid.doit != '[ ]':
                     stats.picked += 1
-                if vid.doit != '[X]':
+                if vid.doit not in ('[X]', '[ ]'):
                     stats.done += 1
                 if self.state == 'convert' and vid.doit == '[ ]':
                     continue
@@ -1242,25 +1287,22 @@ def main(args=None):
         cfg = IniManager(app_name='toh265',
                                keep_backup=False,
                                bloat_thresh=1600,
-                               thread_cnt=0,
+                               thread_cnt=3,
                                quality=28,
-                               allowed_codecs='x26*')
+                               allowed_codecs='x265',
+                               full_speed=False)
         vals = cfg.vals
         parser = argparse.ArgumentParser(
             description="A script that accepts dry-run, force, and debug flags.")
         # config options
         parser.add_argument('-B', '--keep-backup',
                     action='store_false' if vals.keep_backup else 'store_true',
-                    help='rename to ORIG.{videofile} rather than recycle'
+                    help='if true, rename to ORIG.{videofile} rather than recycle'
                          + f' [dflt={vals.keep_backup}]')
         parser.add_argument('-b', '--bloat-thresh',
                     default=vals.bloat_thresh, type=int,
                     help='bloat threshold to convert'
                         + f' [dflt={vals.bloat_thresh},min=500]')
-        parser.add_argument('-t', '--thread-cnt',
-                    default=vals.thread_cnt, type=int,
-                    help='thread count for ffmpeg conversions'
-                        + f' [dflt={vals.thread_cnt}]')
         parser.add_argument('-q', '--quality',
                     default=vals.quality, type=int,
                     help=f'output quality (CRF) [dflt={vals.quality}]')
@@ -1268,10 +1310,18 @@ def main(args=None):
                     default=vals.allowed_codecs,
                     choices=('x26*', 'x265', 'all'),
                     help=f'allowed codecs [dflt={vals.allowed_codecs}]')
+        parser.add_argument('-F', '--full-speed',
+                    action='store_false' if vals.full_speed else 'store_true',
+                    help=f'if true, do NOT set nice -n19, ionice -c3,'
+                        + f' and thread_cnt [dflt={vals.full_speed}]')
+        parser.add_argument('-t', '--thread-cnt',
+                    default=vals.thread_cnt, type=int,
+                    help='thread count for ffmpeg conversions'
+                        + f' [dflt={vals.thread_cnt}]')
 
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
-                    help='save the -B/-b/-t/-q/-a options as defaults')
+                    help='save the -B/-b/-q/-a/-F/-t options as defaults')
         parser.add_argument('-i', '--info-only', action='store_true',
                     help='print just basic info')
         parser.add_argument('-n', '--dry-run', action='store_true',
@@ -1301,7 +1351,7 @@ def main(args=None):
             opts.dry_run = False
         opts.bloat_thresh = max(500, opts.bloat_thresh)
 
-        Converter(opts).main_loop()
+        Converter(opts, os.path.dirname(cfg.config_file_path)).main_loop()
     except Exception as exc:
         # Note: We no longer call Window.exit_handler(), as ConsoleWindow handles it
         # and there is no guarantee the Window class was ever initialized.
