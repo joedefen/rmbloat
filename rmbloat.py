@@ -31,7 +31,7 @@ from datetime import timedelta
 import send2trash
 from console_window import ConsoleWindow, OptionSpinner
 from ProbeCache import ProbeCache
-from VideoParser import VideoParser
+from VideoParser import VideoParser, Mangler
 from IniManager import IniManager
 from RotatingLogger import RotatingLogger
 
@@ -1047,6 +1047,9 @@ class Converter:
                     continue
                 basename = vid.basename1 if vid.basename1 else os.path.basename(vid.filepath)
                 dirname = os.path.dirname(vid.filepath)
+                if self.spins.mangle:
+                    basename = Mangler.mangle_title(basename)
+                    dirname = Mangler.mangle(dirname)
                 res = f'{vid.height}p'
                 ht_over = ' ' if vid.res_ok else '^' # '■'
                 br_over = ' ' if vid.bloat_ok else '^' # '■'
@@ -1055,7 +1058,10 @@ class Converter:
                 line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
                 line += f' {vid.codec:>5}{co_over} {mins:>4} {vid.gb:>6.3f}   {basename} ---> {dirname}'
                 if self.spins.search:
-                    match = re.search(self.spins.search, line, re.IGNORECASE)
+                    pattern = self.spins.search
+                    if self.spins.mangle:
+                        pattern = Mangler.mangle(pattern)
+                    match = re.search(pattern, line, re.IGNORECASE)
                     if not match:
                         continue
                 if vid.doit == '[X]':
@@ -1089,9 +1095,11 @@ class Converter:
         spin.add_key('reset_all', 'r - reset all to "[ ]"', vals=[False, True])
         spin.add_key('init_all', 'i,SP - set all initial state', vals=[False, True])
         spin.add_key('toggle', 't - toggle current line state', vals=[False, True])
-        spin.add_key('quit', 'q - exit the program', vals=[False, True])
+        spin.add_key('quit', 'q - quit converting OR exit app', vals=[False, True])
         spin.add_key('search', '/ - search string',
                           prompt='Set search string, then Enter')
+        spin.add_key('mangle', 'm - mangle titles', vals=[False, True])
+        spin.add_key('help', '? - help screen', vals=[False, True])
 
         others={ord(' '), ord('g')}
         self.spins = spins = spin.default_obj
@@ -1165,12 +1173,14 @@ class Converter:
                     sys.exit(0)
             if self.state == 'convert':
                 if spins.quit:
+                    spins.quit = False
                     if self.job:
                         self.job.ffsubproc.stop()
                         self.job.vid.doit = '[X]'
                         self.job = None
                     self.state = 'select'
-                    spins.quit = False
+                    self.vids.sort(key=lambda vid: vid.bloat, reverse=True)
+                    win.set_pick_mode(True, 1)
                     continue
                 if self.job:
                     while True:
@@ -1217,6 +1227,7 @@ class Converter:
                             break
                     if not self.job:
                         self.state = 'select'
+                        self.vids.sort(key=lambda vid: vid.bloat, reverse=True)
                         win.set_pick_mode(True, 1)
 
             win.clear()
