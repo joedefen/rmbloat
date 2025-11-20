@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
+""" Parses VideoFile names to extract Title, etc. """
 import os
 import re
+import string
+from io import StringIO
 from types import SimpleNamespace
 from ruamel.yaml import YAML
+# pylint: disable=too-many-statements,too-many-branches,too-many-nested-blocks
+# pylint: disable=too-many-locals,broad-exception-caught,too-few-public-methods
+# pylint: disable=too-many-instance-attributes,line-too-long,invalid-name
 
 # Initialize the YAML parser for internal use
 # Note: ruamel.yaml is imported to keep the regression tests runnable.
@@ -17,7 +23,6 @@ def custom_yaml_dump(data, flow_nodes=None, indent=4):
     """
     Placeholder for the original yaml_dump, using ruamel.yaml to format output.
     """
-    from io import StringIO
     string_stream = StringIO()
     # Note: flow_nodes and indent control formatting, but a simple dump suffices
     # to demonstrate the current test results.
@@ -140,8 +145,9 @@ class VideoParser():
 
     @staticmethod
     def type_hint_by_path(videopath: str) -> SimpleNamespace:
+        """ TBD """
         hint = SimpleNamespace(movie=False, tv=False)
-        
+
         # 1. Check parent folder (e.g., Season 01)
         parent_dir = os.path.basename(os.path.dirname(videopath))
         if VideoParser.seasondir_pat.match(parent_dir):
@@ -150,26 +156,26 @@ class VideoParser():
 
         # 2. Check grand-parent folder (e.g., Show Title (2018) US)
         grandparent_dir = os.path.basename(os.path.dirname(os.path.dirname(videopath)))
-        
+
         # Check if grandparent is the Show/Movie Title (YYYY) folder
         title_match = VideoParser.title_year_cc_re.match(grandparent_dir)
-        
+
         if title_match:
             # If the direct parent was *not* a Season folder, and we found a title/(year) folder
-            # we still can't be 100% sure without the root, but the hierarchy suggests it's 
+            # we still can't be 100% sure without the root, but the hierarchy suggests it's
             # either a TV show (if the parent was simple like 'disc 1') or a movie.
-            # Since you want to be generic, the safest assumption is 'no explicit hint' 
-            # unless the Season folder was found. 
-            # However, for TV, the S/E tag is usually enough. For a generic parser, 
+            # Since you want to be generic, the safest assumption is 'no explicit hint'
+            # unless the Season folder was found.
+            # However, for TV, the S/E tag is usually enough. For a generic parser,
             # this title_match is useful for *metadata*, but may not be a strong *type hint*.
-            
+
             # If the parent directory was NOT a season dir, and we find a title/(year) dir
             # two levels up, it suggests TV (since it's a hierarchy).
             if not hint.tv:
                 # Since it's nested under a titled folder, assume TV episode is the primary parse target
-                hint.tv = True 
+                hint.tv = True
                 return hint
-                
+
         # If no folder pattern matches, return no hint (leaving the parser to rely on filename regexes)
         return hint
 
@@ -241,23 +247,23 @@ class VideoParser():
             videopath = os.path.abspath(videopath)
         except Exception:
             pass
-        
+
         self.videopath = videopath
         self.corename, self.ext = os.path.splitext(os.path.basename(videopath))
         # Handle cases where the 'extension' is part of the core name
         if self.ext and self.ext[1:] not in self.vid_sub_exts:
             self.corename, self.ext = self.corename + self.ext, ''
-            
+
         self.title, self.raw_title, self.is_repack, self.year = None, None, None, None
         self.season, self.episode, self.episode_hi = None, None, None
         self.re_key, self.hint, self.is_special = '', '', False
-        
+
         # Determine hint if not explicitly provided
         if expect_episode is None and expect_movie is None:
             hint = self.type_hint_by_path(videopath)
             self._log(9, 'VideoParser type_hint:', vars(hint))
             expect_episode, expect_movie = hint.tv, hint.movie
-            
+
         self._parse(expect_episode=expect_episode, expect_movie=expect_movie)
         self.check_special(expect_movie, videopath)
 
@@ -266,7 +272,7 @@ class VideoParser():
         self.is_special = False # until proven otherwise
         if self.is_movie_year() or expect_movie:
             return
-        
+
         if self.season is not None and self.season == 0:  # s00 => special
             self.is_special = True
         elif self.episode is not None and self.episode == 0: # e00 => special
@@ -289,7 +295,7 @@ class VideoParser():
         From the regex lists above, assemble and test REs against the
         filename until a match is reached or the lists are exhausted.
         """
-        
+
         if bool(expect_movie) and not bool(expect_episode):
             cats = ('movie', 'tv')
             self.hint = 'movie'
@@ -303,12 +309,12 @@ class VideoParser():
 
         hits = []
         force_tv = -1 # if set indicates we need to force the tv hit
-        
+
         for cat in cats:
             for idx in range(len(self.regexes[cat])):
                 key = f'{cat[:3]}{idx}'
                 self._log(8, 'VideoParser: trying:', key, self.regexes[cat][idx])
-                
+
                 compiled_re = self.compiled_regexes.get(key, None)
                 if not compiled_re:
                     pat = self.regexes[cat][idx][1]
@@ -320,7 +326,7 @@ class VideoParser():
                 match = compiled_re.match(self.corename)
                 self._log(9, 'VideoParser pat:', compiled_re.pattern, self.corename, match,
                         match.groups() if match else '')
-                
+
                 if match:
                     self._log(7, 'VideoParser: matched:', self.regexes[cat][idx])
 
@@ -341,15 +347,15 @@ class VideoParser():
 
                     hit = SimpleNamespace(season=None, episode=None, episode_hi=None,
                             year=None, is_repack=False, re_key=None, raw_title=None, title=None)
-                            
+
                     hit.raw_title = match.group(1)
                     hit.title = match.group(1).replace('.', ' ')
-                    
+
                     if self.regexes[cat][idx][0]:
                         force_tv = len(hits) # This is a strong TV indicator hit
-                        
+
                     hits.append(hit)
-                    
+
                     # Fill in TV/Movie specific fields based on category
                     if cat == 'tv':
                         # Match groups for TV are: $1=title, $2=season, $3=episode, $4=hi_ep, $5=repack
@@ -366,10 +372,10 @@ class VideoParser():
                         hit.year = match.group(2)
                         hit.year = int(hit.year) if hit.year else None
                         # Repack group index is always the last group in the pattern (index -1)
-                        hit.is_repack = bool(match.groups()[-1]) 
+                        hit.is_repack = bool(match.groups()[-1])
                         hit.re_key = key
                         self._log(5, 'VideoParser Movie hit:', vars(hit))
-                        
+
                     break # Stop at the first successful match in this category
 
         if len(hits) == 0:
@@ -382,17 +388,17 @@ class VideoParser():
             winner = hits[0]
         elif len(hits) == 2:
             winner, loser = hits[0], hits[1]
-            
+
             # Prioritize the strong TV match if it occurred
             if force_tv >= 0:
                 winner, loser = hits[force_tv], hits[0 if force_tv == 1 else 1]
-            
+
             # Case 1: TV match looks like a valid year (e.g., S19E45 looks like 1945)
             elif hits[1].year and hits[0].season and hits[0].episode:
                 if 1900 <= 100*int(hits[0].season) + int(hits[0].episode) <= 2099:
                     winner, loser = hits[1], hits[0] # Choose Movie
                     self._log(1, 'VideoParser: override as movie')
-            
+
             # Case 2: Movie match is weak (no year/junk indicator), but TV match is strong
             elif not hits[0].year and hits[1].season and hits[1].episode:
                 self._log(1, 'VideoParser: override as tvshow')
@@ -432,17 +438,17 @@ class VideoParser():
         # Load the YAML tests using the internal ruamel.yaml instance
         tests = yaml.load(VideoParser.tests_yaml)
         fail_cnt, results = 0, {}
-        
+
         # Helper for printing (since lg.pr is no longer available)
         _print = print
-        
+
         for filename, result_dict in tests.items():
             parsed = VideoParser(filename)
             nres = parsed.mini_str()
             # The structure of the loaded YAML is {'filename': {'result': '...string...'}}
-            ores = result_dict.get('result', '') 
+            ores = result_dict.get('result', '')
             ok = 'OK' if nres == ores else 'FAIL'
-            
+
             if ok != 'OK' or verbose:
                 _print(f'{ok:4s}: {filename}')
                 _print(f'- nres: {nres}')
@@ -472,7 +478,7 @@ class VideoParser():
         has_s_e = bool(parsed.season is not None and parsed.episode is not None)
         has_s_or_e = bool(parsed.season is not None or parsed.episode is not None)
         has_yr = bool(parsed.year is not None)
-        
+
         # Logic to check if the result seems reasonable based on the hint
         if parsed.hint == 'episode':
             seems_ok = bool(has_s_e or parsed.is_special)
@@ -542,25 +548,94 @@ class VideoParser():
       - result: n/a "American Experience s22e06b Eleanor Roosevelt 2" any .mp4
     """
 
+class Mangler:
+    """ Mangles names with fixed translation table """
+    translation_table = None
+    title_pat = None
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def mangle(text: str) -> str:
+        """
+        Mangles a string using a fixed, static character substitution table.
+        This function preserves non-alphabetic characters (numbers, spaces, punctuation)
+        and maintains the original casing (uppercase maps to uppercase, lowercase to lowercase).
+        Args:
+            text: The original string (e.g., 'Harry Wild').
+        Returns:
+            The mangled text (e.g., 'Wqrru Zild').
+        """
+        if Mangler.translation_table is None:
+            # --- 1. Define the Fixed Substitution Mapping ---
+            # Standard English alphabet (Source)
+            source_lower = string.ascii_lowercase  # 'abcdefghijklmnopqrstuvwxyz'
+            source_upper = string.ascii_uppercase  # 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            # Target mangled alphabet (This must be generated ONCE and fixed)
+            target_lower = 'qazwsxedcrfvtgbyhnujmikolp'
+            target_upper = 'QAZWSXEDCRFVTGBYHNUJMIKOLP'
+
+            # --- 2. Create a Unified Translation Table (Maketrans) ---
+            # We combine the source and target alphabets into a single translation table.
+            # This is the most efficient way to perform character-by-character substitution in Python.
+            Mangler.translation_table = str.maketrans(
+                source_lower + source_upper,
+                target_lower + target_upper
+            )
+
+        # --- 3. Apply the Translation ---
+        # The translate method handles the substitution quickly.
+        # Any characters not in the source_lower/source_upper strings (like numbers,
+        # spaces, dashes, etc.) are automatically preserved.
+        mangled_text = text.translate(Mangler.translation_table)
+
+        return mangled_text
+
+    @staticmethod
+    def mangle_title(filename: str) -> str:
+        """
+        Static method to mangle a title without needing to instantiate Mangler.
+        Args:
+            title: The original title string.
+        Returns:
+            The mangled title string.
+        """
+        core, ext = os.path.splitext(filename)
+        if not Mangler.title_pat:
+            Mangler.title_pat = re.compile(r'(^.*?)\b(s\d+e\d+|\d+x\d+|\d\d\d|\d\d\d\d)', re.IGNORECASE)
+        mat = Mangler.title_pat.match(core)
+        size = len(mat.group(1)) if mat else 40
+        rv = Mangler.mangle(core[:size]) + core[size:] + ext
+        return rv
+
+
 if __name__ == "__main__":
     # Example 1: Run full regression tests (verbose=False by default)
     # This prints only the summary and any failures.
+
+    tests = yaml.load(VideoParser.tests_yaml)
+    for video in tests:
+        mangled = Mangler.mangle_title(video)
+        print(f'{mangled=}    {video=}')
+
+
     VideoParser.run_regressions(verbose=False)
-    
+
     # ---
-    
+
     # Example 2: Test a specific file with verbose output
     print("\n" + "="*50)
     print("Testing specific file: Yellowstone.2018.S03E08.720p.HEVC.x265-MeGusta.mkv")
     print("="*50)
     VideoParser.parse_file("Yellowstone.2018.S03E08.720p.HEVC.x265-MeGusta.mkv", verbose=True)
-    
+
     # Example 3: Test a file that fails to parse cleanly
     print("\n" + "="*50)
     print("Testing file that fails to parse as TV/Movie: Gone with the Wind.avi")
     print("="*50)
     VideoParser.parse_file("Gone with the Wind.avi", verbose=True)
-    
+
     # Example 4: Test a file that is parsed as a movie
     print("\n" + "="*50)
     print("Testing Movie file: Captain Alatriste The Spanish Musketeer (2006).mkv")

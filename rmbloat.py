@@ -309,7 +309,7 @@ class Job: # class FfmpegJob:
         self.vid = vid
         self.start_mono = time.monotonic()
         self.progress='DRY-RUN' if converter.opts.dry_run else 'Started'
-        self.input_file = vid.filebase
+        self.input_file = os.path.basename(vid.filepath)
         self.orig_backup_file=orig_backup_file
         self.temp_file=temp_file
         self.duration_secs=duration_secs
@@ -386,7 +386,6 @@ class Converter:
     def apply_probe(self, vid, probe):
         """ TBD """
         # shorthand
-        vid.probe = probe
         vid.width = probe.width
         vid.height = probe.height
         vid.codec = probe.codec
@@ -406,6 +405,7 @@ class Converter:
 
         vid.summary = (f'  {vid.width}x{vid.height}' +
                         f' {vid.codec} {vid.bloat}b {vid.gb}G')
+        return probe
 
     def already_converted(self, basic_ns, video_file):
         """
@@ -429,9 +429,10 @@ class Converter:
                     duration=None, codec=None, bitrate=None, bloat=None, bloat_ok=None,
                     codec_ok=None, gb=None, all_ok=None,
                     standard_name=basic_ns.standard_name,
-                    do_rename=basic_ns.do_rename, probe=None,
-                return_code=None, texts=[], ops=[])
-        self.apply_probe(vid, basic_ns.probe)
+                    do_rename=basic_ns.do_rename,
+                    probe0=None, probe1=None, basename1=None,
+                    return_code=None, texts=[], ops=[])
+        vid.probe0 = self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
         vid.doit = '[ ]' if vid.all_ok or self.dont_doit(vid) else '[X]'
@@ -455,21 +456,22 @@ class Converter:
         """ TBD """
 
         os.chdir(os.path.dirname(vid.filepath))
+        basename = os.path.basename(vid.filepath)
 
         ## print(f'standard_name2: {do_rename=} {standard_name=})')
         prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
         temp_file = f"{prefix}.{vid.standard_name}"
-        orig_backup_file = f"ORIG.{vid.filebase}"
+        orig_backup_file = f"ORIG.{basename}"
 
         if os.path.exists(temp_file):
             os.unlink(temp_file)
-        duration_secs = vid.probe.duration
+        duration_secs = vid.probe0.duration
         if self.opts.sample:
             duration_secs = self.sample_seconds
 
         job = Job(vid, orig_backup_file, temp_file, duration_secs)
         pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
-        job.input_file = vid.filebase
+        job.input_file = basename
 
         nice_opts, thread_opts = [], []
         if not self.opts.full_speed:
@@ -871,19 +873,20 @@ class Converter:
         if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
             trashes = set()
+            basename = os.path.basename(vid.filepath)
             try:
                 # Rename original to backup
                 if not dry_run and self.opts.keep_backup:
-                    os.rename(vid.filebase, job.orig_backup_file)
+                    os.rename(basename, job.orig_backup_file)
                 if self.opts.keep_backup:
                     vid.ops.append(
-                        f"{would} rename {vid.filebase!r} {job.orig_backup_file!r}")
+                        f"{would} rename {basename!r} {job.orig_backup_file!r}")
                 if not dry_run and not self.opts.keep_backup:
-                    send2trash.send2trash(vid.filebase)
+                    send2trash.send2trash(basename)
                 if dry_run and not self.opts.keep_backup:
-                    trashes.add(vid.filebase)
+                    trashes.add(basename)
                 if not self.opts.keep_backup:
-                    vid.ops.append(f"{would}trash {vid.filebase!r}")
+                    vid.ops.append(f"{would}trash {basename!r}")
 
                 # Rename temporary file to the original filename
                 if not dry_run:
@@ -892,18 +895,20 @@ class Converter:
                     f"{would}rename {job.temp_file!r} {vid.standard_name!r}")
 
                 if vid.do_rename:
-                    vid.ops += self.bulk_rename(vid.filebase, vid.standard_name, trashes)
+                    vid.ops += self.bulk_rename(basename, vid.standard_name, trashes)
 
                 if not dry_run:
                     # probe = self.get_video_metadata(vid.standard_name)
-                    self.apply_probe(vid, probe)
+                    vid.basename1 = vid.standard_name
+                    vid.probe1 = self.apply_probe(vid, probe)
 
             except OSError as e:
                 print(f"ERROR during swap of {vid.filepath}: {e}")
                 print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
         elif success and self.opts.sample:
             # probe = self.get_video_metadata(job.temp_file)
-            self.apply_probe(vid, probe)
+            vid.basename1 = job.temp_file
+            vid.probe1 = self.apply_probe(vid, probe)
         elif not success:
             # Transcoding failed, delete the temporary file
             if os.path.exists(job.temp_file):
@@ -1019,7 +1024,7 @@ class Converter:
 
     def dont_doit(self, vid):
         """ Returns true if prohibited from re-encoding """
-        base = vid.filebase.lower()
+        base = os.path.basename(vid.filepath).lower()
         if (base.startswith('sample.')
                 or base.startswith('test.')
                 or base.endswith('.recode.mkv')
@@ -1040,7 +1045,7 @@ class Converter:
                     continue
                 if doit_skips and vid.doit in doit_skips:
                     continue
-                basename = os.path.basename(vid.filepath)
+                basename = vid.basename1 if vid.basename1 else os.path.basename(vid.filepath)
                 dirname = os.path.dirname(vid.filepath)
                 res = f'{vid.height}p'
                 ht_over = ' ' if vid.res_ok else '^' # '■'
@@ -1048,7 +1053,7 @@ class Converter:
                 co_over = ' ' if vid.codec_ok else '^'
                 mins = int(round(vid.duration / 60))
                 line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
-                line += f' {vid.codec:>5}{co_over} {mins:>4} {vid.gb:>6}   {basename} =ON= {dirname}'
+                line += f' {vid.codec:>5}{co_over} {mins:>4} {vid.gb:>6.3f}   {basename} ---> {dirname}'
                 if self.spins.search:
                     match = re.search(self.spins.search, line, re.IGNORECASE)
                     if not match:
@@ -1181,7 +1186,10 @@ class Converter:
                             self.finish_transcode_job(
                                 success=bool(got == 0), job=self.job)
                             dumped = vars(self.job.vid)
-                            dumped['probe'] = vars(dumped['probe'])
+                            if self.job.vid.probe0:
+                                dumped['probe0'] = vars(dumped['probe0'])
+                            if self.job.vid.probe1:
+                                dumped['probe1'] = vars(dumped['probe1'])
                             if got == 0:
                                 dumped['texts'] = []
                             
@@ -1236,7 +1244,8 @@ class Converter:
                 self.process_one_file(vid)
 
             except Exception as e:
-                print(f"An error occurred while processing {file_basename}: {e}")
+                raise
+                # print(f"An error occurred while processing {file_basename}: {e}")
             finally:
                 os.chdir(self.original_cwd)
         self.do_window_mode()
