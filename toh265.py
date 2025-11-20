@@ -22,6 +22,7 @@ import shlex
 import re
 import time
 import fcntl
+import json
 from textwrap import indent
 from typing import Optional, Union
 from copy import copy
@@ -301,9 +302,10 @@ class FfmpegMon:
 class Job: # class FfmpegJob:
     """ TBD """
     def __init__(self, vid, orig_backup_file, temp_file, duration_secs):
+        converter = Converter.singleton
         self.vid = vid
-        self.start_time=time.time()
-        self.progress='Started'
+        self.start_mono = time.monotonic()
+        self.progress='DRY-RUN' if converter.opts.dry_run else 'Started'
         self.input_file = vid.filebase
         self.orig_backup_file=orig_backup_file
         self.temp_file=temp_file
@@ -361,7 +363,7 @@ class Converter:
         Converter.singleton = self
         self.win = None
         self.opts = opts
-        self.vals = None # spinner values
+        self.spins = None # spinner values
         self.vids = []
         self.visible_vids = []
         self.original_cwd = os.getcwd()
@@ -424,27 +426,11 @@ class Converter:
                     filebase=os.path.basename(video_file),
                     standard_name=basic_ns.standard_name,
                     do_rename=basic_ns.do_rename, probe=None,
-                return_code=None, texts=[])
+                return_code=None, texts=[], ops=[])
         self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
-        if (vid.res_ok and vid.bloat_ok) or self.dont_doit(vid):
-            if self.opts.window_mode:
-                vid.doit = '[ ]'
-            else:
-                print(f'      -: {vid.summary}')
-            return True
-        else:
-            why = '' if vid.res_ok else f'>{self.TARGET_HEIGHT}p '
-            why += '' if vid.bloat_ok else f'>{self.opts.bloat_thresh} kbps'
-            why += '' if vid.codec else f'>{vid.codec}'
-            if why:
-                why = f' [{why}]'
-            if self.opts.window_mode:
-                vid.doit = '[X]'
-            else:
-                print(f'CONVERT: {vid.summary}{why}')
-            return False
+        vid.doit = '[ ]' if vid.all_ok or self.dont_doit(vid) else '[X]'
     
     @staticmethod
     def bash_quote(args):
@@ -515,11 +501,7 @@ class Converter:
             job.temp_file
         ]
         vid.command = self.bash_quote(ffmpeg_cmd)
-        if self.vals.dry_run:
-            print(f"SKIP RUNNING {ffmpeg_cmd}\n")
-        else:
-            if not self.opts.keep_window:
-                print(' '.join(ffmpeg_cmd))
+        if not self.opts.dry_run:
             job.ffsubproc.start(ffmpeg_cmd)
             self.progress_line_mono = time.monotonic() - 15.0
         return job
@@ -528,7 +510,7 @@ class Converter:
         """
         Runs the FFmpeg transcode command and monitors its output for a non-scrolling display.
         """
-        if not self.vals.dry_run:
+        if not self.opts.dry_run:
             # --- Progress Monitoring Loop ---
             # Read stderr line-by-line until the process finishes
             while True:
@@ -546,9 +528,9 @@ class Converter:
             # Clear the progress line and print final status
             print('\r' + ' ' * 120, end='', flush=True) # Overwrite last line with spaces
 
-        if self.vals.dry_run or return_code == 0:
+        if self.opts.dry_run or return_code == 0:
             print(f"\r{job.input_file}: Transcoding FINISHED"
-                  f" (Elapsed: {timedelta(seconds=int(time.time() - job.start_time))})")
+                  f" (Elapsed: {timedelta(seconds=int(time.monotonic() - job.start_mono))})")
             return True # Success
         else:
             # Print a final error message
@@ -599,7 +581,7 @@ class Converter:
                     print(f"\n{line=} {groups=}")
                     raise
 
-                elapsed_time_sec = int(time.time() - job.start_time)
+                elapsed_time_sec = int(time.monotonic() - job.start_mono)
 
                     # 2. Calculate remaining time
                 if job.duration_secs > 0:
@@ -706,7 +688,7 @@ class Converter:
                 name = f'{parsed.title} {parsed.year}'
 
             name +=  f' {height}p x265-cmf{self.opts.quality} recode'
-            name = re.sub(r'[\s\.\-]+', '.', name.lower()) + '.mkv'
+            name = re.sub(r'[\s\.\-]+', '.', name) + '.mkv'
 
             return bool(name != basename), name
 
@@ -772,7 +754,9 @@ class Converter:
             new_file_name: A sample filename (e.g., 'newbie.mkv') used to define
                            the base name to rename to ('newbie').
         """
-        dry_run = self.vals.dry_run
+        ops = []
+        dry_run = self.opts.dry_run
+        would = 'WOULD ' if dry_run else ''
 
         old_base_name, _ = os.path.splitext(old_file_name)
         new_base_name, _ = os.path.splitext(new_file_name)
@@ -824,26 +808,20 @@ class Converter:
                 # 5. Perform the rename operation
                 full_new_path = os.path.join(root, new_item_name)
                 try:
-                    if dry_run:
-                        if os.path.basename(item_name) not in trashes:
-                            print(f"  WOULD rename as: '{full_new_path}'")
-                    else:
-                        os.rename(full_old_path, full_new_path)
-                except OSError as e:
-                    # Handle potential errors (e.g., permission errors, file in use)
-                    print(f"  ERROR renaming '{full_old_path}' to '{full_new_path}': {e}")
+                    if os.path.basename(item_name) not in trashes:
+                        if not dry_run:
+                            os.rename(full_old_path, full_new_path)
+                        ops.append(f"{would}rename {full_old_path!r} {full_new_path!r}")
                 except Exception as e:
-                    # Catch other unexpected errors
-                    print(f"  An unexpected error occurred with '{full_old_path}': {e}")
+                    # Handle potential errors (e.g., permission errors, file in use)
+                    ops.append(f"ERR: rename '{full_old_path}' '{full_new_path}': {e}")
+        return ops
 
     def process_one_file(self, vid):
         """ Handle just one """
         input_file = vid.video_file
         if not self.is_valid_video_file(input_file):
             return  # Skip to the next file in the loop
-        if not self.opts.window_mode:
-            print("\n" + "=" * 80)
-            print(f"{input_file}")
 
         # --- File names for the safe replacement process ---
         do_rename, standard_name = self.standard_name(input_file, vid.probe.height)
@@ -851,19 +829,7 @@ class Converter:
         vid.do_rename = do_rename
         vid.standard_name = standard_name
 
-        if self.opts.rename_only:
-            if do_rename:
-                self.bulk_rename(input_file, standard_name, trashes=set())
-            return
-
-        # 1. Quality Checkns
-        if self.already_converted(vid, input_file):
-            return
-        if self.opts.info_only:
-            return
-        if self.opts.window_mode:
-            return
-        self.convert_one_file(vid)
+        self.already_converted(vid, input_file)
 
     def convert_one_file(self, vid):
         """ TBD """
@@ -876,7 +842,7 @@ class Converter:
     def finish_transcode_job(self, success, job):
         """ TBD """
         # 4. Atomic Swap (Safe Replacement)
-        dry_run = self.vals.dry_run
+        dry_run = self.opts.dry_run
         vid = job.vid
         probe = None
         if success:
@@ -903,26 +869,26 @@ class Converter:
             trashes = set()
             try:
                 # Rename original to backup
-                if not dry_run:
-                    if self.opts.keep_backup:
-                        os.rename(vid.filebase, job.orig_backup_file)
-                    else:
-                        send2trash.send2trash(vid.filebase)
-                else:
-                    if self.opts.keep_backup:
-                        print(f"{would}Move Original to {job.orig_backup_file}")
-                    else:
-                        print(f"{would}Trash {vid.filebase}")
-                        trashes.add(vid.filebase)
+                if not dry_run and self.opts.keep_backup:
+                    os.rename(vid.filebase, job.orig_backup_file)
+                if self.opts.keep_backup:
+                    vid.ops.append(
+                        f"{would} rename {vid.filebase!r} {job.orig_backup_file!r}")
+                if not dry_run and not self.opts.keep_backup:
+                    send2trash.send2trash(vid.filebase)
+                if dry_run and not self.opts.keep_backup:
+                    trashes.add(vid.filebase)
+                if not self.opts.keep_backup:
+                    vid.ops.append(f"{would}trash {vid.filebase!r}")
 
                 # Rename temporary file to the original filename
                 if not dry_run:
                     os.rename(job.temp_file, vid.standard_name)
-                print(f"OK: {would}Replace {vid.standard_name}")
+                vid.ops.append(
+                    f"{would}rename {job.temp_file!r} {vid.standard_name!r}")
 
                 if vid.do_rename:
-                    self.bulk_rename(vid.filebase, vid.standard_name,
-                                     trashes)
+                    vid.ops += self.bulk_rename(vid.filebase, vid.standard_name, trashes)
 
                 if not dry_run:
                     # probe = self.get_video_metadata(vid.standard_name)
@@ -1047,18 +1013,14 @@ class Converter:
 
         return video_files_out
 
-    def do_keep_window(self):
-        """ Computed do keep window based on that option and others """
-        if self.vals.dry_run or self.opts.rename_only:
-            return False
-        return self.opts.keep_window
-
     def dont_doit(self, vid):
         """ Returns true if prohibited from re-encoding """
         base = vid.filebase.lower()
         if (base.startswith('sample.')
                 or base.startswith('test.')
-                or base.endswith('.recode.mkv')):
+                or base.endswith('.recode.mkv')
+                or vid.doit not in ('[ ]', '[X]', '', None)
+                ):
             return True
         return False
 
@@ -1066,16 +1028,10 @@ class Converter:
         """ TBD """
         def make_lines(doit_skips=None):
             nonlocal self
-            lines, nses = [], []
-            self.visible_vids = []
+            lines, self.visible_vids = [], []
             stats = SimpleNamespace(total=0, picked=0, done=0, progress_idx=0)
-            stats.total = len(self.vids)
 
             for vid in self.vids:
-                if vid.doit != '[ ]':
-                    stats.picked += 1
-                if vid.doit not in ('[X]', '[ ]'):
-                    stats.done += 1
                 if self.state == 'convert' and vid.doit == '[ ]':
                     continue
                 if doit_skips and vid.doit in doit_skips:
@@ -1089,13 +1045,17 @@ class Converter:
                 mins = int(round(vid.duration / 60))
                 line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
                 line += f' {vid.codec:>5}{co_over} {mins:>4} {vid.gb:>6}   {basename} ON {dirname}'
-                if self.vals.search and self.state == 'select':
-                    match = re.search(self.vals.search, line, re.IGNORECASE)
+                if self.spins.search:
+                    match = re.search(self.spins.search, line, re.IGNORECASE)
                     if not match:
                         continue
+                if vid.doit == '[X]':
+                    stats.picked += 1
+                if vid.doit not in ('[X]', '[ ]', 'IP '):
+                    stats.done += 1
 
                 lines.append(line)
-                nses.append(vid)
+                # nses.append(vid)
                 self.visible_vids.append(vid)
                 if self.job and self.job.vid == vid:
                     lines.append(f'-----> {self.job.progress}')
@@ -1106,6 +1066,7 @@ class Converter:
                         self.win.set_pick_mode(False)
 
                 # print(line)
+            stats.total = len(self.visible_vids)
             return lines, stats
 
         def toggle_doit(vid):
@@ -1120,13 +1081,11 @@ class Converter:
         spin.add_key('init_all', 'i,SP - set all initial state', vals=[False, True])
         spin.add_key('toggle', 't - toggle current line state', vals=[False, True])
         spin.add_key('quit', 'q - exit the program', vals=[False, True])
-        spin.add_key('dry_run', 'd - dry-run', vals=[False, True])
         spin.add_key('search', '/ - search string',
                           prompt='Set search string, then Enter')
 
         others={ord(' '), ord('g')}
-        self.vals = vals = spin.default_obj
-        vals.dry_run = self.opts.dry_run
+        self.spins = spins = spin.default_obj
 
         self.win = win = ConsoleWindow(
             keys=spin.keys^others, body_rows=10+len(self.vids))
@@ -1138,12 +1097,12 @@ class Converter:
             lines, stats = make_lines()
             if self.state == 'select':
                 head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o [q]uit'
-                if vals.dry_run:
-                    head += ' [d]ry-run'
+                if self.opts.dry_run:
+                    head += ' DRY-RUN'
                 if self.opts.sample:
                     head += ' SAMPLE'
-                if vals.search:
-                    head += f' /{vals.search}'
+                if spins.search:
+                    head += f' /{spins.search}'
                 win.add_header(head)
             win.add_header(f'     Picked={stats.picked}/{stats.total}')
             if self.state != 'select':
@@ -1159,49 +1118,44 @@ class Converter:
             key = win.prompt(seconds=0.5) # Wait for half a second or a keypress
             if key in spin.keys:
                 spin.do_key(key, win)
-            if self.opts.sample:
-                self.vals.dry_run = False
 
             if self.state == 'select':
-                if vals.set_all:
-                    for vid in self.vids:
+                if spins.set_all:
+                    for vid in self.visible_vids:
                         if not self.dont_doit(vid):
                             vid.doit = '[X]'
-                    vals.set_all = False
+                    spins.set_all = False
 
-                if vals.reset_all:
-                    for vid in self.vids:
-                        vid.doit = '[ ]'
-                    vals.reset_all = False
-
-                if vals.init_all:
-                    for vid in self.vids:
-                        if self.dont_doit(vid) or vid.all_ok:
+                if spins.reset_all:
+                    for vid in self.visible_vids:
+                        if vid.doit in ('[ ]', '[X]'):
                             vid.doit = '[ ]'
-                        else:
-                            vid.doit = '[X]'
-                    vals.init_all = False
+                    spins.reset_all = False
 
-                if vals.toggle or key == ord(' '):
+                if spins.init_all:
+                    for vid in self.visible_vids:
+                        if vid.doit in ('[ ]', '[X]'):
+                            if self.dont_doit(vid) or vid.all_ok:
+                                vid.doit = '[ ]'
+                            else:
+                                vid.doit = '[X]'
+                    spins.init_all = False
+
+                if spins.toggle or key == ord(' '):
                     idx = win.pick_pos
                     if 0 <= idx < len(self.visible_vids):
                         toggle_doit(self.visible_vids[idx])
-                        vals.toggle = False
+                        spins.toggle = False
                         win.pick_pos += 1
 
-
                 if key == ord('g'):
-                    if self.do_keep_window():
-                        self.state = 'convert'
+                    self.state = 'convert'
                         # self.win.set_pick_mode(False, 1)
-                    else:
-                        win.stop_curses()
-                        break
 
-                if vals.quit:
+                if spins.quit:
                     sys.exit(0)
             if self.state == 'convert':
-                if vals.quit:
+                if spins.quit:
                     if self.job:
                         self.job.ffsubproc.stop()
                         self.job.vid.doit = 'ABT'
@@ -1209,44 +1163,49 @@ class Converter:
                         break
                 if self.job:
                     while True:
-                        got = self.get_job_progress(self.job)
+                        if self.opts.dry_run:
+                            delta = time.monotonic() - self.job.start_mono 
+                            got = 0 if delta >= 3 else f'{delta=}'
+                        else:
+                            got = self.get_job_progress(self.job)
                         if isinstance(got, str):
                             self.job.progress = got
                         elif isinstance(got, int):
                             self.job.vid.doit = ' OK' if got == 0 else 'ERR'
                             self.finish_transcode_job(
                                 success=bool(got == 0), job=self.job)
-                            self.job = None
+                            dumped = vars(self.job.vid)
+                            dumped['probe'] = vars(dumped['probe'])
+                            if got == 0:
+                                dumped['texts'] = []
+                            
+                            if self.opts.sample:
+                                title = 'SAMPLE'
+                            elif self.opts.dry_run:
+                                title = 'DRY-RUN'
+                            else:
+                                title = 'RE-ENCODE-TO-H265'
+
+                            lg.put('OK' if got == 0 else 'ERR',
+                                title + ' ', json.dumps(dumped, indent=4))
+                            self.job = None 
                             break
                         else:
                             break
                 if not self.job:
-                    for vid in self.vids:
+                    for vid in self.visible_vids:
+                        if not vid:
+                            continue
                         if vid.doit == '[X]':
                             self.prev_time_encoded_secs = -1
                             self.job = self.start_transcode_job(vid)
                             vid.doit = 'IP '
                             break
                     if not self.job:
-                        win.stop_curses()
-                        break
+                        self.state = 'select'
+                        win.set_pick_mode(True, 1)
 
             win.clear()
-
-        if not self.do_keep_window():
-            for vid in self.vids:
-                if 'X' in vid.doit:
-                    print(f'>>> {vid.filebase}')
-                    self.convert_one_file(vid)
-        else:
-            lines, _ = make_lines(doit_skips={'[ ]', '[X]'})
-            for idx, line in enumerate(lines):
-                vid = self.visible_vids[idx]
-                if vid:
-                    print(line)
-                    if vid.return_code:
-                        indent('\n'.join(vid.texts), '  ')
-
 
     def main_loop(self):
         """ TBD """
@@ -1274,9 +1233,7 @@ class Converter:
                 print(f"An error occurred while processing {file_basename}: {e}")
             finally:
                 os.chdir(self.original_cwd)
-        if self.opts.window_mode:
-            self.do_window_mode()
-
+        self.do_window_mode()
 
 
 def main(args=None):
@@ -1322,18 +1279,12 @@ def main(args=None):
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
                     help='save the -B/-b/-q/-a/-F/-t options as defaults')
-        parser.add_argument('-i', '--info-only', action='store_true',
-                    help='print just basic info')
         parser.add_argument('-n', '--dry-run', action='store_true',
                     help='Perform a trial run with no changes made.')
-        parser.add_argument('-r', '--rename-only', action='store_true',
-                    help='just look for re-names')
         parser.add_argument('-s', '--sample', action='store_true',
                     help='produce 30s samples called SAMPLE.{input-file}')
-        parser.add_argument('-w', '--window-mode', action='store_false',
-                    help='disable window mode')
-        parser.add_argument('-W', '--keep-window', action='store_false',
-                    help='run conversions in window mode')
+        parser.add_argument('-L', '--logs', action='store_true',
+                    help='view the logs')
 
         parser.add_argument('files', nargs='*',
             help='Non-option arguments (e.g., file paths or names).')
@@ -1347,8 +1298,25 @@ def main(args=None):
             cfg.write()
             sys.exit(0)
 
+        if opts.logs:
+            files = lg.log_paths
+            cmd = ['less', '+F', files[0]]
+            if os.path.isfile(files[1]):
+                cmd.append(files[1])
+            try:
+                program = cmd[0] 
+                # This call replaces the current Python process
+                os.execvp(program, cmd)
+            except FileNotFoundError:
+                print(f"Error: Executable '{program}' not found.", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                # Catch any other execution errors
+                print(f"An error occurred during exec: {e}", file=sys.stderr)
+                sys.exit(1)
+
         if opts.sample:
-            opts.dry_run = False
+            opts.dry_run = False # cannot have both
         opts.bloat_thresh = max(500, opts.bloat_thresh)
 
         Converter(opts, os.path.dirname(cfg.config_file_path)).main_loop()

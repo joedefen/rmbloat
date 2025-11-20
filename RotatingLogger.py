@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# pylint: disable=too-many-statements
+"""
+    My API for "logging" messages
+"""
+# pylint: disable=too-many-statements,line-too-long,protected-access
+# pylint: disable=broad-exception-caught,too-many-locals,redefined-outer-name
+# pylint: disable=invalid-name
 import os
 import sys
 import inspect
@@ -19,7 +24,7 @@ class RotatingLogger:
     # Log files are now ordered: [Active, Backup]
     LOG_FILES = ['log_0.txt', 'log_1.txt']
     # Indentation for subsequent lines of a multi-line message
-    INDENT = "    " 
+    INDENT = "    "
 
     def __init__(self, app_name='my_app', log_dir: str | Path | None = None):
         """
@@ -46,11 +51,11 @@ class RotatingLogger:
             else:
                 # Default behavior: ~/.config/{app_name}
                 base_dir = Path.home() / '.config'
-            
+
             # The final configuration directory path
             config_dir = base_dir / self.app_name
             config_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # 2. Define the absolute paths for the two log files
             self.log_paths = [config_dir / name for name in self.LOG_FILES]
         except Exception as e:
@@ -73,23 +78,23 @@ class RotatingLogger:
         """
         active_path = self.log_paths[0] # log_0.txt
         backup_path = self.log_paths[1] # log_1.txt
-        
+
         try:
             # 1. Delete the old backup (log_1.txt) to make way for the new backup
             if backup_path.exists():
                 backup_path.unlink()
-            
+
             # 2. Rename the active file (log_0.txt) to the backup file (log_1.txt)
             if active_path.exists():
                 active_path.rename(backup_path)
-            
+
             # The next log operation will implicitly create the new, empty log_0.txt.
-            
+
             # 3. Write a rotation notification to the new file (using the standard logging method)
             # caller_depth=1 points to the _rotate_log method call
             self.lg(f"--- LOG ROTATION: {active_path.name} moved to {backup_path.name}. New {active_path.name} is active. ---",
                     caller_depth=1)
-            
+
         except OSError as e:
             # Handle potential file system errors
             print(f"Error during log rotation/renaming: {e}", file=sys.stderr)
@@ -103,7 +108,7 @@ class RotatingLogger:
         :param log_messages: A list of strings/objects to be logged.
         :param caller_depth: How many stack frames to go back to find the calling code.
         """
-        
+
         # 1. Check for rotation before writing
         try:
             # Check the size of the active file (log_0.txt)
@@ -112,7 +117,7 @@ class RotatingLogger:
                 self._rotate_log()
         except OSError:
             # File system error, proceed with logging attempt but rotation skipped
-            pass 
+            pass
 
         # 2. Get caller information (filename and line number)
         caller_info = ""
@@ -124,7 +129,7 @@ class RotatingLogger:
                     frame = frame.f_back
                 else:
                     break
-            
+
             if frame:
                 line_number = frame.f_lineno
                 file_name = Path(frame.f_code.co_filename).name
@@ -136,24 +141,24 @@ class RotatingLogger:
 
         # 3. Format the log entry with multi-line support
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        
+
         # CRITICAL: Join all arguments into a single raw string
         raw_message = "".join(str(m) for m in log_messages)
-        
+
         # Split the raw message into lines
         all_lines = raw_message.split('\n')
-        
+
         formatted_lines = []
-        
+
         # The main log line format: [TIMESTAMP] [TYPE] (FILE:LINE) CONTENT
         # The first line is prefixed with the header
-        header = f"[{timestamp}] [{message_type}] {caller_info} "
+        header = f"\n[{timestamp}] [{message_type}] {caller_info} "
         formatted_lines.append(header + all_lines[0])
-        
+
         # Subsequent lines are prefixed with 4 spaces
         for subsequent_line in all_lines[1:]:
             formatted_lines.append(self.INDENT + subsequent_line)
-        
+
         # Join lines and add final newline
         log_entry = '\n'.join(formatted_lines) + '\n'
 
@@ -164,7 +169,7 @@ class RotatingLogger:
                 f.write(log_entry)
         except OSError as e:
             print(f"FATAL LOGGING ERROR writing to {self._active_path.name}: {e}", file=sys.stderr)
-            
+
     def _prepare_messages(self, args):
         """
         Checks if the first argument is a list of strings and formats it by joining with '\n'.
@@ -180,7 +185,7 @@ class RotatingLogger:
     def put(self, message_type: str, *args, **kwargs):
         """
         Logs a message with an arbitrary MESSAGE_TYPE tag.
-        
+
         If the first argument is a list of strings, they are joined by newline characters.
         Supports print-style arguments and multi-line messages with indentation.
         """
@@ -191,7 +196,7 @@ class RotatingLogger:
     def lg(self, *args, **kwargs):
         """
         Logs an ordinary message with a 'MSG' tag.
-        
+
         If the first argument is a list of strings, they are joined by newline characters.
         Supports print-style arguments and multi-line messages with indentation.
         """
@@ -202,13 +207,13 @@ class RotatingLogger:
     def err(self, *args, **kwargs):
         """
         Logs an error message with an 'ERR' tag.
-        
+
         If the first argument is a list of strings, they are joined by newline characters.
         Supports print-style arguments and multi-line messages with indentation.
         """
         prepared_args = self._prepare_messages(args)
         # Print to stderr for immediate visibility of errors, then log formally
-        print(f"!!! ERROR: {''.join(str(m) for m in prepared_args)}", file=sys.stderr) 
+        print(f"!!! ERROR: {''.join(str(m) for m in prepared_args)}", file=sys.stderr)
         # caller_depth=2 points to the user's call to err()
         self._write_log("ERR", prepared_args, caller_depth=2)
 
@@ -218,26 +223,26 @@ Log = RotatingLogger
 
 # --- Self-testing Main Block (formerly demo_app.py content) ---
 if __name__ == "__main__":
-    
+
     # Configuration for demo run
     APP_NAME = "MySuperApp"
     # Overriding the log directory to /tmp for easy access and cleanup during testing
-    LOG_DIR_OVERRIDE = "/tmp" 
+    LOG_DIR_OVERRIDE = "/tmp"
     LOG_MSG_COUNT = 3
-    
+
     # Instantiate the logger, using the /tmp override for testing
     logger = RotatingLogger(app_name=APP_NAME, log_dir=LOG_DIR_OVERRIDE)
 
     print(f"Logger initialized for application: {APP_NAME}")
     print(f"Logs are being written to: {logger._active_path}")
     print("-" * 50)
-    
+
     # 1. Log an ordinary message
     logger.lg("Application started successfully in demonstration mode.")
-    
+
     # --- DEMO 1: Standard lg() with manual multi-line message ---
     logger.lg("This is a manual multiple\nline log message demonstrating the 4-space indent.")
-    
+
     # --- DEMO 2: NEW FEATURE: lg() with list of strings ---
     multi_step_log = [
         "Starting file integrity check:",
@@ -246,7 +251,7 @@ if __name__ == "__main__":
         "Check FAILED."
     ]
     logger.lg(multi_step_log, "Process finished.")
-    
+
     # --- DEMO 3: Custom put() with structured, multi-line data (using JSON) ---
     data_dict = {
         "status": "success",
@@ -254,9 +259,9 @@ if __name__ == "__main__":
         "duration_ms": 45.2,
         "source": "api_endpoint_v2"
     }
-    logger.put("API", "Database transaction committed successfully.\n" + 
+    logger.put("API", "Database transaction committed successfully.\n" +
                      json.dumps(data_dict, indent=4))
-    
+
     # --- DEMO 4: err() with multi-line stack trace ---
     try:
         raise ValueError("Configuration file missing.")
@@ -267,19 +272,19 @@ if __name__ == "__main__":
                          f"--- Simplified Traceback ---\n"
                          f"Line: {sys._getframe().f_lineno} in {Path(sys._getframe().f_code.co_filename).name}")
         logger.err(error_details)
-        
+
     # 5. Log a loop of messages
     print(f"Logging {LOG_MSG_COUNT} routine messages...")
     for i in range(1, LOG_MSG_COUNT + 1):
         if i == 2:
-             logger.lg("Mid-run check-in. Everything looks okay.")
+            logger.lg("Mid-run check-in. Everything looks okay.")
         else:
             logger.lg(f"Loop iteration {i} of {LOG_MSG_COUNT} completed.")
         time.sleep(0.001)
-        
+
     # 6. Final message
     logger.lg("Application shutdown initiated.")
-    
+
     print("-" * 50)
-    print(f"Demonstration complete.")
+    print("Demonstration complete.")
     print(f"Check the log files in the directory: {logger._active_path.parent}")
