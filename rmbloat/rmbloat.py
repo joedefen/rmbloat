@@ -3,10 +3,8 @@
 """
 TBD
 TODO:
-- show GB and net savings
 - ensure the 10% better is enforced and the NET is computed
     - need an option
-- show cpu consumption/max
 - error strategy
   - to the probe cache, add an "exception" field
   - For errors in transcoding, I was thinking of exception values "Er1" ... "Er9" where the number is
