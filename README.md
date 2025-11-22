@@ -1,13 +1,25 @@
-# rmbloat
-`rmbloat` easily converts your entire, aging video collection to h265. This is useful for size reduction and ensure efficient rendering on modern video players.
+# `rmbloat` - the smart video converter for media server owners
 
-While this converter has many potential uses, it is geared towards doing mass conversions on a media server.  Since it is potentially very long running, t makes sense to start `rmbloat` in a tmux window that out-lives a log in session (say on a headless server).
+`rmbloat` is an intelligent, interactive video converter designed specifically for media server owners to reclaim massive amounts of disk space effortlessly, while maintaining high visual quality. It identifies the most inefficient videos in your collection and lets you convert them in prioritized, low-impact background batches.
+
+### The Compelling Problem (and the `rmbloat` Solution)
+
+Your video library is likely filled with bloat: older H.264 (AVC), MPEG-4, or high-bitrate H.265 files that waste valuable storage and sometimes create playback challenges.
+
+* **The Problem**: Manually finding and converting these files is tedious, requires dozens of FFmpeg commands, and can easily overwhelm your server.
+* **The `rmbloat` Solution**: We use the unique BLOAT metric to prioritize files that will give you the largest size reduction per conversion. `rmbloat` then runs the conversions in a low-priority, controlled background process, creating space savings with minimal server disruption.
+
+Since it is designed for mass conversions on a media server, it often makes sense to start `rmbloat` in a tmux or screen session that out-lives a log-in session (e.g., on a headless server).
 
 ### Easy Installation
-To install `rmbloat`, use `pipx rmbloat`. If needed, see [Install and Execute Python Applications Using pipx](https://realpython.com/python-pipx/).
+To install `rmbloat`, use `pipx rmbloat`. If explanation is needed, see [Install and Execute Python Applications Using pipx](https://realpython.com/python-pipx/).
 
 ### Bloat Metric
-`rmbloat` defines `bloat = 1000 * bitrate / sqrt(height*width)`.  A bloat value of 1000, roughly is an aggressively compressed h265 file. It is common to see bloats of 4000 or more; very bloated files can typically be reduced in size by a factor of 4 or more w/o too much loss of watchability.
+`rmbloat` defines
+```
+        bloat = 1000 * bitrate / sqrt(height*width)
+```
+A bloat value of 1000 is roughly that of an aggressively compressed h265 file. It is common to see bloats of 4000 or more in typical collections; very bloated files can typically be reduced in size by a factor of 4 or more w/o too much loss of watchability.
 
 ## Using `rmbloat`
 ### Starting `rmbloat` from the CLI
@@ -37,9 +49,9 @@ options:
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
   -L, --logs            view the logs
   ```
-  You can customize the defaults by setting the desired options and adding the  `--save-defaults` option. Non-video files in the given files and directories are simply ignored.
+  You can customize the defaults by setting the desired options and adding the  `--save-defaults` option to write the current choices to its .ini file. Non-video files in the given files and directories are simply ignored.
 
-  Candidate video files are probed (with `ffprobe`). If not probable, then the candidate is simply ignored. Probing a bunch of files can be time consuming, but `rmbloat` keeps a cache of probes so start-up can be fast if most candidates have been successfully probed.
+  Candidate video files are probed (with `ffprobe`). If the probe fails, then the candidate is simply ignored. Probing many files can be time consuming, but `rmbloat` keeps a cache of probes so start-up can be fast if most of the candidates have been successfully probed.
 
 ## The Three Main Screens
 The main screens are:
@@ -72,7 +84,7 @@ After scanning/probing the file and folder arguments, the selection screen will 
 * `^` denotes a value over the threshold for conversion. Besides an excessive bloat, the height could be too large, or the codec unacceptable; all depending on the program options.
 * To change whether selected, you can use:
     * the s/r/i keys to affect potentially every select, and
-    * SPACE to toggle just one; if one is toggle, the cursor moves to the next line so you can toggle sequences very quickly starting at the top.
+    * SPACE to toggle just one; if one is toggled, the cursor moves to the next line so you can toggle sequences very quickly starting at the top.
 * The videos are always sorted by their current bloat score, highest first.
 * To start converting the selected videos, hit "go" (i.e., the `g` key), and the Conversion Screen replaces this Selection screen.
 ### Conversion Screen
@@ -123,8 +135,31 @@ Type keys to alter choice:
 * Some keys are to instigate some action (they have no value)
 * Finally, `/` is to set the filter. The filter must be a valid python regular expression, and it is always case insensitive.
 
-## TODO (What needs documenting still)
-* File renaming. It renames files when resolution (TBD) or codec changes if the names had that info as well as companion files like .srt files.
-* NOT DONE (tried and failed):
-    * Intel QSV
-    * Thread limits
+## Under the Covers
+### File Renaming Strategy
+Files are renamed in one of these forms if they are successfully "parsed":
+* `{tv-series}.sXXeXX.{encoding-info}.mkv`
+* `{tv-series}.{year}.sXXeXX.{encoding-info}.mkv`
+* `{movie-title}.{year}.{encoding-info}.mkv`
+
+For those video files for which the needed components cannot be determined, it changes resolution or codec if those parts are both found and are now wrong.
+
+Companion files, like .srt files, and folders who share the same basename w/o the extension(s), will be renamed also if the video file was renamed.
+
+### Logging (--logs)
+When a conversion completes successfully or not, details are logged into files in your `~/.config/rmbloat` folder. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
+
+### Dry-Run (--dry-run)
+If started with `--dry-run`, then conversions are not done, but the log is written with details like how file(s) will be renamed. This helps with testing screens and actions more quickly than waiting for actual conversions.
+
+### Performance and Server Impact
+By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering its priority. This will (in our experience) allow the server to run rather well.  But, your experience may vary.
+
+We attempted to further limit impact by using options to control the number of threads, but none were found that changed anything.  Similiarly, with process affinity, nothing really helped (`ffmpeg` seems to dodge any controls). `systemd` throttles worked, but they decimate the efficiency of `ffmpeg` so much that it seemed better to do without.
+
+Furthermore, we attempted to use the Intel hardware accellerated h265 processing, but that never worked either.  This may be revisited some day.
+
+# TODO:
+- controls over the status line timeouts should be considered (those are fixed)
+- handling for failed and ineffective conversions
+
