@@ -6,29 +6,33 @@ import subprocess
 import math
 import re
 from types import SimpleNamespace
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor # <-- NEW IMPORT
 # pylint: disable=invalid-name,broad-exception-caught,line-too-long
 # pylint: disable=too-many-return-statements
 
 class ProbeCache:
     """ TBD """
+    disk_fields = set('anomaly width height codec bitrate duration size_bytes color_spt'.split())
+
+    """ TBD """
     def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp"):
         self.cache_path = os.path.join(cache_dir_name, cache_file_name)
-        self.cache_data: Dict[str, Dict[str, Any]] = {}
+        self.cache_data: Dict[str, Any] = {}
         self._dirty_count = 0
+        self._cache_lock = Lock() # NEW: import Lock from threading
         self.load()
 
     # --- Utility Methods ---
 
     @staticmethod
     def _get_file_size_info(filepath: str) -> Optional[Dict[str, Union[int, float]]]:
-        """Gets the size of a file in bytes and GB for storage."""
+        """Gets the size of a file in bytes storage."""
         try:
             size_bytes = os.path.getsize(filepath)
-            size_gb = round(size_bytes / (1024 * 1024 * 1024), 3)
             return {
                 'size_bytes': size_bytes,
-                'size_gb': size_gb
             }
         except Exception:
             return None
@@ -36,8 +40,30 @@ class ProbeCache:
     def _get_metadata_with_ffprobe(self, file_path: str) -> Optional[SimpleNamespace]:
         """
         Extracts video metadata using ffprobe and creates a SimpleNamespace object.
-        (Your existing logic)
         """
+        # --- START COMPACT COLOR PARAMETER EXTRACTION ---
+
+        def get_color_spt(): # compact color spec
+            nonlocal video_stream
+                # 1. Load the three color fields, defaulting missing fields to 'unknown'
+            colorspace = video_stream.get('color_space', 'unknown')
+            color_primaries = video_stream.get('color_primaries', 'unknown')
+            color_trc = video_stream.get('color_transfer', 'unknown')
+                # 2. Build the compact list using the placeholder '~'
+            parts = [colorspace] # Space is always the first part
+            if color_primaries != colorspace:
+                parts.append(color_primaries)
+            else:
+                parts.append("~") # Placeholder if Primaries == Space
+            if color_trc != color_primaries:
+                parts.append(color_trc)
+            else:
+                parts.append("~") # Placeholder if TRC == Primaries
+            # 3. Store the compact, comma-separated string
+            # Example: A:A:B becomes "A,~,B"
+            return ",".join(parts)
+
+        # --- END COMPACT COLOR PARAMETER EXTRACTION ---
         if not os.path.exists(file_path):
             print(f"Error: File not found at '{file_path}'")
             return None
@@ -73,23 +99,18 @@ class ProbeCache:
             meta.height = int(video_stream.get('height', 0))
             meta.codec = video_stream.get('codec_name', 'unk_codec')
 
+            meta.color_spt = get_color_spt()
+
             # Ensure safe integer conversion
             bitrate_str = metadata["format"].get('bit_rate', '0')
             meta.bitrate = int(int(bitrate_str)/1000)
 
             meta.duration = float(metadata["format"].get('duration', 0.0))
 
-            area = meta.width * meta.height
-            if area > 0:
-                meta.bloat = int(round((meta.bitrate / math.sqrt(area)) * 1000))
-            else:
-                meta.bloat = 0
-
             size_info = self._get_file_size_info(file_path)
             if size_info is None:
                 raise IOError("Failed to get file size after probe.")
 
-            meta.gb = size_info['size_gb']
             meta.size_bytes = size_info['size_bytes']
 
             # Check for dirty count to store cache
@@ -98,27 +119,38 @@ class ProbeCache:
 
             return meta
 
-        except FileNotFoundError:
-            print("Error: ffprobe command not found. Ensure FFmpeg/ffprobe is installed and in your system PATH.")
-            return None
-        except subprocess.TimeoutExpired:
-            print(f"Error: ffprobe timed out for '{file_path}'.")
-            return None
         except subprocess.CalledProcessError as e:
-            print(f"Error running ffprobe for '{file_path}': [Code: {e.returncode}] {e.stderr.strip()}")
+            print(f"Error executing ffprobe: {e.stderr}")
             return None
-        except Exception as e:
-            print(f"An unexpected error occurred during probing or parsing for '{file_path}': {e}")
+        except json.JSONDecodeError:
+            print(f"Error: Failed to decode ffprobe JSON output for '{file_path}'.")
             return None
+        except FileNotFoundError:
+            print("Error: The 'ffprobe' command was not found. Is FFmpeg installed and in your PATH?")
+            return None
+        except IOError as e:
+            print(f"File size error: {e}")
+            return None
+
 
     # --- Cache Management Methods ---
 
+    @staticmethod
+    def _compute_fields(meta):
+        # manufactured, but not stored fields (bloat and gigabytes)
+        area = meta.width * meta.height
+        if area > 0:
+            meta.bloat = int(round((meta.bitrate / math.sqrt(area)) * 1000))
+        else:
+            meta.bloat = 0
+        meta.gb = round(meta.size_bytes / (1024 * 1024 * 1024), 3)
+
     def _load_probe_data(self, filepath: str) -> SimpleNamespace:
         """Helper to convert stored dictionary back into SimpleNamespace."""
-        ns = SimpleNamespace(**self.cache_data[filepath]['probe_data'])
-        if not hasattr(ns, 'anomaly'):
-            ns.anomaly = None
-        return ns
+        meta = SimpleNamespace(**self.cache_data[filepath])
+        self._compute_fields(meta)
+
+        return meta
 
 
     def load(self):
@@ -138,30 +170,36 @@ class ProbeCache:
 
 
     def store(self):
-        """Writes the current cache data to the temporary JSON file ONLY IF it is dirty."""
+        """Writes the current cache data atomically if dirty."""
         if self._dirty_count > 0:
+            temp_path = self.cache_path + ".tmp"
             try:
-                with open(self.cache_path, 'w', encoding='utf-8') as f:
-                    # Note: self.cache_data contains dictionaries, which is JSON-serializable
+                # 1. Write to a temporary file
+                with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(self.cache_data, f, indent=4)
+
+                # 2. Rename/Move the temp file to the final path (Atomic operation)
+                os.replace(temp_path, self.cache_path)
 
                 self._dirty_count = 0
 
             except IOError as e:
                 print(f"Error writing cache file: {e}")
-
+            finally:
+                # Clean up temp file if it still exists (e.g., if os.replace failed)
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
 
     def _set_cache(self, filepath: str, meta: SimpleNamespace):
         """Stores the metadata in the cache dictionary and marks the cache as dirty."""
-        validation_keys = {'size_bytes': meta.size_bytes}
-
         # Convert the SimpleNamespace back to a dict for JSON storage
-        probe_dict = vars(meta)
+        probe_dict = dict(vars(meta))
+        if 'gb' in probe_dict:
+            del probe_dict['gb']
+        if 'bloat' in probe_dict:
+            del probe_dict['bloat']
 
-        self.cache_data[filepath] = {
-            'validation': validation_keys,
-            'probe_data': probe_dict
-        }
+        self.cache_data[filepath] = probe_dict
         self._dirty_count += 1
 
     def _get_valid_entry(self, filepath: str):
@@ -177,7 +215,13 @@ class ProbeCache:
             return None
 
         if filepath in self.cache_data:
-            cached_bytes = self.cache_data[filepath]['validation']['size_bytes']
+            fields = set(self.cache_data[filepath].keys())
+            if fields != self.disk_fields:
+                del self.cache_data[filepath]
+                self._dirty_count += 1
+                return None
+
+            cached_bytes = self.cache_data[filepath]['size_bytes']
 
             if cached_bytes != current_size_info['size_bytes']:
                 # File size changed, invalidate cache entry (mark as dirty)
@@ -206,6 +250,8 @@ class ProbeCache:
         # 3. Store result in cache if successful
         if meta:
             self._set_cache(filepath, meta)
+
+        self._compute_fields(meta)
 
         return meta
 
@@ -236,3 +282,53 @@ class ProbeCache:
                 # this does not happen often ... make sure it is saved NOW
                 self.store()
         return meta
+
+    def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[SimpleNamespace]]:
+        """
+        Batch process a list of file paths. Checks cache first, then runs ffprobe
+        concurrently for all cache misses.
+        """
+        results: Dict[str, Optional[SimpleNamespace]] = {}
+        probe_needed_paths: List[str] = []
+
+        # 1. First Pass: Check Cache for all files
+        for filepath in filepaths:
+            meta = self._get_valid_entry(filepath)
+            if meta:
+                results[filepath] = meta
+            else:
+                probe_needed_paths.append(filepath)
+
+        # 2. Second Pass: Concurrent Probing for cache misses
+        if not probe_needed_paths:
+            return results
+
+        print(f"Starting concurrent ffprobe for {len(probe_needed_paths)} files using {max_workers} threads...")
+
+        def probe_wrapper(filepath: str) -> Optional[SimpleNamespace]:
+            return self._get_metadata_with_ffprobe(filepath)
+
+        # Use ThreadPoolExecutor to run probes concurrently
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Map the probe_needed_paths to the probe_and_store function
+            future_to_path = {executor.submit(probe_wrapper, path): path for path in probe_needed_paths}
+
+            for future in future_to_path:
+                filepath = future_to_path[future]
+                try:
+                    meta = future.result()
+                    with self._cache_lock:
+                        self._set_cache(filepath, meta)
+                        self._compute_fields(meta)
+                        results[filepath] = meta
+                        if self._dirty_count >= 100:
+                            self.store()
+                except Exception as exc:
+                    print(f"Error probing {filepath}: {exc}")
+                    # results[filepath] = None
+
+        # 3. Final Step: Save all new probes to disk once (thread-safe store)
+        with self._cache_lock:
+            self.store()
+
+        return results

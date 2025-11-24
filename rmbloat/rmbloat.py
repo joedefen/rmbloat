@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # pylint: disable=too-many-statements
 """
-TBD
 TODO:
+- make max height an option
 - error strategy
   - to the probe cache, add an "exception" field
   - For errors in transcoding, I was thinking of exception values "Er1" ... "Er9" where the number is
@@ -18,11 +18,11 @@ TODO:
   - runs during certain hours ... restarts itself to freshly read
     disk
 """
-# pylint: disable=too-many-locals,line-too-long,broad-exceptioncaught
+# pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return,too-many-branches
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
 # pylint: disable=consider-using-with,line-too-long,too-many-lines
-# pylint: disable=too-many-nested-blocks,try-except-raise
+# pylint: disable=too-many-nested-blocks,try-except-raise,line-too-long
 
 import sys
 import os
@@ -514,19 +514,67 @@ class Converter:
         return f'{mask:#x}'
         # return '--cpu-set " + ",".join(map(str, sorted(list(selected_cores))))
 
+    def make_color_opts(self, color_spt):
+        """ TBD """
+        spt_parts = color_spt.split(',')
+
+        # 1. Reconstruct the three full, original values (can contain 'unknown')
+        space_orig = spt_parts[0]
+        primaries_orig = spt_parts[1] if spt_parts[1] != "~" else space_orig
+        trc_orig = spt_parts[2] if spt_parts[2] != "~" else primaries_orig
+
+        # 2. Define the final, valid FFmpeg values using fallback logic
+
+        # Use BT.709 as the default standard for all three components
+        DEFAULT_SPACE = 'bt709'
+        DEFAULT_PRIMARIES = 'bt709'
+        DEFAULT_TRC = '709' # Note: TRC often uses '709' instead of 'bt709' string
+
+        # Check and replace 'unknown' or invalid values with the safe default
+
+        # Color Space:
+        if space_orig == 'unknown':
+            space = DEFAULT_SPACE
+        else:
+            space = space_orig
+
+        # Color Primaries:
+        if primaries_orig == 'unknown':
+            primaries = DEFAULT_PRIMARIES
+        else:
+            primaries = primaries_orig
+
+        # Color TRC:
+        if trc_orig == 'unknown':
+            trc = DEFAULT_TRC
+        # FFmpeg also sometimes prefers the numerical '709' over 'bt709' for TRC
+        elif trc_orig == 'bt709':
+            trc = DEFAULT_TRC
+        else:
+            trc = trc_orig
+
+        # --- Use these final 'space', 'primaries', and 'trc' variables in the FFmpeg command ---
+
+        color_opts = [
+            '-colorspace', space,
+            '-color_primaries', primaries,
+            '-color_trc', trc
+        ]
+        return color_opts
+
     def start_transcode_job(self, vid):
         """ TBD """
         os.chdir(os.path.dirname(vid.filepath))
         basename = os.path.basename(vid.filepath)
+        probe = vid.probe0 # <-- Good: Accessing the probe data
 
-        ## print(f'standard_name2: {do_rename=} {standard_name=})')
         prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
         temp_file = f"{prefix}.{vid.standard_name}"
         orig_backup_file = f"ORIG.{basename}"
 
         if os.path.exists(temp_file):
             os.unlink(temp_file)
-        duration_secs = vid.probe0.duration
+        duration_secs = probe.duration
         if self.opts.sample:
             duration_secs = self.sample_seconds
 
@@ -534,52 +582,58 @@ class Converter:
         pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
         job.input_file = basename
 
-       # --- NEW LIMITING LOGIC ---
         shell_priority_opts, quota_opts, thread_opts = [], [], []
+        # Base x265 params for maximum compatibility (no-high-tier)
+        thread_opts = [ ] # '-x265-params' , 'no-high-tier']
 
         if not self.opts.full_speed:
-#           cpu_quota_pct = self.opts.thread_cnt * 100
-#           if cpu_quota_pct > 0:
-#               quota_opts = [
-#                   'systemd-run',
-#                   '--user',
-#                   '--scope',
-#                   f'--unit="rmbloat-transcode.scope"',
-#                   f'--property=CPUQuota={cpu_quota_pct}%',
-#           ]
             shell_priority_opts = ['ionice', '-c3', 'nice', '-n20']
 
-            # The thread_opts logic remains here if you need to pass it to FFmpeg
-            # if self.opts.thread_cnt > 0:
-            #     thread_opts = ['-x265-params', f'pools={self.opts.thread_cnt}']
+            if self.opts.thread_cnt > 0:
+                # Thread limits and compatibility flag combined
+                thread_opts = ['-x265-params', f'pools={self.opts.thread_cnt}'] # :no-high-tier']
 
+        MAX_HEIGHT = 1080
+        # ...
+        scale_opts = []
+        if probe.height > MAX_HEIGHT:
+            width = MAX_HEIGHT * probe.width // probe.height
+            scale_opts = ['-vf', f'scale={width}:-2']
 
         if self.opts.sample:
             start_secs = max(120, job.duration_secs)*.20
             pre_i_opts += [ '-ss', job.duration_spec(start_secs) ]
             post_i_opts =  ['-t', str(self.sample_seconds)]
-            # post_i_opts += [ '-copyts', '-avoid_negative_ts', 'make_zero',
-            #   '-t', str(self.sample_seconds)]
-            # post_i_opts += [ '-ss', '1:15', '-t', str(self.sample_seconds)]
 
-        # Define the FFmpeg command
+        # Reconstruct the three color values from the compact string
+        color_opts = self.make_color_opts(vid.probe0.color_spt)
+        pix_fmt_opts = ['-pix_fmt', 'yuv420p10le']
+
         ffmpeg_cmd = [
             * quota_opts,
             * shell_priority_opts,
             'ffmpeg',
-            '-y',                           # Overwrite temp file if exists
-            # '-v', 'error',                  # suppress INFO/WARNINGS
+            '-y',
             * pre_i_opts,
             '-i', job.input_file,
             * post_i_opts,
+            * scale_opts,
+
+            # Video Encoding Options
             '-c:v', 'libx265',
-            * thread_opts,
             '-crf', str(self.opts.quality),
             '-preset', 'medium',
-            # '-preset', 'fast',
+
+            * pix_fmt_opts,
+            * color_opts,
+
+            * thread_opts,
+
+            # Stream Copy/Mapping
             '-c:a', 'copy',
             '-c:s', 'copy',
             '-map', '0',
+
             job.temp_file
         ]
         vid.command = self.bash_quote(ffmpeg_cmd)
@@ -623,7 +677,7 @@ class Converter:
     def get_job_progress(self, job):
         """ TBD """
         vid = job.vid
-        secs_max = self.opts.progress_secs_max 
+        secs_max = self.opts.progress_secs_max
         while True:
             got = job.ffsubproc.poll()
             now_mono = time.monotonic()
@@ -1038,12 +1092,12 @@ class Converter:
                 sys.stdin = os.fdopen(0, 'r')
                 # 2e. Close the original file descriptor variable (tty_fd)
                 os.close(tty_fd)
-                
+
             except OSError as e:
                 # This handles cases where /dev/tty is not available (e.g., some non-interactive environments)
                 sys.stderr.write(f"Error reopening TTY: {e}. Cannot enter interactive mode.\n")
                 sys.exit(1)
-            
+
 
         # 2. Separate into directories and individual files, and sort for processing order
         directories = []
@@ -1434,7 +1488,7 @@ class Converter:
                 spin.do_key(key, win)
 
             handle_keyboard()
-        
+
             advance_jobs()
 
             if not spins.freeze:
@@ -1444,6 +1498,7 @@ class Converter:
         """ TBD """
         # sys.argv is the list of command-line arguments. sys.argv[0] is the script name.
         video_files = self.create_video_file_list()
+        self.probe_cache.store()
         video_files.sort(key=lambda vid: vid.probe.bloat, reverse=True)
 
         if not video_files:
@@ -1478,7 +1533,7 @@ def main(args=None):
         cfg = IniManager(app_name='rmbloat',
                                keep_backup=False,
                                bloat_thresh=1600,
-#                              thread_cnt=3,
+                               thread_cnt=4,
                                min_shrink_pct=10,
                                quality=28,
                                allowed_codecs='x265',
@@ -1506,10 +1561,10 @@ def main(args=None):
                     action='store_false' if vals.full_speed else 'store_true',
                     help='if true, do NOT set nice -n19 and ionice -c3'
                         + f' dflt={vals.full_speed}]')
-#       parser.add_argument('-t', '--thread-cnt',
-#                   default=vals.thread_cnt, type=int,
-#                   help='thread count for ffmpeg conversions'
-#                       + f' [dflt={vals.thread_cnt}]')
+        parser.add_argument('-t', '--thread-cnt',
+                    default=vals.thread_cnt, type=int,
+                    help='thread count for ffmpeg conversions'
+                        + f' [dflt={vals.thread_cnt}]')
         parser.add_argument('-m', '--min-shrink-pct',
                     default=vals.min_shrink_pct, type=int,
                     help='minimum conversion reduction percent for replacement'
