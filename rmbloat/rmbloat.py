@@ -998,7 +998,7 @@ class Converter:
             if os.path.exists(job.temp_file):
                 os.remove(job.temp_file)
                 print(f"FFmpeg failed. Deleted incomplete {job.temp_file}.")
-                self.probe_cache.set_anomaly(vid.filepath, 'Err')
+            self.probe_cache.set_anomaly(vid.filepath, 'Err')
 
     def create_video_file_list(self):
         """ TBD """
@@ -1367,17 +1367,30 @@ class Converter:
                     else:
                         break # no progress on job
             if self.state == 'convert' and not self.job:
+                gonners = set()
                 for vid in self.visible_vids:
                     if not vid:
                         continue
                     if vid.doit == '[X]':
-                        self.prev_time_encoded_secs = -1
-                        self.job = self.start_transcode_job(vid)
-                        vid.doit = 'IP '
-                        break
+                        if not os.path.isfile(vid.filepath):
+                            gonners.add(vid)
+                            continue
+                        if not self.job: # start only one job
+                            self.prev_time_encoded_secs = -1
+                            self.job = self.start_transcode_job(vid)
+                            vid.doit = 'IP '
+                if gonners:  # any disappearing files?
+                    vids = []
+                    for vid in self.vids:
+                        if vid not in gonners:
+                            vids.append(vid)
+                    self.vids = vids # pruned list
+                    lg.err('videos disappeared before conversion:\n'
+                        + json.dumps(list(gonners), indent=4))
+
                 if not self.job:
                     self.state = 'select'
-                    self.vids.sort(key=lambda vid: vid.bloat, reverse=True)
+                    self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
                     win.set_pick_mode(True, 1)
 
         def toggle_doit(vid):

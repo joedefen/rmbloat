@@ -232,5 +232,7 @@ class ProbeCache:
 
             if meta.anomaly != anomaly:
                 meta.anomaly = anomaly
-                self._dirty_count += 1
+                self._set_cache(filepath, meta)
+                # this does not happen often ... make sure it is saved NOW
+                self.store()
         return meta

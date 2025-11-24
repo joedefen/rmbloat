@@ -159,6 +159,28 @@ We attempted to further limit impact by using options to control the number of t
 
 Furthermore, we attempted to use the Intel hardware accellerated h265 processing, but that never worked either.  This may be revisited some day.
 
+### Videos Removed/Moved While Running
+If videos are removed or moved while `rmbloat` is running, they will only be detected just before starting a conversion (if ever).
+In that case, they are silently removed from the queue (in the Conversion screen), but there is a log of the event.
+Since the conversions may be long-running and unattended, there is no alert other than the log.
+
+### Upgrading to ffmpeg V8 on Ubuntu
+```
+  sudo apt remove ffmpeg
+  sudo add-apt-repository ppa:ubuntuhandbook1/ffmpeg8
+  sudo apt update
+  sudo apt install ffmpeg
+  ffmpeg -version
+  sudo apt install libva-dev intel-media-va-driver-non-free
+  sudo usermod -aG video $USER
+  sudo usermod -aG render $USER
+  sudo apt remove ffmpeg
+  sudo add-apt-repository --remove ppa:ubuntuhandbook1/ffmpeg8
+  sudo add-apt-repository ppa:ubuntuhandbook1/ffmpeg7
+  sudo apt update
+  sudo apt install ffmpeg
+```
+
 # TODO:
 - controls over the status line timeouts should be considered (those are fixed)
 - handling for failed and ineffective conversions
