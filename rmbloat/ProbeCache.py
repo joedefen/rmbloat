@@ -2,6 +2,7 @@
 """ TBD """
 import json
 import os
+import sys
 import subprocess
 import math
 import re
@@ -10,11 +11,11 @@ from typing import Optional, Dict, Any, Union, List
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor # <-- NEW IMPORT
 # pylint: disable=invalid-name,broad-exception-caught,line-too-long
-# pylint: disable=too-many-return-statements
+# pylint: disable=too-many-return-statements,too-many-statements
 
 class ProbeCache:
     """ TBD """
-    disk_fields = set('anomaly width height codec bitrate duration size_bytes color_spt'.split())
+    disk_fields = set('anomaly width height codec bitrate fps duration size_bytes color_spt'.split())
 
     """ TBD """
     def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp"):
@@ -107,20 +108,30 @@ class ProbeCache:
 
             meta.duration = float(metadata["format"].get('duration', 0.0))
 
+            # 1. Get the Raw Frame Rate String (r_frame_rate preferred)
+            fps_str = video_stream.get('r_frame_rate') or video_stream.get('avg_frame_rate', '0/0')
+            meta.fps = 0.0
+            try:
+                # The format is typically a fraction like "30000/1001"
+                num, den = map(int, fps_str.split('/'))
+                if den > 0:
+                    # Calculate the float and immediately round to 3 decimal places
+                    full_fps = float(num) / float(den)
+                    meta.fps = round(full_fps, 3) # <-- ROUNDING HERE
+
+            except Exception:
+                # Handle cases where fps_str is non-standard
+                pass
+
             size_info = self._get_file_size_info(file_path)
             if size_info is None:
                 raise IOError("Failed to get file size after probe.")
 
             meta.size_bytes = size_info['size_bytes']
-
-            # Check for dirty count to store cache
-            if self._dirty_count >= 100:
-                self.store()
-
             return meta
 
         except subprocess.CalledProcessError as e:
-            print(f"Error executing ffprobe: {e.stderr}")
+            # print(f"Error executing ffprobe: {e.stderr}")
             return None
         except json.JSONDecodeError:
             print(f"Error: Failed to decode ffprobe JSON output for '{file_path}'.")
@@ -283,13 +294,14 @@ class ProbeCache:
                 self.store()
         return meta
 
-    def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[SimpleNamespace]]:
+    def old_batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[SimpleNamespace]]:
         """
         Batch process a list of file paths. Checks cache first, then runs ffprobe
         concurrently for all cache misses.
         """
         results: Dict[str, Optional[SimpleNamespace]] = {}
         probe_needed_paths: List[str] = []
+        total_files, probe_cnt = len(filepaths), 0
 
         # 1. First Pass: Check Cache for all files
         for filepath in filepaths:
@@ -318,17 +330,146 @@ class ProbeCache:
                 try:
                     meta = future.result()
                     with self._cache_lock:
+                        probe_cnt += 1
                         self._set_cache(filepath, meta)
                         self._compute_fields(meta)
                         results[filepath] = meta
                         if self._dirty_count >= 100:
                             self.store()
-                except Exception as exc:
-                    print(f"Error probing {filepath}: {exc}")
+                            # \r (carriage return) moves the cursor to the start of the line for overwrite
+                            percent = round(100 * probe_cnt / total_files, 1)
+                            sys.stderr.write(f"probing: {percent}% {probe_cnt} of {total_files}\r")
+                            sys.stderr.flush()
+
+                except Exception:
+                    probe_cnt += 1
                     # results[filepath] = None
 
         # 3. Final Step: Save all new probes to disk once (thread-safe store)
         with self._cache_lock:
             self.store()
+        # Print a final newline character to clean the console after completion
+        if total_files > 0:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+        return results
+        
+    def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[SimpleNamespace]]:
+        """
+        Batch process a list of file paths. Checks cache first, then runs ffprobe
+        concurrently for all cache misses. Includes graceful handling for KeyboardInterrupt (Ctrl-C).
+        """
+        exit_please = False
+        results: Dict[str, Optional[SimpleNamespace]] = {}
+        probe_needed_paths: List[str] = []
+
+        # 1. First Pass: Check Cache for all files
+        for filepath in filepaths:
+            meta = self._get_valid_entry(filepath)
+            if meta:
+                results[filepath] = meta
+            else:
+                probe_needed_paths.append(filepath)
+
+        # 2. Second Pass: Concurrent Probing for cache misses
+        if not probe_needed_paths:
+            return results
+        total_files, probe_cnt = len(probe_needed_paths), 0
+
+        print(f"Starting concurrent ffprobe for {len(probe_needed_paths)} files using {max_workers} threads...")
+
+        def probe_wrapper(filepath: str) -> Optional[SimpleNamespace]:
+            return self._get_metadata_with_ffprobe(filepath)
+
+        # Dictionary to hold all futures for easy cancellation later
+        future_to_path: Dict[Future, str] = {}
+        
+        # Use ThreadPoolExecutor to run probes concurrently
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all probes to the executor
+            future_to_path.update({executor.submit(probe_wrapper, path): path for path in probe_needed_paths})
+
+            try:
+                # Iterate over the completed futures (as they complete)
+                for future in future_to_path:
+                    filepath = future_to_path[future]
+                    
+                    try:
+                        # Blocks until the result is ready or an exception occurs
+                        meta = future.result() 
+                        
+                        # --- CRITICAL: Cache Update and Progress ---
+                        with self._cache_lock:
+                            probe_cnt += 1
+                            self._set_cache(filepath, meta)
+                            self._compute_fields(meta)
+                            results[filepath] = meta
+                            
+                            # Store frequently to minimize lost work on crash/interrupt
+                            if self._dirty_count >= 100:
+                                self.store()
+                                # Overwrite status line
+                                percent = round(100 * probe_cnt / total_files, 1)
+                                sys.stderr.write(f"probing: {percent}% {probe_cnt} of {total_files}\r")
+                                sys.stderr.flush()
+
+                    except KeyboardInterrupt:
+                        # If an interrupt hits during a result fetch, stop all work.
+                        print("\n🛑 Received interrupt. Shutting down worker threads...")
+                        
+                        # Cancel all futures that have not started or completed yet
+                        for pending_future in future_to_path:
+                            if not pending_future.done():
+                                pending_future.cancel()
+                        
+                        # Re-raise the interrupt to jump to the 'finally' block for the final save
+                        raise 
+
+                    except Exception:
+                        # Handle other exceptions from the probe (e.g., ffprobe timeout, corrupt file)
+                        with self._cache_lock:
+                            probe_cnt += 1
+                        # results[filepath] is implicitly None/missing, or you can set it explicitly:
+                        # results[filepath] = None 
+                        
+            except KeyboardInterrupt:
+                # Catches the re-raised interrupt and passes control to 'finally'
+                exit_please = True
+
+            finally:
+                # 3. Final Step: Graceful Shutdown and Final Cache Save
+                
+                # Ensure the executor is cleanly shut down and futures are cancelled
+                executor.shutdown(wait=False, cancel_futures=True)
+
+                for future in future_to_path: 
+                    # Check if the Future object is done and not cancelled
+                    if future.done() and not future.cancelled():
+                        
+                        filepath = future_to_path[future] # Get the filepath (string) from the Future (key)
+                        
+                        try:
+                            meta = future.result()
+                            with self._cache_lock:
+                                # Only set if it wasn't already successfully processed
+                                if filepath not in results:
+                                    self._set_cache(filepath, meta)
+                                    self._compute_fields(meta)
+                                    results[filepath] = meta
+                        except Exception:
+                            pass # Ignore exceptions on shutdown
+
+                # The final save is guaranteed to run here.
+                with self._cache_lock:
+                    self.store()
+                if exit_please:
+                    sys.exit(1)
+
+        # Print a final newline character to clean the console after completion
+        self.store()
+        if total_files > 0:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
         return results

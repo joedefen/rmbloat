@@ -359,10 +359,33 @@ class Converter:
     TARGET_CODECS = ['h265', 'hevc']
     MAX_BITRATE_KBPS = 2100 # about 15MB/min (or 600MB for 40m)
 
-        # Regex to find FFmpeg progress lines (from stderr)
-        # Looks for 'frame=  XXXXX' and 'time=00:00:00.00' and 'speed=XX.XXx'
+#       # Regex to find FFmpeg progress lines (from stderr)
+#       # Looks for 'frame=  XXXXX' and 'time=00:00:00.00' and 'speed=XX.XXx'
+#   PROGRESS_RE = re.compile(
+#       r"frame=\s*(\d+)\b.*?"
+#       r"time=(?:(\d{2}):(\d{2}):(\d{2})\.(\d{2})|\S*?)\b.*"
+#       r"speed=\s*(?:(\d+\.\d+)x|\S*?)\b"
+#   )
+#   PROGRESS_RE = re.compile(
+#       r"frame=\s*(?P<frame>\d+)"  # 1. Capture the frame number (required)
+#       r".*?"                      # Non-greedy match for anything between
+#       r"time=(?P<time>\d{2}:\d{2}:\d{2}\.\d{2}|N\/A)\s+" # 2. Capture time OR N/A
+#       r".*?"                      # Non-greedy match for anything between
+#       r"speed=(?P<speed>\d+\.\d+x|N\/A)"  # 3. Capture speed OR N/A
+#   )
     PROGRESS_RE = re.compile(
-        r"frame=\s*(\d+)\s+.*time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})\s+.*speed=\s*(\d+\.\d+)x"
+        # 1. Capture the Frame Number (Group 1)
+        r"\s*frame=\s*(\d+)\s+"
+        # 2. Match everything until 'time='
+        r".*?"
+        # 3. Handle Time: Capture the time fields (Groups 2, 3, 4, 5) OR match 'N/A'
+        # By using (?:...|N/A), if N/A is matched, Groups 2-5 will be None.
+        r"time=(?:(\d{2}):(\d{2}):(\d{2})\.(\d{2})|N\/A)\s+"
+        # 4. Match everything until 'speed='
+        r".*?"
+        # 5. Handle Speed: Capture the speed field (Group 6) OR match 'N/A'
+        # If N/A is matched, Group 6 will be None.
+        r"speed=(?:(\d+\.\d+)x|N\/A)"
     )
 
     # A common list of video extensions ffmpeg can typically handle.
@@ -676,6 +699,46 @@ class Converter:
 
     def get_job_progress(self, job):
         """ TBD """
+        def rough_progress(frame_number):
+            nonlocal job, vid
+            total_frames = int(round(vid.probe0.fps * vid.probe0.duration))
+            frame_number = int(frame_number)
+
+            elapsed_time_sec = int(time.monotonic() - job.start_mono)
+
+            if elapsed_time_sec < 5 or total_frames == 0:
+                # Too early for a reliable estimate or total frames unknown
+                return f"Frame {frame_number}: MAKING PROGRESS..."
+
+            # 1. Calculate Estimated Total Time (based on elapsed time and frames done)
+            # T_est = (Elapsed Time / Frames Done) * Total Frames
+            # Avoid division by zero:
+            if frame_number == 0:
+                return f"Frame {frame_number}: MAKING PROGRESS..."
+            estimated_total_time = (elapsed_time_sec / frame_number) * total_frames
+            # 2. Calculate Remaining Time
+            remaining_seconds = estimated_total_time - elapsed_time_sec
+            # 3. Calculate Current FPS (Virtual Speed)
+            current_fps, speed = frame_number / elapsed_time_sec, 'UNKx'
+            if vid.probe0.fps > 0:
+                speed = f'{round(current_fps / vid.probe0.fps, 1)}x'
+
+            # --- Format the output line using the estimated values ---
+            percent_complete = (frame_number / total_frames) * 100
+            remaining_time_formatted = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
+            elapsed_time_formatted = job.trim0(str(timedelta(seconds=elapsed_time_sec)))
+
+            # Use the estimated FPS for the speed report
+            progress_line = (
+                f"{percent_complete:.1f}% | "
+                f"{elapsed_time_formatted} | "
+                f"-{remaining_time_formatted} | "
+                f"{speed} | " # Report FPS clearly as Estimated
+                f"Frame {frame_number}/{total_frames}"
+            )
+            return progress_line
+
+
         vid = job.vid
         secs_max = self.opts.progress_secs_max
         while True:
@@ -697,14 +760,12 @@ class Converter:
                     continue
 
                 if now_mono - self.progress_line_mono < 3:
-                    # don't update progress crazy often
-                    continue
+                    continue # don't update progress crazy often
                 self.progress_line_mono = time.monotonic()
-                # print(f'\r{self.progress_line_mono=} {line}')
 
                 # 1. Extract values from the regex match
+                groups = match.groups()
                 try:
-                    groups = match.groups()
 
                     # The first two parts (H and M) are integers. The third part (S.ms) is the float.
                     h = int(groups[1])
@@ -713,19 +774,16 @@ class Converter:
                     ms = int(groups[4])
                     time_encoded_seconds = h * 3600 + m * 60 + s + ms / 100
                     time_encoded_seconds = round(int(time_encoded_seconds))
-#                   if self.prev_time_encoded_secs > 2 + time_encoded_seconds:
-#                       continue  # don't return too often
                     speed = float(match.group(6))
                 except Exception:
-                    print(f"\n{line=} {groups=}")
-                    raise
+                    # return f"Frame {groups[0]}:  MAKING PROGRESS..."
+                    return rough_progress(groups[0])
 
                 elapsed_time_sec = int(time.monotonic() - job.start_mono)
 
                     # 2. Calculate remaining time
                 if job.duration_secs > 0:
                     percent_complete = (time_encoded_seconds / job.duration_secs) * 100
-
                     if percent_complete > 0 and speed > 0:
                         # Time Remaining calculation (rough estimate)
                         # Remaining Time = (Total Time - Encoded Time) / Speed
@@ -1154,36 +1212,41 @@ class Converter:
 
         # 5. Final Probing and Progress Indicator 🎬
         total_files = len(paths_to_probe)
-        probe_count = 0
-        update_interval = 10  # Update the line every 10 probes
+#       probe_count = 0
+#       update_interval = 10  # Update the line every 10 probes
 
         if total_files > 0:
             # Print the initial line to start the progress bar
             sys.stderr.write(f"probing: 0% 0 of {total_files}\r")
             sys.stderr.flush()
 
-        for video_file_path in paths_to_probe:
-            probe_count += 1
+        results = self.probe_cache.batch_get_or_probe(paths_to_probe)
+        for file_path, probe in results.items():
+            ns = SimpleNamespace(video_file=file_path, probe=probe)
+            video_files_out.append(ns)
 
-            # probe = self.get_video_metadata(video_file_path)
-            probe = self.probe_cache.get(video_file_path)
+#       for video_file_path in paths_to_probe:
+#           probe_count += 1
 
-            if probe:
-                ns = SimpleNamespace(video_file=video_file_path, probe=probe)
-                video_files_out.append(ns)
+#           # probe = self.get_video_metadata(video_file_path)
+#           probe = self.probe_cache.get(video_file_path)
 
-            # Update the progress indicator every N probes or on the last file
-            if probe_count % update_interval == 0 or probe_count == total_files:
-                percent = int((probe_count / total_files) * 100)
+#           if probe:
+#               ns = SimpleNamespace(video_file=video_file_path, probe=probe)
+#               video_files_out.append(ns)
 
-                # \r (carriage return) moves the cursor to the start of the line for overwrite
-                sys.stderr.write(f"probing: {percent}% {probe_count} of {total_files}\r")
-                sys.stderr.flush()
+#           # Update the progress indicator every N probes or on the last file
+#           if probe_count % update_interval == 0 or probe_count == total_files:
+#               percent = int((probe_count / total_files) * 100)
+
+#               # \r (carriage return) moves the cursor to the start of the line for overwrite
+#               sys.stderr.write(f"probing: {percent}% {probe_count} of {total_files}\r")
+#               sys.stderr.flush()
 
         # Print a final newline character to clean the console after completion
-        if total_files > 0:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+#       if total_files > 0:
+#           sys.stderr.write("\n")
+#           sys.stderr.flush()
 
         return video_files_out
 
