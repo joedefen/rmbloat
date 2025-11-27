@@ -1721,10 +1721,26 @@ def main(args=None):
                 # Catch any other execution errors
                 print(f"An error occurred during exec: {e}", file=sys.stderr)
                 sys.exit(1)
-#       if opts.chooser_tests:
-#           chooser = FfmpegChooser(force_pull=True)
-#           chooser.
+        if opts.chooser_tests:
+            chooser = FfmpegChooser(force_pull=True)
 
+            video_file = None
+            if opts.files:
+                # Get first video file from arguments
+                paths, _ = Converter.get_candidate_video_files(opts.files)
+                if paths:
+                    video_file = paths[0]
+                    print(f"\nTesting with video: {video_file}")
+                else:
+                    print("\nWarning: No valid video files found, running basic tests only")
+
+            # Run tests (real-world if video_file provided, basic otherwise)
+            exit_code = chooser.run_tests(
+                video_file=video_file,
+                duration=30,
+                show_test_encode=(video_file is None)  # Show example commands if no video
+            )
+            sys.exit(exit_code)
 
         if opts.sample:
             opts.dry_run = False # cannot have both

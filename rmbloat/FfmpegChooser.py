@@ -799,8 +799,10 @@ class FfmpegChooser:
             print("Recommended: system_cpu (CPU fallback)")
         
         print("="*60 + "\n")
-        
+
         return results
+
+    def make_ffprobe_cmd(self, input_file, *extra_args):
         """
         Build an ffprobe command.
         
@@ -843,10 +845,74 @@ class FfmpegChooser:
         return cmd
 
 
+    def run_tests(self, video_file=None, duration=30, output_dir=None, show_test_encode=False):
+        """
+        Run various tests on the FfmpegChooser.
+
+        Args:
+            video_file: Optional video file for real-world tests
+            duration: Duration in seconds for real-world test (default: 30)
+            output_dir: Output directory for test files (default: temp directory)
+            show_test_encode: Show example encode commands (default: False)
+
+        Returns:
+            int: 0 for success, 1 for failure
+        """
+        try:
+            # Real-world tests with video file
+            if video_file:
+                results = self.real_world_tests(
+                    video_file,
+                    duration=duration,
+                    output_dir=output_dir
+                )
+
+                # Return 0 if any test succeeded, 1 if all failed
+                return 0 if any(r['success'] for r in results.values()) else 1
+
+            # Basic detection info
+            print(f"\nStatus: Using {self.runtime} container" if self.use_docker
+                  else "\nStatus: Using system ffmpeg")
+            print("Status: Hardware acceleration enabled" if self.use_acceleration
+                  else "Status: CPU encoding only")
+
+            # Test command generation if requested
+            if show_test_encode:
+                print("\n" + "="*60)
+                print("Example FFmpeg Command")
+                print("="*60)
+
+                params = self.make_namespace(
+                    input_file='input.mp4',
+                    output_file='output.mkv',
+                    crf=28,
+                    preset='medium',
+                    color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', '709'],
+                )
+
+                cmd = self.make_ffmpeg_cmd(params)
+                print(' '.join(f"'{arg}'" if ' ' in str(arg) else str(arg) for arg in cmd))
+
+                print("\n" + "="*60)
+                print("Example FFprobe Command")
+                print("="*60)
+
+                probe_cmd = self.make_ffprobe_cmd('input.mp4', '-show_format', '-show_streams')
+                print(' '.join(f"'{arg}'" if ' ' in str(arg) else str(arg) for arg in probe_cmd))
+
+            return 0
+
+        except RuntimeError as e:
+            print(f"\nError: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user")
+            return 130
+
 def main():
     """Test the FfmpegChooser."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="Detect and configure FFmpeg runtime with hardware acceleration"
     )
@@ -886,78 +952,24 @@ def main():
         '--output-dir',
         help='Output directory for test files (default: temp directory)'
     )
-    
+
     args = parser.parse_args()
-    
-    try:
-        # Real-world tests require detection first but don't need a specific strategy
-        if args.real_test:
-            # Detect with auto to see all capabilities
-            chooser = FfmpegChooser(
-                force_pull=args.force_pull, 
-                image=args.image,
-                prefer_strategy='auto'
-            )
-            
-            results = chooser.real_world_tests(
-                args.real_test,
-                duration=args.duration,
-                output_dir=args.output_dir
-            )
-            
-            # Return 0 if any test succeeded, 1 if all failed
-            return 0 if any(r['success'] for r in results.values()) else 1
-        
-        # Normal detection and testing
-        chooser = FfmpegChooser(
-            force_pull=args.force_pull, 
-            image=args.image,
-            prefer_strategy=args.prefer_strategy
-        )
-        
-        # Print status for scripting
-        if chooser.use_docker:
-            print(f"Status: Using {chooser.runtime} container")
-        else:
-            print(f"Status: Using system ffmpeg")
-        
-        if chooser.use_acceleration:
-            print("Status: Hardware acceleration enabled")
-        else:
-            print("Status: CPU encoding only")
-        
-        # Test command generation if requested
-        if args.test_encode:
-            print("\n" + "="*60)
-            print("Example FFmpeg Command")
-            print("="*60)
-            
-            params = chooser.make_namespace(
-                input_file='input.mp4',
-                output_file='output.mkv',
-                crf=28,
-                preset='medium',
-                color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', '709'],
-            )
-            
-            cmd = chooser.make_ffmpeg_cmd(params)
-            print(' '.join(f"'{arg}'" if ' ' in str(arg) else str(arg) for arg in cmd))
-            
-            print("\n" + "="*60)
-            print("Example FFprobe Command")
-            print("="*60)
-            
-            probe_cmd = chooser.make_ffprobe_cmd('input.mp4', '-show_format', '-show_streams')
-            print(' '.join(f"'{arg}'" if ' ' in str(arg) else str(arg) for arg in probe_cmd))
-        
-        return 0
-    
-    except RuntimeError as e:
-        print(f"\nError: {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
-        return 130
+
+    # Create chooser with appropriate strategy
+    prefer_strategy = 'auto' if args.real_test else args.prefer_strategy
+    chooser = FfmpegChooser(
+        force_pull=args.force_pull,
+        image=args.image,
+        prefer_strategy=prefer_strategy
+    )
+
+    # Run tests
+    return chooser.run_tests(
+        video_file=args.real_test,
+        duration=args.duration,
+        output_dir=args.output_dir,
+        show_test_encode=args.test_encode
+    )
 
 
 if __name__ == '__main__':
