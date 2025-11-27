@@ -426,6 +426,20 @@ class Converter:
         # self.cgroup_prefix = set_cgroup_cpu_limit(opts.thread_cnt*100)
         atexit.register(store_cache_on_exit)
 
+        # Build options suffix for display (computed once)
+        parts = []
+        parts.append(f'Q={opts.quality}')
+        parts.append(f'Shr>={opts.min_shrink_pct}')
+        if opts.dry_run:
+            parts.append('DRYRUN')
+        if opts.sample:
+            parts.append('SAMPLE')
+        if opts.keep_backup:
+            parts.append('KeepB')
+        if opts.merge_subtitles:
+            parts.append('MrgSrt')
+        self.options_suffix = ' -- ' + ' '.join(parts)
+
     def is_allowed_codec(self, probe):
         """ Return whether the codec is 'allowed' """
         if not probe:
@@ -1362,10 +1376,6 @@ class Converter:
                 lines, stats = make_lines()
                 if self.state == 'select':
                     head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o ?=help [q]uit'
-                    if self.opts.dry_run:
-                        head += ' DRY-RUN'
-                    if self.opts.sample:
-                        head += ' SAMPLE'
                     if self.search_re:
                         shown = Mangler.mangle(self.search_re) if spins.mangle else self.search_re
                         head += f' /{shown}'
@@ -1389,7 +1399,7 @@ class Converter:
                     win.add_header(head)
                     # lg.lg(f'{cpu_status=}')
 
-                win.add_header(f'CVT {"NET":>4} {"BLOAT":>5}  {"RES":>5}  {"CODEC":>5}  {"MINS":>4} {"GB":>6}   VIDEO')
+                win.add_header(f'CVT {"NET":>4} {"BLOAT":>5}  {"RES":>5}  {"CODEC":>5}  {"MINS":>4} {"GB":>6}   VIDEO{self.options_suffix}')
                 if self.state == 'convert':
                     win.pick_pos = stats.progress_idx
                     win.scroll_pos = stats.progress_idx - win.scroll_view_size + 2
