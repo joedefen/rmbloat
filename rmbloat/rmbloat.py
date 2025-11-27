@@ -17,7 +17,17 @@ TODO:
   - fully automated daemon (still running as curses app)
   - runs during certain hours ... restarts itself to freshly read
     disk
+
+- V3.0
+  - merge in missing subtitles
+    ffmpeg -i video.mkv -i video.en.srt \
+    -map 0 -map 1:s:0 \
+    -c copy \  # Copy all streams, no re-encoding
+    -c:s srt \  # Only subtitle needs codec
+    -metadata:s:s:0 language=eng \
+    video.sb.mkv
 """
+
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return,too-many-branches
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
@@ -38,8 +48,9 @@ import fcntl
 import json
 import random
 import curses
+from pathlib import Path
 from typing import Optional, Union
-from copy import copy
+# from copy import copy
 from types import SimpleNamespace
 from datetime import timedelta
 import send2trash
@@ -237,7 +248,7 @@ class FfmpegMon:
             # --- CRITICAL FIX: Split by EITHER \n OR \r ---
             # We need to split by both, keeping the delimiters for context is not needed,
             # but handling trailing fragments is important.
-            
+
             # 2a. Split data by \n or \r. Note: re.split discards delimiters.
             # Use 'b' prefix for regex pattern since data is bytes
             fragments = re.split(b'[\r\n]', data)
@@ -363,15 +374,15 @@ class Converter:
         # 1. Mandatory Frame Number (Group 1)
         # The \s* at the beginning accounts for possible leading whitespace
         r"\s*frame[=\s]+(\d+)\s+"
-        
+
         # 2. Time Section (Optional, Strict Numerical Capture)
         # Looks for 'time=', then attempts to capture the precise HH:MM:SS.cs format (G2-G5).
         r"(?:.*?time[=\s]+(\d{2}):(\d{2}):(\d{2})\.(\d{2}))?"
-        
+
         # 3. Speed Section (Optional, Strict Numerical Capture)
         # Looks for 'speed=', then captures the float (G6).
         r"(?:.*?speed[=\s]+(\d+\.\d+)x)?",
-        
+
         re.IGNORECASE
     )
 
@@ -579,150 +590,82 @@ class Converter:
         os.chdir(os.path.dirname(vid.filepath))
         basename = os.path.basename(vid.filepath)
         probe = vid.probe0
-        
+
+        merged_external_subtitle = None
+        if self.opts.merge_subtitles:  # Assuming you'll add this flag to opts
+            subtitle_path = Path(vid.filepath).with_suffix('.en.srt')
+            if subtitle_path.exists():
+                merged_external_subtitle = str(subtitle_path)
+                vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
+
         # Determine output file paths
         prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
         temp_file = f"{prefix}.{vid.standard_name}"
         orig_backup_file = f"ORIG.{basename}"
-        
+
         if os.path.exists(temp_file):
             os.unlink(temp_file)
-        
+
         # Calculate duration
         duration_secs = probe.duration
         if self.opts.sample:
             duration_secs = self.sample_seconds
-        
+
         job = Job(vid, orig_backup_file, temp_file, duration_secs)
         job.input_file = basename
-        
+
         # Create namespace with defaults
         params = self.chooser.make_namespace(
             input_file=job.input_file,
             output_file=job.temp_file
         )
-        
+
         # Set quality
         params.crf = self.opts.quality
-        
+
         # Set priority
         params.use_nice_ionice = not self.opts.full_speed
-        
+
         # Set thread count
         params.thread_count = self.opts.thread_cnt
-        
+
         # Sampling options
         if self.opts.sample:
             params.sample_mode = True
             start_secs = max(120, job.duration_secs) * 0.20
             params.pre_input_opts = ['-ss', job.duration_spec(start_secs)]
             params.post_input_opts = ['-t', str(self.sample_seconds)]
-        
+
         # Scaling options
         MAX_HEIGHT = 1080
         if probe.height > MAX_HEIGHT:
             width = MAX_HEIGHT * probe.width // probe.height
             params.scale_opts = ['-vf', f'scale={width}:-2']
-        
+
         # Color options
         params.color_opts = self.make_color_opts(vid.probe0.color_spt)
-        
+
         # Stream mapping options
         map_copy = '-map 0:v:0 -map 0:a? -c:a copy -map'
-        map_copy += ' 0:s? -c:s copy -map -0:t -map -0:d'
+
+        # Check for external subtitle file
+        if merged_external_subtitle:
+            # Don't copy internal subtitles, we're replacing with external
+            map_copy += ' -0:s -map -0:t -map -0:d'
+        else:
+            # Not merging subtitles, copy internal ones
+            map_copy += ' 0:s? -c:s copy -map -0:t -map -0:d'
+
         params.map_opts = map_copy.split()
-        
+        params.external_subtitle = merged_external_subtitle
+
         # Generate the command
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
-        
+
         # Store command for logging
         vid.command = self.bash_quote(ffmpeg_cmd)
-        
+
         # Start the job
-        if not self.opts.dry_run:
-            job.ffsubproc.start(ffmpeg_cmd)
-            self.progress_line_mono = time.monotonic()
-        
-        return job
-    def old_start_transcode_job(self, vid):
-        """ TBD """
-        os.chdir(os.path.dirname(vid.filepath))
-        basename = os.path.basename(vid.filepath)
-        probe = vid.probe0 # <-- Good: Accessing the probe data
-
-        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        temp_file = f"{prefix}.{vid.standard_name}"
-        orig_backup_file = f"ORIG.{basename}"
-
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-        duration_secs = probe.duration
-        if self.opts.sample:
-            duration_secs = self.sample_seconds
-
-        job = Job(vid, orig_backup_file, temp_file, duration_secs)
-        pre_i_opts, post_i_opts = copy(self.ff_pre_i_opts), copy(self.ff_post_i_opts)
-        job.input_file = basename
-
-        shell_priority_opts, quota_opts, thread_opts = [], [], []
-        # Base x265 params for maximum compatibility (no-high-tier)
-        thread_opts = [ ] # '-x265-params' , 'no-high-tier']
-
-        if not self.opts.full_speed:
-            shell_priority_opts = ['ionice', '-c3', 'nice', '-n20']
-
-            if self.opts.thread_cnt > 0:
-                # Thread limits and compatibility flag combined
-                thread_opts = ['-x265-params', f'pools={self.opts.thread_cnt}'] # :no-high-tier']
-
-        MAX_HEIGHT = 1080
-        # ...
-        scale_opts = []
-        if probe.height > MAX_HEIGHT:
-            width = MAX_HEIGHT * probe.width // probe.height
-            scale_opts = ['-vf', f'scale={width}:-2']
-
-        if self.opts.sample:
-            start_secs = max(120, job.duration_secs)*.20
-            pre_i_opts += [ '-ss', job.duration_spec(start_secs) ]
-            post_i_opts =  ['-t', str(self.sample_seconds)]
-
-        # Reconstruct the three color values from the compact string
-        color_opts = self.make_color_opts(vid.probe0.color_spt)
-
-        pix_fmt_opts = ['-pix_fmt', 'yuv420p10le']
-        map_copy = '-map 0:v:0 -map 0:a? -c:a copy -map'
-        map_copy += ' 0:s? -c:s copy -map -0:t -map -0:d'
-        map_opts = map_copy.split()
-
-        ffmpeg_cmd = [
-            * quota_opts,
-            * shell_priority_opts,
-            'ffmpeg',
-            '-y',
-            * pre_i_opts,
-            '-i', job.input_file,
-            * post_i_opts,
-            * scale_opts,
-
-            # Video Encoding Options
-            '-crf', str(self.opts.quality),
-            '-preset', 'medium',
-
-            * pix_fmt_opts,
-            * color_opts,
-            * thread_opts,
-            * map_opts,
-
-            # Stream Copy/Mapping
-            '-c:v', 'libx265',
-            '-c:a', 'copy',
-            '-c:s', 'copy',
-            # '-map', '0',
-
-            job.temp_file
-        ]
-        vid.command = self.bash_quote(ffmpeg_cmd)
         if not self.opts.dry_run:
             job.ffsubproc.start(ffmpeg_cmd)
             self.progress_line_mono = time.monotonic()
@@ -910,7 +853,8 @@ class Converter:
         else:
             return f"{size:.2f} {size_names[i]}"
 
-    def is_valid_video_file(self, filename):
+    @staticmethod
+    def is_valid_video_file(filename):
         """
         Checks if a file meets all the criteria:
         1. Does not start with 'TEMP.' or 'ORIG.'.
@@ -918,7 +862,7 @@ class Converter:
         """
 
         # 1. Check for prefixes to skip
-        if filename.startswith(self.SKIP_PREFIXES):
+        if filename.startswith(Converter.SKIP_PREFIXES):
             # print(f"Skipping '{filename}': Starts with a forbidden prefix.")
             return False
 
@@ -927,7 +871,7 @@ class Converter:
         _, ext = os.path.splitext(filename)
 
         # 2. Check if the extension is a recognized video format
-        if ext.lower() not in self.VIDEO_EXTENSIONS:
+        if ext.lower() not in Converter.VIDEO_EXTENSIONS:
             # print(f"Skipping '{filename}': Not a recognized video file extension ('{ext.lower()}').")
             return False
 
@@ -1181,16 +1125,25 @@ class Converter:
                 print(f"FFmpeg failed. Deleted incomplete {job.temp_file}.")
             self.probe_cache.set_anomaly(vid.filepath, 'Err')
 
-    def create_video_file_list(self):
-        """ TBD """
-        read_pipe = False
-        video_files_out = []
-        enqueued_paths = set()
+    @staticmethod
+    def get_candidate_video_files(file_args):
+        """
+        Gather candidate video file paths from command-line arguments.
 
-        # 1. Gather all unique, absolute paths from arguments and stdin
+        Args:
+            file_args: List of file/directory paths or "-" for stdin
+
+        Returns:
+            tuple: (paths_to_probe, read_pipe)
+                - paths_to_probe: List of absolute file paths to probe
+                - read_pipe: True if stdin was read (caller needs to restore TTY)
+        """
+        read_pipe = False
+        enqueued_paths = set()
         paths_from_args = []
 
-        for file_arg in self.opts.files:
+        # 1. Gather all unique, absolute paths from arguments and stdin
+        for file_arg in file_args:
             if file_arg == "-":
                 # Handle STDIN
                 if not read_pipe:
@@ -1202,29 +1155,6 @@ class Converter:
                 if abs_path not in enqueued_paths:
                     paths_from_args.append(abs_path)
                     enqueued_paths.add(abs_path)
-
-        # --- 2. Restore TTY Input if needed ---
-        if read_pipe:
-            try:
-                # 2a. Close the current stdin (the pipe)
-                sys.stdin.close()
-                # 2b. Open the TTY device (the actual keyboard/terminal)
-                # os.O_RDONLY is read-only access.
-                tty_fd = os.open('/dev/tty', os.O_RDONLY)
-                # 2c. Replace file descriptor 0 (stdin) with the TTY descriptor
-                # os.dup2(old_fd, new_fd) copies the old_fd to the new_fd (FD 0).
-                os.dup2(tty_fd, 0)
-                # 2d. Re-create the sys.stdin file object for Python's I/O
-                # os.fdopen(0, 'r') creates a new Python file object from FD 0.
-                sys.stdin = os.fdopen(0, 'r')
-                # 2e. Close the original file descriptor variable (tty_fd)
-                os.close(tty_fd)
-
-            except OSError as e:
-                # This handles cases where /dev/tty is not available (e.g., some non-interactive environments)
-                sys.stderr.write(f"Error reopening TTY: {e}. Cannot enter interactive mode.\n")
-                sys.exit(1)
-
 
         # 2. Separate into directories and individual files, and sort for processing order
         directories = []
@@ -1268,7 +1198,7 @@ class Converter:
                     full_path = os.path.join(root, file_name)
 
                     # Check for validity and duplicates
-                    if self.is_valid_video_file(full_path):
+                    if Converter.is_valid_video_file(full_path):
                         if full_path not in enqueued_paths:
                             group_files.append(full_path)
                             enqueued_paths.add(full_path)
@@ -1278,6 +1208,37 @@ class Converter:
 
         # 4. Process Individual Files: Append sorted immediate files
         paths_to_probe.extend(immediate_files)
+
+        return paths_to_probe, read_pipe
+
+    def create_video_file_list(self):
+        """ TBD """
+        video_files_out = []
+
+        # Get candidate video file paths
+        paths_to_probe, read_pipe = self.get_candidate_video_files(self.opts.files)
+
+        # --- Restore TTY Input if needed ---
+        if read_pipe:
+            try:
+                # 2a. Close the current stdin (the pipe)
+                sys.stdin.close()
+                # 2b. Open the TTY device (the actual keyboard/terminal)
+                # os.O_RDONLY is read-only access.
+                tty_fd = os.open('/dev/tty', os.O_RDONLY)
+                # 2c. Replace file descriptor 0 (stdin) with the TTY descriptor
+                # os.dup2(old_fd, new_fd) copies the old_fd to the new_fd (FD 0).
+                os.dup2(tty_fd, 0)
+                # 2d. Re-create the sys.stdin file object for Python's I/O
+                # os.fdopen(0, 'r') creates a new Python file object from FD 0.
+                sys.stdin = os.fdopen(0, 'r')
+                # 2e. Close the original file descriptor variable (tty_fd)
+                os.close(tty_fd)
+
+            except OSError as e:
+                # This handles cases where /dev/tty is not available (e.g., some non-interactive environments)
+                sys.stderr.write(f"Error reopening TTY: {e}. Cannot enter interactive mode.\n")
+                sys.exit(1)
 
         # 5. Final Probing and Progress Indicator 🎬
         total_files = len(paths_to_probe)
@@ -1423,7 +1384,6 @@ class Converter:
                     cpu_status = self.cpu.get_status_string()
                     head += (f'     ToDo={stats.total-stats.done}/{stats.total}'
                                 f'  GB={stats.gb}({stats.delta_gb})'
-                                f'  {self.cpu.get_status_string()}'
                                 f'  {cpu_status}'
                                 )
                     win.add_header(head)
@@ -1671,54 +1631,62 @@ def main(args=None):
     """
     try:
         cfg = IniManager(app_name='rmbloat',
-                               keep_backup=False,
-                               bloat_thresh=1600,
-                               thread_cnt=4,
-                               min_shrink_pct=10,
-                               quality=28,
                                allowed_codecs='x265',
-                               full_speed=False)
+                               bloat_thresh=1600,
+                               full_speed=False,
+                               keep_backup=False,
+                               merge_subtitles=True,
+                               min_shrink_pct=10,
+                               thread_cnt=4,
+                               quality=28,
+                        )
         vals = cfg.vals
         parser = argparse.ArgumentParser(
             description="CLI/curses bulk Video converter for media servers")
         # config options
-        parser.add_argument('-B', '--keep-backup',
-                    action='store_false' if vals.keep_backup else 'store_true',
-                    help='if true, rename to ORIG.{videofile} rather than recycle'
-                         + f' [dflt={vals.keep_backup}]')
-        parser.add_argument('-b', '--bloat-thresh',
-                    default=vals.bloat_thresh, type=int,
-                    help='bloat threshold to convert'
-                        + f' [dflt={vals.bloat_thresh},min=500]')
-        parser.add_argument('-q', '--quality',
-                    default=vals.quality, type=int,
-                    help=f'output quality (CRF) [dflt={vals.quality}]')
         parser.add_argument('-a', '--allowed-codecs',
                     default=vals.allowed_codecs,
                     choices=('x26*', 'x265', 'all'),
                     help=f'allowed codecs [dflt={vals.allowed_codecs}]')
+        parser.add_argument('-b', '--bloat-thresh',
+                    default=vals.bloat_thresh, type=int,
+                    help='bloat threshold to convert'
+                        + f' [dflt={vals.bloat_thresh},min=500]')
         parser.add_argument('-F', '--full-speed',
                     action='store_false' if vals.full_speed else 'store_true',
                     help='if true, do NOT set nice -n19 and ionice -c3'
                         + f' dflt={vals.full_speed}]')
+        parser.add_argument('-B', '--keep-backup',
+                    action='store_false' if vals.keep_backup else 'store_true',
+                    help='if true, rename to ORIG.{videofile} rather than recycle'
+                         + f' [dflt={vals.keep_backup}]')
+        parser.add_argument('-M', '--merge-subtitles',
+                    action='store_false' if vals.merge_subtitles else 'store_true',
+                    help='Merge external .en.srt subtitle files into output'
+                    + f' [dflt={vals.merge_subtitles}]')
+        parser.add_argument('-m', '--min-shrink-pct',
+                    default=vals.min_shrink_pct, type=int,
+                    help='minimum conversion reduction percent for replacement'
+                    + f' [dflt={vals.min_shrink_pct}]')
+        parser.add_argument('-q', '--quality',
+                    default=vals.quality, type=int,
+                    help=f'output quality (CRF) [dflt={vals.quality}]')
         parser.add_argument('-t', '--thread-cnt',
                     default=vals.thread_cnt, type=int,
                     help='thread count for ffmpeg conversions'
                         + f' [dflt={vals.thread_cnt}]')
-        parser.add_argument('-m', '--min-shrink-pct',
-                    default=vals.min_shrink_pct, type=int,
-                    help='minimum conversion reduction percent for replacement'
-                        + f' [dflt={vals.min_shrink_pct}]')
 
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
-                    help='save the -B/-b/-q/-a/-F/-m options as defaults')
+                    help='save the -B/-b/-q/-a/-F/-m/-M options as defaults')
         parser.add_argument('-n', '--dry-run', action='store_true',
                     help='Perform a trial run with no changes made.')
         parser.add_argument('-s', '--sample', action='store_true',
                     help='produce 30s samples called SAMPLE.{input-file}')
         parser.add_argument('-L', '--logs', action='store_true',
                     help='view the logs')
+        parser.add_argument('-T', '--chooser-tests', action='store_true',
+                    help='run tests on ffmpeg choices w 30s cvt of 1st given video')
 
         parser.add_argument('files', nargs='*',
             help='Video files and recursively scanned folders w Video files')
@@ -1727,7 +1695,6 @@ def main(args=None):
             # then make it an actual option.  It is the max time allowed
             # between progress updates when converting a video
         opts.progress_secs_max = 30
-
 
         if opts.save_defaults:
             print('Setting new defaults:')
@@ -1754,6 +1721,9 @@ def main(args=None):
                 # Catch any other execution errors
                 print(f"An error occurred during exec: {e}", file=sys.stderr)
                 sys.exit(1)
+#       if opts.chooser_tests:
+#           chooser = FfmpegChooser(force_pull=True)
+#           chooser.
 
 
         if opts.sample:

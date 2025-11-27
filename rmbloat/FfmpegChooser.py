@@ -404,6 +404,7 @@ class FfmpegChooser:
             scale_opts=[],
             color_opts=[],
             map_opts=[],
+            external_subtitle=None,  # Path to external .srt file to merge
             
             # Threading
             thread_count=0,  # 0 = auto
@@ -502,6 +503,17 @@ class FfmpegChooser:
         workdir = str(input_path.parent)
         input_basename = input_path.name
         
+        # Handle external subtitle if provided
+        subtitle_basename = None
+        if params.external_subtitle:
+            subtitle_path = Path(params.external_subtitle).resolve()
+            if subtitle_path.exists():
+                subtitle_basename = subtitle_path.name
+                # Ensure subtitle is in same directory as input for Docker mounting
+                if subtitle_path.parent != input_path.parent:
+                    print(f"Warning: Subtitle file must be in same directory as input for Docker. Ignoring subtitle.")
+                    subtitle_basename = None
+        
         # Build base command (docker/podman vs system)
         if self.use_docker:
             cmd.extend([
@@ -529,6 +541,12 @@ class FfmpegChooser:
         
         # Input file
         cmd.extend(['-i', input_basename if self.use_docker else params.input_file])
+        
+        # Add external subtitle as additional input if provided
+        subtitle_input_index = None
+        if subtitle_basename:
+            cmd.extend(['-i', subtitle_basename if self.use_docker else params.external_subtitle])
+            subtitle_input_index = 1  # Subtitle is the second input (index 1)
         
         # Post-input options (e.g., -t for duration)
         if params.post_input_opts:
@@ -604,6 +622,13 @@ class FfmpegChooser:
         # Stream mapping
         if params.map_opts:
             cmd.extend(params.map_opts)
+        
+        # If we have an external subtitle, map it and set metadata
+        if subtitle_input_index is not None:
+            cmd.extend(['-map', f'{subtitle_input_index}:s:0'])  # Map first subtitle stream from subtitle input
+            cmd.extend(['-c:s', 'srt'])  # Keep as SRT format
+            cmd.extend(['-metadata:s:s:0', 'language=eng'])  # Set language to English
+            cmd.extend(['-metadata:s:s:0', 'title=English'])  # Set title to English
         
         # Codec
         cmd.extend(['-c:v', codec, '-c:a', 'copy', '-c:s', 'copy'])
