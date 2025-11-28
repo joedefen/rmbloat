@@ -66,6 +66,66 @@ from .FfmpegChooser import FfmpegChooser
 
 lg = RotatingLogger('rmbloat')
 
+def sanitize_file_paths(paths):
+    """
+    Sanitize a list of file paths by:
+    1. Converting all to absolute paths
+    2. Removing non-existing paths
+    3. Removing redundant paths (paths contained within other paths)
+
+    Returns a sorted list of unique, clean paths.
+    """
+    if not paths:
+        return []
+
+    # Convert all to absolute paths and resolve symlinks
+    abs_paths = []
+    for path_str in paths:
+        if not path_str or not path_str.strip():
+            continue
+        try:
+            path = Path(path_str).resolve()
+            if path.exists():
+                abs_paths.append(path)
+        except (OSError, RuntimeError):
+            # Skip invalid paths
+            continue
+
+    if not abs_paths:
+        return []
+
+    # Remove duplicates and sort
+    abs_paths = sorted(set(abs_paths))
+
+    # Remove redundant paths (paths that are subdirectories of other paths)
+    filtered_paths = []
+    for path in abs_paths:
+        # Check if this path is a subdirectory of any already-added path
+        is_redundant = False
+        for existing_path in filtered_paths:
+            try:
+                # Check if path is relative to existing_path (i.e., is a subdirectory)
+                path.relative_to(existing_path)
+                is_redundant = True
+                break
+            except ValueError:
+                # Not a subdirectory, check reverse (is existing_path a subdirectory of path?)
+                try:
+                    existing_path.relative_to(path)
+                    # existing_path is redundant, remove it and add path instead
+                    filtered_paths.remove(existing_path)
+                    is_redundant = False
+                    break
+                except ValueError:
+                    # Neither is a subdirectory of the other
+                    continue
+
+        if not is_redundant:
+            filtered_paths.append(path)
+
+    # Convert back to strings
+    return [str(p) for p in sorted(filtered_paths)]
+
 def store_cache_on_exit():
     """ TBD """
     if Converter.singleton:
@@ -427,19 +487,33 @@ class Converter:
         # self.cgroup_prefix = set_cgroup_cpu_limit(opts.thread_cnt*100)
         atexit.register(store_cache_on_exit)
 
-        # Build options suffix for display (computed once)
+        # Auto mode tracking
+        self.auto_mode_enabled = bool(opts.auto_hr is not None)
+        self.auto_mode_start_time = time.monotonic() if self.auto_mode_enabled else None
+        self.auto_mode_hrs_limit = opts.auto_hr if self.auto_mode_enabled else None
+        self.consecutive_failures = 0
+        self.ok_count = 0
+        self.error_count = 0
+
+        # Build options suffix for display
+        self.options_suffix = self.build_options_suffix()
+
+    def build_options_suffix(self):
+        """Build the options suffix string for display."""
         parts = []
-        parts.append(f'Q={opts.quality}')
-        parts.append(f'Shr>={opts.min_shrink_pct}')
-        if opts.dry_run:
+        parts.append(f'Q={self.opts.quality}')
+        parts.append(f'Shr>={self.opts.min_shrink_pct}')
+        if self.opts.dry_run:
             parts.append('DRYRUN')
-        if opts.sample:
+        if self.opts.sample:
             parts.append('SAMPLE')
-        if opts.keep_backup:
+        if self.opts.keep_backup:
             parts.append('KeepB')
-        if opts.merge_subtitles:
+        if self.opts.merge_subtitles:
             parts.append('MrgSrt')
-        self.options_suffix = ' -- ' + ' '.join(parts)
+        if self.auto_mode_enabled:
+            parts.append(f'Auto={self.opts.auto_hr}hr')
+        return ' -- ' + ' '.join(parts)
 
     def is_allowed_codec(self, probe):
         """ Return whether the codec is 'allowed' """
@@ -677,11 +751,24 @@ class Converter:
             # Don't copy internal subtitles, we're replacing with external
             map_copy += ' -0:s -map -0:t -map -0:d'
         else:
-            # Not merging subtitles, copy internal ones
-            map_copy += ' 0:s? -c:s copy -map -0:t -map -0:d'
+            # Copy internal subtitles, but drop unsafe ones (bitmap codecs like dvd_subtitle)
+            # Check if probe has custom instructions to drop specific subtitle streams
+            if probe.customs and 'drop_subs' in probe.customs:
+                # Map all subtitles first, then explicitly exclude the unsafe ones
+                map_copy += ' 0:s?'
+                for sub_idx in probe.customs['drop_subs']:
+                    map_copy += f' -map -0:s:{sub_idx}'
+                map_copy += ' -map -0:t -map -0:d'
+            else:
+                # No custom subtitle filtering needed
+                map_copy += ' 0:s? -map -0:t -map -0:d'
 
         params.map_opts = map_copy.split()
         params.external_subtitle = merged_external_subtitle
+
+        # Set subtitle codec to srt for MKV compatibility (transcodes mov_text, ass, etc.)
+        # When external subtitle is used, FfmpegChooser handles the codec internally
+        params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
 
         # Generate the command
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
@@ -1083,6 +1170,7 @@ class Converter:
         dry_run = self.opts.dry_run
         vid = job.vid
         probe = None
+        space_saved_gb = 0.0
         if success:
             if not dry_run:
                 probe = self.probe_cache.get(job.temp_file)
@@ -1091,6 +1179,7 @@ class Converter:
                     success = True
                     vid.doit = 'ok'
                     net = -20
+                    space_saved_gb = vid.gb * 0.20  # Estimate for dry run
                 else:
                     success = False
                     vid.doit = 'ERR'
@@ -1098,10 +1187,20 @@ class Converter:
             else:
                 net = (vid.gb - probe.gb) / vid.gb
                 net = int(round(-net*100))
+                space_saved_gb = vid.gb - probe.gb
             if self.is_allowed_codec(probe) and net > -self.opts.min_shrink_pct:
                 self.probe_cache.set_anomaly(vid.filepath, 'OPT')
                 success = False
             vid.net = f'{net}%'
+
+        # Track auto mode vitals
+        if self.auto_mode_enabled:
+            if success and not self.opts.sample:
+                self.ok_count += 1
+                self.consecutive_failures = 0
+            elif not success:
+                self.error_count += 1
+                self.consecutive_failures += 1
 
         if success and not self.opts.sample:
             would = 'WOULD ' if dry_run else ''
@@ -1315,6 +1414,46 @@ class Converter:
             return True
         return False
 
+    def print_auto_mode_vitals(self, stats):
+        """Print vitals report and exit for auto mode."""
+        runtime_hrs = (time.monotonic() - self.auto_mode_start_time) / 3600
+
+        # Calculate space bloated from remaining TODO items
+        space_bloated_gb = 0.0
+        for vid in self.vids:
+            if vid.doit == '[X]' and vid.probe0:
+                space_bloated_gb += vid.probe0.gb
+
+        # Format report
+        report = "\n" + "=" * 70 + "\n"
+        report += "AUTO MODE VITALS REPORT\n"
+        report += "=" * 70 + "\n"
+        report += f"Runtime:              {runtime_hrs:.2f} hours\n"
+        report += f"OK conversions:       {self.ok_count}\n"
+        report += f"Error conversions:    {self.error_count}"
+
+        if self.consecutive_failures >= 10:
+            report += " (early termination: 10 consecutive failures)\n"
+        else:
+            report += "\n"
+
+        report += f"Remaining TODO:       {stats.total - stats.done}\n"
+        report += f"Space saved:          {abs(stats.delta_gb):.2f} GB\n"
+        report += f"Space still bloated:  {space_bloated_gb:.2f} GB\n"
+        report += "=" * 70 + "\n"
+
+        # Print to screen
+        if self.win:
+            self.win.stop_curses()
+        print(report)
+
+        # Log to file
+        lg.lg(report)
+
+        # Exit with appropriate code
+        exit_code = 1 if self.consecutive_failures >= 10 else 0
+        sys.exit(exit_code)
+
     def do_window_mode(self):
         """ TBD """
         def make_lines(doit_skips=None):
@@ -1496,6 +1635,10 @@ class Converter:
                         self.job.ffsubproc.stop()
                         self.job.vid.doit = '[X]'
                         self.job = None
+                    # Disable auto mode when user interrupts
+                    if self.auto_mode_enabled:
+                        self.auto_mode_enabled = False
+                        self.options_suffix = self.build_options_suffix()
                     self.state = 'select'
                     self.vids.sort(key=lambda vid: vid.bloat, reverse=True)
                     win.set_pick_mode(True, 1)
@@ -1561,6 +1704,24 @@ class Converter:
                         + json.dumps(list(gonners), indent=4))
 
                 if not self.job:
+                    # Check auto mode exit conditions
+                    if self.auto_mode_enabled:
+                        # Calculate current stats for vitals report
+                        lines, stats = make_lines()
+
+                        # Check exit conditions
+                        time_exceeded = False
+                        if self.auto_mode_start_time and self.auto_mode_hrs_limit:
+                            runtime_hrs = (time.monotonic() - self.auto_mode_start_time) / 3600
+                            time_exceeded = runtime_hrs >= self.auto_mode_hrs_limit
+
+                        no_more_todo = (stats.total - stats.done) == 0
+                        too_many_failures = self.consecutive_failures >= 10
+
+                        if time_exceeded or no_more_todo or too_many_failures:
+                            self.print_auto_mode_vitals(stats)
+                            # print_auto_mode_vitals exits, so we never reach here
+
                     self.state = 'select'
                     self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
                     win.set_pick_mode(True, 1)
@@ -1602,10 +1763,16 @@ class Converter:
                 render_screen()
 
             key = win.prompt(seconds=3.0) # Wait for half a second or a keypress
+
             if key in spin.keys:
                 spin.do_key(key, win)
 
             handle_keyboard()
+
+            # Auto-transition to convert state if auto mode enabled
+            if self.auto_mode_enabled and self.state == 'select':
+                self.state = 'convert'
+
 
             advance_jobs()
 
@@ -1651,6 +1818,7 @@ def main(args=None):
         cfg = IniManager(app_name='rmbloat',
                                allowed_codecs='x265',
                                bloat_thresh=1600,
+                               files=[],  # Default video collection paths
                                full_speed=False,
                                keep_backup=False,
                                merge_subtitles=True,
@@ -1696,7 +1864,10 @@ def main(args=None):
 
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
-                    help='save the -B/-b/-q/-a/-F/-m/-M options as defaults')
+                    help='save the -B/-b/-q/-a/-F/-m/-M options and file paths as defaults')
+        parser.add_argument('--auto-hr', type=float, default=None,
+                    help='Auto mode: run unattended for specified hours, '
+                         'auto-select [X] files and auto-start conversions')
         parser.add_argument('-n', '--dry-run', action='store_true',
                     help='Perform a trial run with no changes made.')
         parser.add_argument('-p', '--prefer-strategy',
@@ -1711,20 +1882,38 @@ def main(args=None):
         parser.add_argument('-T', '--chooser-tests', action='store_true',
                     help='run tests on ffmpeg choices w 30s cvt of 1st given video')
 
-        parser.add_argument('files', nargs='*',
-            help='Video files and recursively scanned folders w Video files')
+        # Build help message for files argument showing defaults if set
+        files_help = 'Video files and recursively scanned folders w Video files'
+        if vals.files:
+            files_help += f' [dflt: {", ".join(vals.files)}]'
+        parser.add_argument('files', nargs='*', help=files_help)
         opts = parser.parse_args(args)
             # Fake as option ... if this needs tuning (which I doubt)
             # then make it an actual option.  It is the max time allowed
             # between progress updates when converting a video
         opts.progress_secs_max = 30
 
+        # Use default files if none provided on command line
+        # (but not for --chooser-tests, where no files means detection-only mode)
+        if not opts.files and vals.files and not opts.chooser_tests:
+            opts.files = vals.files
+            print('Using default video collection paths from config:')
+            for path in opts.files:
+                print(f'  {path}')
+
         if opts.save_defaults:
             print('Setting new defaults:')
             for key in vars(vals):
                 new_value = getattr(opts, key)
+                # Special handling for files: sanitize paths
+                if key == 'files':
+                    new_value = sanitize_file_paths(new_value)
+                    print(f'- {key} (sanitized):')
+                    for path in new_value:
+                        print(f'    {path}')
+                else:
+                    print(f'- {key} {new_value}')
                 setattr(vals, key, new_value)
-                print(f'- {key} {new_value}')
             cfg.write()
             sys.exit(0)
 

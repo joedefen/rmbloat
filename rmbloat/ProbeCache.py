@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor # <-- NEW IMPORT
 
 class ProbeCache:
     """ TBD """
-    disk_fields = set('anomaly width height codec bitrate fps duration size_bytes color_spt'.split())
+    disk_fields = set('anomaly width height codec bitrate fps duration size_bytes color_spt customs'.split())
 
     """ TBD """
     def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp", chooser=None):
@@ -136,6 +136,7 @@ class ProbeCache:
 
             meta = SimpleNamespace()
             meta.anomaly = None # use for errors and ineffective conversions
+            meta.customs = None # custom conversion instructions (e.g., subtitle filtering)
 
             meta.width = int(video_stream.get('width', 0))
             meta.height = int(video_stream.get('height', 0))
@@ -148,6 +149,22 @@ class ProbeCache:
             meta.bitrate = int(int(bitrate_str)/1000)
 
             meta.duration = float(metadata["format"].get('duration', 0.0))
+
+            # Detect unsafe subtitle streams (bitmap codecs that cause conversion failures)
+            # Safe text-based codecs: subrip, ass, ssa, mov_text, webvtt, text
+            # Everything else (dvd_subtitle, hdmv_pgs_subtitle, etc.) should be dropped
+            safe_subtitle_codecs = {'subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'}
+            subtitle_streams = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'subtitle']
+
+            if subtitle_streams:
+                drop_indices = []
+                for idx, sub_stream in enumerate(subtitle_streams):
+                    codec = sub_stream.get('codec_name', '')
+                    if codec and codec not in safe_subtitle_codecs:
+                        drop_indices.append(idx)
+
+                if drop_indices:
+                    meta.customs = {'drop_subs': drop_indices}
 
             # 1. Get the Raw Frame Rate String (r_frame_rate preferred)
             fps_str = video_stream.get('r_frame_rate') or video_stream.get('avg_frame_rate', '0/0')

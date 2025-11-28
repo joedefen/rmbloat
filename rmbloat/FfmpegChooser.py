@@ -371,6 +371,7 @@ class FfmpegChooser:
             scale_opts: Scaling filter options (default: [])
             color_opts: Color space options (default: [])
             map_opts: Stream mapping options (default: [])
+            subtitle_codec: Subtitle codec (default: 'copy')
             thread_count: Thread limit, 0=auto (default: 0)
             sample_mode: Extract sample clip (default: False)
             sample_start_secs: Sample start time in seconds (default: None)
@@ -396,30 +397,31 @@ class FfmpegChooser:
             # Required - must provide
             input_file=None,
             output_file=None,
-            
+
             # Quality/encoding
             crf=28,
             preset='medium',
             codec='hevc',
             use_10bit=True,
-            
+
             # Filtering/processing
             scale_opts=[],
             color_opts=[],
             map_opts=[],
             external_subtitle=None,  # Path to external .srt file to merge
-            
+            subtitle_codec='copy',  # Subtitle codec: 'copy', 'srt', 'ass', etc.
+
             # Threading
             thread_count=0,  # 0 = auto
-            
+
             # Sampling
             sample_mode=False,
             sample_start_secs=None,
             sample_duration_secs=None,
-            
+
             # Priority
             use_nice_ionice=True,
-            
+
             # Pre/post input opts
             pre_input_opts=[],
             post_input_opts=[],
@@ -632,9 +634,12 @@ class FfmpegChooser:
             cmd.extend(['-c:s', 'srt'])  # Keep as SRT format
             cmd.extend(['-metadata:s:s:0', 'language=eng'])  # Set language to English
             cmd.extend(['-metadata:s:s:0', 'title=English'])  # Set title to English
-        
-        # Codec
-        cmd.extend(['-c:v', codec, '-c:a', 'copy', '-c:s', 'copy'])
+
+        # Codec - only set subtitle codec if no external subtitle (external subtitle already set it)
+        if subtitle_input_index is not None:
+            cmd.extend(['-c:v', codec, '-c:a', 'copy'])
+        else:
+            cmd.extend(['-c:v', codec, '-c:a', 'copy', '-c:s', params.subtitle_codec])
         
         # Output file
         output_basename = Path(params.output_file).name if self.use_docker else params.output_file

@@ -44,12 +44,12 @@ options:
   -F, --full-speed      if true, do NOT set nice -n19 and ionice -c3 dflt=False]
   -m MIN_SHRINK_PCT, --min-shrink-pct MIN_SHRINK_PCT
                         minimum conversion reduction percent for replacement [dflt=10]
-  -S, --save-defaults   save the -B/-b/-q/-a/-F/-m options as defaults
+  -S, --save-defaults   save the -B/-b/-q/-a/-F/-m/-M options and file paths as defaults
   -n, --dry-run         Perform a trial run with no changes made.
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
   -L, --logs            view the logs
   ```
-  You can customize the defaults by setting the desired options and adding the  `--save-defaults` option to write the current choices to its .ini file. Non-video files in the given files and directories are simply ignored.
+  You can customize the defaults by setting the desired options and adding the  `--save-defaults` option to write the current choices to its .ini file. This includes saving your video collection root paths, so you don't need to specify them every time you run `rmbloat`. File paths are automatically sanitized: converted to absolute paths, non-existing paths removed, and redundant paths (subdirectories of other saved paths) eliminated. Non-video files in the given files and directories are simply ignored.
 
   Candidate video files are probed (with `ffprobe`). If the probe fails, then the candidate is simply ignored. Probing many files can be time consuming, but `rmbloat` keeps a cache of probes so start-up can be fast if most of the candidates have been successfully probed.
 

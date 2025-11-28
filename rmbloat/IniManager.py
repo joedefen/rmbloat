@@ -109,7 +109,11 @@ class IniManager:
                             value_to_set = config.getboolean(self.SECTION, key)
                         elif default_type is float:
                             value_to_set = config.getfloat(self.SECTION, key)
-                        
+                        elif default_type is list:
+                            # Handle list type: stored as newline-separated values
+                            value_to_set = [line.strip() for line in value_to_set.split('\n')
+                                          if line.strip()]
+
                         setattr(self.vals, key, value_to_set)
 
                     except ValueError:
@@ -140,7 +144,11 @@ class IniManager:
         # Transfer all current attribute values from self.vals
         for key in self._default_values.keys():
             value = getattr(self.vals, key)
-            config[self.SECTION][key] = str(value)
+            # Handle list type: store as newline-separated values
+            if isinstance(value, list):
+                config[self.SECTION][key] = '\n' + '\n'.join(str(item) for item in value)
+            else:
+                config[self.SECTION][key] = str(value)
 
         try:
             with open(self.config_file_path, 'w') as configfile:
