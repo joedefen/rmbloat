@@ -63,7 +63,7 @@ The main screens are:
 After scanning/probing the file and folder arguments, the selection screen will open.  In the example below, we have applied a filter pattern, `anqis.gsk`, to select only certain video files.
 
 ```
- [s]etAll [r]setAll [i]nit SP:toggle [g]o ?=help [q]uit /anqis.gsk
+ [r]setAll [i]nit SP:toggle [g]o ?=help [q]uit /anqis.gsk
       Picked=3/10  GB=5.6(0)  CPU=736/800%
  CVT  NET BLOAT    RES  CODEC  MINS     GB   VIDEO
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -81,6 +81,13 @@ After scanning/probing the file and folder arguments, the selection screen will 
 **Notes.**
 * `[ ]` denotes a video NOT selected for conversion.
 * `[X]` denotes a video selected for conversion.
+* other CVT values are:
+  * `?Pn` - denotes probe failed `n` times (stops at 9)
+    * A "hard" failure which cannot be overridden to start conversion
+  * `ErN` - denotes conversion failed `N` times (stops at 9)
+    * `Er1` is a "very soft" state (auto overriden); can manually select other values
+  * `OPT` - denotes the prior conversion went OK except insuffient shrinkage
+    * can manually select for conversion
 * `^` denotes a value over the threshold for conversion. Besides an excessive bloat, the height could be too large, or the codec unacceptable; all depending on the program options.
 * To change whether selected, you can use:
     * the s/r/i keys to affect potentially every select, and
@@ -120,9 +127,8 @@ j, DOWN:  down one row           $, END:  last row
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 Type keys to alter choice:
                     ? - help screen:  off ON
-               s - set all to "[X]"
              r - reset all to "[ ]"
-       i,SP - set all initial state
+     i - set all to automatic state
      SP - toggle current line state
               g - begin conversions
     q - quit converting OR exit app

@@ -20,11 +20,11 @@ TODO:
 
 - V3.0
   - merge in missing subtitles
-    ffmpeg -i video.mkv -i video.en.srt \
-    -map 0 -map 1:s:0 \
-    -c copy \  # Copy all streams, no re-encoding
-    -c:s srt \  # Only subtitle needs codec
-    -metadata:s:s:0 language=eng \
+    ffmpeg -i video.mkv -i video.en.srt 
+    -map 0 -map 1:s:0 
+    -c copy   # Copy all streams, no re-encoding
+    -c:s srt   # Only subtitle needs codec
+    -metadata:s:s:0 language=eng 
     video.sb.mkv
 """
 
@@ -33,6 +33,7 @@ TODO:
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
 # pylint: disable=consider-using-with,line-too-long,too-many-lines
 # pylint: disable=too-many-nested-blocks,try-except-raise,line-too-long
+# pylint: disable=too-many-public-methods
 
 import sys
 import os
@@ -444,6 +445,10 @@ class Converter:
         """ Return whether the codec is 'allowed' """
         if not probe:
             return True
+        if not re.match(r'^[a-z]\w*$', probe.codec, re.IGNORECASE):
+            # if not a codec name (e.g., "---"), then it is OK
+            # in the sense we will not choose it as an exception
+            return True
         codec_ok = bool(self.opts.allowed_codecs == 'all')
         if self.opts.allowed_codecs == 'x265':
             codec_ok = bool(probe.codec in ('hevc',))
@@ -488,7 +493,7 @@ class Converter:
         vid = SimpleNamespace(
                     filepath=video_file,
                     filebase=os.path.basename(video_file),
-                    doit='', net=' ---', width=None, height=None,
+                    doit='', doit_auto='', net=' ---', width=None, height=None,
                     command=None, res_ok=None,
                     duration=None, codec=None, bitrate=None, bloat=None, bloat_ok=None,
                     codec_ok=None, gb=None, all_ok=None,
@@ -499,7 +504,12 @@ class Converter:
         vid.probe0 = self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
-        vid.doit = '[ ]' if vid.all_ok or self.dont_doit(vid) else '[X]'
+        anomaly = vid.probe0.anomaly # shorthand
+        if anomaly and anomaly not in ('Er1', ):
+            vid.doit = anomaly
+        else:
+            vid.doit = '[ ]' if vid.all_ok or self.dont_doit(vid) else '[X]'
+        vid.doit_auto = vid.doit # auto value of doit saved for ease of re-init
 
     @staticmethod
     def bash_quote(args):
@@ -1300,7 +1310,7 @@ class Converter:
         if (base.startswith('sample.')
                 or base.startswith('test.')
                 or base.endswith('.recode.mkv')
-                or vid.doit not in ('[ ]', '[X]', '', None)
+                or vid.doit in ('OK',)
                 ):
             return True
         return False
@@ -1375,7 +1385,8 @@ class Converter:
             else:
                 lines, stats = make_lines()
                 if self.state == 'select':
-                    head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o ?=help [q]uit'
+                    # head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o ?=help [q]uit'
+                    head = '[r]setAll [i]nit SP:toggle [g]o ?=help [q]uit'
                     if self.search_re:
                         shown = Mangler.mangle(self.search_re) if spins.mangle else self.search_re
                         head += f' /{shown}'
@@ -1442,29 +1453,25 @@ class Converter:
                 else: # ignore pattern changes unless in select or if won't compile
                     spins.search = self.search_re
 
-            if spins.set_all:
-                spins.set_all = False
-                if self.state == 'select':
-                    for vid in self.visible_vids:
-                        if not self.dont_doit(vid):
-                            vid.doit = '[X]'
+#           if spins.set_all:
+#               spins.set_all = False
+#               if self.state == 'select':
+#                   for vid in self.visible_vids:
+#                       if not self.dont_doit(vid) and vid.doit_auto.startswith('['):
+#                           vid.doit = '[X]'
 
             if spins.reset_all:
                 spins.reset_all = False
                 if self.state == 'select':
                     for vid in self.visible_vids:
-                        if vid.doit in ('[ ]', '[X]'):
+                        if vid.doit_auto.startswith('['):
                             vid.doit = '[ ]'
 
             if spins.init_all:
                 spins.init_all = False
                 if self.state == 'select':
                     for vid in self.visible_vids:
-                        if vid.doit in ('[ ]', '[X]'):
-                            if self.dont_doit(vid) or vid.all_ok:
-                                vid.doit = '[ ]'
-                            else:
-                                vid.doit = '[X]'
+                        vid.doit = vid.doit_auto
 
             if spins.toggle:
                 spins.toggle = False
@@ -1507,6 +1514,7 @@ class Converter:
                         self.job.progress = got
                     elif isinstance(got, int):
                         self.job.vid.doit = ' OK' if got == 0 else 'ERR'
+                        self.job.vid.doit_auto = self.job.vid.doit
                         self.finish_transcode_job(
                             success=bool(got == 0), job=self.job)
                         dumped = dict(vars(self.job.vid))
@@ -1558,16 +1566,16 @@ class Converter:
                     win.set_pick_mode(True, 1)
 
         def toggle_doit(vid):
-            if self.dont_doit(vid):
-                vid.doit = '[ ]'
-            else:
-                vid.doit = '[X]' if vid.doit == '[ ]' else '[ ]'
+            if vid.doit == '[X]':
+                vid.doit = vid.doit_auto if vid.doit_auto != '[X]' else '[ ]'
+            elif not vid.doit.startswith('?') and not self.dont_doit(vid):
+                vid.doit = '[X]'
 
         spin = OptionSpinner()
         spin.add_key('help_mode', '? - help screen', vals=[False, True])
-        spin.add_key('set_all', 's - set all to "[X]"', category='action')
+        # spin.add_key('set_all', 's - set all to "[X]"', category='action')
         spin.add_key('reset_all', 'r - reset all to "[ ]"', category='action')
-        spin.add_key('init_all', 'i,SP - set all initial state', category='action')
+        spin.add_key('init_all', 'i - set all automatic state', category='action')
         spin.add_key('toggle', 'SP - toggle current line state', category='action',
                      keys={ord(' '), })
         spin.add_key('go', 'g - begin conversions', category='action')
@@ -1753,7 +1761,7 @@ def main(args=None):
             exit_code = chooser.run_tests(
                 video_file=video_file,
                 duration=30,
-                show_test_encode=(video_file is None)  # Show example commands if no video
+                show_test_encode=bool(video_file is None)  # Show example commands if no video
             )
             sys.exit(exit_code)
 
