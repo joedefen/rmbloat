@@ -50,6 +50,7 @@ import json
 import random
 import curses
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Optional, Union
 # from copy import copy
 from types import SimpleNamespace
@@ -134,7 +135,50 @@ def store_cache_on_exit():
         if Converter.singleton.probe_cache:
             Converter.singleton.probe_cache.store()
 
+_dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
 
+@dataclass(**_dataclass_kwargs)
+class Vid:
+    """ Our main object for the list of video entries """
+    # Init parameters
+    basic_ns: SimpleNamespace
+    video_file: str
+
+    # Fields set from init parameters (via __post_init__)
+    filepath: str = field(init=False)
+    filebase: str = field(init=False)
+    standard_name: str = field(init=False)
+    do_rename: bool = field(init=False)
+
+    # Fields with default values
+    doit: str = field(default='', init=False)
+    doit_auto: str = field(default='', init=False)
+    net: str = field(default=' ---', init=False)
+    width: Optional[int] = field(default=None, init=False)
+    height: Optional[int] = field(default=None, init=False)
+    command: Optional[str] = field(default=None, init=False)
+    res_ok: Optional[bool] = field(default=None, init=False)
+    duration: Optional[float] = field(default=None, init=False)
+    codec: Optional[str] = field(default=None, init=False)
+    bitrate: Optional[float] = field(default=None, init=False)
+    bloat: Optional[float] = field(default=None, init=False)
+    bloat_ok: Optional[bool] = field(default=None, init=False)
+    codec_ok: Optional[bool] = field(default=None, init=False)
+    gb: Optional[float] = field(default=None, init=False)
+    all_ok: Optional[bool] = field(default=None, init=False)
+    probe0: Optional[SimpleNamespace] = field(default=None, init=False)
+    probe1: Optional[SimpleNamespace] = field(default=None, init=False)
+    basename1: Optional[str] = field(default=None, init=False)
+    return_code: Optional[int] = field(default=None, init=False)
+    texts: list = field(default_factory=list, init=False)
+    ops: list = field(default_factory=list, init=False)
+
+    def __post_init__(self):
+        """ Custom initialization logic after dataclass __init__ """
+        self.filepath = self.video_file
+        self.filebase = os.path.basename(self.video_file)
+        self.standard_name = self.basic_ns.standard_name
+        self.do_rename = self.basic_ns.do_rename
 
 ###
 ### import subprocess
@@ -550,8 +594,8 @@ class Converter:
         vid.bloat_ok = bool(vid.bloat < self.opts.bloat_thresh)
         vid.all_ok = bool(vid.res_ok and vid.bloat_ok and vid.codec_ok)
 
-        vid.summary = (f'  {vid.width}x{vid.height}' +
-                        f' {vid.codec} {vid.bloat}b {vid.gb}G')
+        # vid.summary = (f'  {vid.width}x{vid.height}' +
+        #               f' {vid.codec} {vid.bloat}b {vid.gb}G')
         return probe
 
     def already_converted(self, basic_ns, video_file):
@@ -568,17 +612,7 @@ class Converter:
             bool: True if the file meets all criteria, False otherwise.
         """
 
-        vid = SimpleNamespace(
-                    filepath=video_file,
-                    filebase=os.path.basename(video_file),
-                    doit='', doit_auto='', net=' ---', width=None, height=None,
-                    command=None, res_ok=None,
-                    duration=None, codec=None, bitrate=None, bloat=None, bloat_ok=None,
-                    codec_ok=None, gb=None, all_ok=None,
-                    standard_name=basic_ns.standard_name,
-                    do_rename=basic_ns.do_rename,
-                    probe0=None, probe1=None, basename1=None,
-                    return_code=None, texts=[], ops=[])
+        vid = Vid(basic_ns, video_file)
         vid.probe0 = self.apply_probe(vid, basic_ns.probe)
         self.vids.append(vid)
 
@@ -1210,6 +1244,25 @@ class Converter:
             would = 'WOULD ' if dry_run else ''
             trashes = set()
             basename = os.path.basename(vid.filepath)
+
+            # Preserve timestamps from original file
+            orig_stat = None
+            if not dry_run:
+                try:
+                    orig_stat = os.stat(basename)
+                    # Get atime and mtime
+                    atime = orig_stat.st_atime
+                    mtime = orig_stat.st_mtime
+
+                    # If timestamps are in the future, set them to 1 year ago
+                    now = time.time()
+                    one_year_ago = now - (365 * 24 * 60 * 60)
+                    if atime > now or mtime > now:
+                        atime = one_year_ago
+                        mtime = one_year_ago
+                except OSError:
+                    orig_stat = None  # Failed to get timestamps
+
             try:
                 # Rename original to backup
                 if not dry_run and self.opts.keep_backup:
@@ -1234,6 +1287,13 @@ class Converter:
                     vid.ops += self.bulk_rename(basename, vid.standard_name, trashes)
 
                 if not dry_run:
+                    # Apply preserved timestamps to the new file
+                    if orig_stat is not None:
+                        try:
+                            os.utime(vid.standard_name, (atime, mtime))
+                        except OSError:
+                            pass  # Ignore timestamp setting errors
+
                     # probe = self.get_video_metadata(vid.standard_name)
                     vid.basename1 = vid.standard_name
                     vid.probe1 = self.apply_probe(vid, probe)
@@ -1381,29 +1441,6 @@ class Converter:
         for file_path, probe in results.items():
             ns = SimpleNamespace(video_file=file_path, probe=probe)
             video_files_out.append(ns)
-
-#       for video_file_path in paths_to_probe:
-#           probe_count += 1
-
-#           # probe = self.get_video_metadata(video_file_path)
-#           probe = self.probe_cache.get(video_file_path)
-
-#           if probe:
-#               ns = SimpleNamespace(video_file=video_file_path, probe=probe)
-#               video_files_out.append(ns)
-
-#           # Update the progress indicator every N probes or on the last file
-#           if probe_count % update_interval == 0 or probe_count == total_files:
-#               percent = int((probe_count / total_files) * 100)
-
-#               # \r (carriage return) moves the cursor to the start of the line for overwrite
-#               sys.stderr.write(f"probing: {percent}% {probe_count} of {total_files}\r")
-#               sys.stderr.flush()
-
-        # Print a final newline character to clean the console after completion
-#       if total_files > 0:
-#           sys.stderr.write("\n")
-#           sys.stderr.flush()
 
         return video_files_out
 
@@ -1686,13 +1723,13 @@ class Converter:
                     else:
                         break # no progress on job
             if self.state == 'convert' and not self.job:
-                gonners = set()
+                gonners = []
                 for vid in self.visible_vids:
                     if not vid:
                         continue
                     if vid.doit == '[X]':
                         if not os.path.isfile(vid.filepath):
-                            gonners.add(vid)
+                            gonners.append(vid)
                             continue
                         if not self.job: # start only one job
                             self.prev_time_encoded_secs = -1
@@ -1704,8 +1741,17 @@ class Converter:
                         if vid not in gonners:
                             vids.append(vid)
                     self.vids = vids # pruned list
+                    # Convert SimpleNamespace objects to dicts for JSON serialization
+                    gonners_data = []
+                    for v in gonners:
+                        dumped = dict(vars(v))
+                        if v.probe0:
+                            dumped['probe0'] = vars(dumped['probe0'])
+                        if v.probe1:
+                            dumped['probe1'] = vars(dumped['probe1'])
+                        gonners_data.append(dumped)
                     lg.err('videos disappeared before conversion:\n'
-                        + json.dumps(list(gonners), indent=4))
+                        + json.dumps(gonners_data, indent=4))
 
                 if not self.job:
                     # Check auto mode exit conditions
