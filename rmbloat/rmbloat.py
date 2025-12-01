@@ -38,10 +38,8 @@ TODO:
 import sys
 import os
 import argparse
-import subprocess
 import traceback
 import atexit
-import shlex
 import re
 import time
 import json
@@ -49,83 +47,24 @@ import random
 import curses
 from pathlib import Path
 from dataclasses import asdict
-from typing import Optional, Union
-# from copy import copy
 from types import SimpleNamespace
 from datetime import timedelta
 import send2trash
 from console_window import ConsoleWindow, OptionSpinner
 from .ProbeCache import ProbeCache
-from .VideoParser import VideoParser, Mangler
+from .VideoParser import Mangler
 from .IniManager import IniManager
 from .RotatingLogger import RotatingLogger
 from .CpuStatus import CpuStatus
 from .FfmpegChooser import FfmpegChooser
-from .FfmpegMon import FfmpegMon
 from .Models import PathProbePair, Vid, Job
-# from .SetupCgroup import set_cgroup_cpu_limit
+from . import FileOps
+from . import ConvertUtils
 
 lg = RotatingLogger('rmbloat')
 
-def sanitize_file_paths(paths):
-    """
-    Sanitize a list of file paths by:
-    1. Converting all to absolute paths
-    2. Removing non-existing paths
-    3. Removing redundant paths (paths contained within other paths)
-
-    Returns a sorted list of unique, clean paths.
-    """
-    if not paths:
-        return []
-
-    # Convert all to absolute paths and resolve symlinks
-    abs_paths = []
-    for path_str in paths:
-        if not path_str or not path_str.strip():
-            continue
-        try:
-            path = Path(path_str).resolve()
-            if path.exists():
-                abs_paths.append(path)
-        except (OSError, RuntimeError):
-            # Skip invalid paths
-            continue
-
-    if not abs_paths:
-        return []
-
-    # Remove duplicates and sort
-    abs_paths = sorted(set(abs_paths))
-
-    # Remove redundant paths (paths that are subdirectories of other paths)
-    filtered_paths = []
-    for path in abs_paths:
-        # Check if this path is a subdirectory of any already-added path
-        is_redundant = False
-        for existing_path in list(filtered_paths):
-            try:
-                # Check if path is relative to existing_path (i.e., is a subdirectory)
-                path.relative_to(existing_path)
-                is_redundant = True
-                break
-            except ValueError:
-                # Not a subdirectory, check reverse (is existing_path a subdirectory of path?)
-                try:
-                    existing_path.relative_to(path)
-                    # existing_path is redundant, remove it and add path instead
-                    filtered_paths.remove(existing_path)
-                    is_redundant = False
-                    break
-                except ValueError:
-                    # Neither is a subdirectory of the other
-                    continue
-
-        if not is_redundant:
-            filtered_paths.append(path)
-
-    # Convert back to strings
-    return [str(p) for p in sorted(filtered_paths)]
+# File operation functions moved to FileOps.py
+sanitize_file_paths = FileOps.sanitize_file_paths
 
 def store_cache_on_exit():
     """ TBD """
@@ -136,103 +75,6 @@ def store_cache_on_exit():
             Converter.singleton.probe_cache.store()
 
 # Data models moved to Models.py
-
-###
-### import subprocess
-### import re
-###
-### # --- Configuration for Aggressive Compression (Low Bitrate) ---
-###
-### # CRF 28 is the 'default' for libx265. We go higher for lower quality/smaller file.
-### # Higher value = lower quality = smaller file.
-### CRF_VALUE_AGGRESSIVE = 30
-### # QSV's equivalent is -global_quality. 25 is a common 'good' starting point.
-### # We go higher for lower quality/smaller file, aiming for ~1200kbps.
-### QSV_QUALITY_AGGRESSIVE = 32
-###
-### # -----------------------------------------------------------
-###
-### def detect_qsv_support():
-###     """Checks if the system's FFmpeg build supports hevc_qsv (Intel QSV HEVC encoding)."""
-###     try:
-###         # Command to list available encoders (We specifically look for 'hevc_qsv')
-###         command = ['ffmpeg', '-hide_banner', '-encoders']
-###
-###         # Execute and check for success
-###         result = subprocess.run(
-###             command,
-###             capture_output=True,
-###             text=True,
-###             check=True, # Raises CalledProcessError for non-zero exit status
-###             timeout=5
-###         )
-###
-###         # Search the output for the QSV HEVC encoder name
-###         if re.search(r'\bhevc_qsv\b', result.stdout):
-###             # This confirms the FFmpeg binary has QSV support compiled in.
-###             return True
-###         else:
-###             return False
-###
-###     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-###         # Handles errors like 'ffmpeg' not found, command failure, or timeout.
-###         print(f"Warning: Could not execute FFmpeg to detect encoders. Assuming no QSV. Error: {e}")
-###         return False
-###
-### # --- How to use it in your main application logic ---
-###
-### # Initialize all your conversion flags
-### VIDEO_CODEC = ''
-### HWACCEL_FLAG = []
-### PIPLINE_ARG = []
-### QUALITY_ARG = []
-### PRESET_ARG = ['-preset', 'medium'] # Use a medium preset for a good balance
-###
-### if detect_qsv_support():
-###     print(f"✅ Intel QSV (hevc_qsv) support detected. Using hardware acceleration.")
-###
-###     # 1. Hardware Encoder
-###     VIDEO_CODEC = 'hevc_qsv'
-###     VIDEO_CODEC = 'hevc_vaapi'
-###
-###     # 2. Hardware Acceleration Flag (may vary by system setup)
-###     # HWACCEL_FLAG = '-hwaccel qsv'.split()
-###     HWACCEL_FLAG = ['-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
-###                         '-filter_hw_device', 'va']
-###     HWACCEL_FLAG = [ '-hwaccel', 'vaapi', # Enable VAAPI decoding
-###                     '-hwaccel_device', 'va:/dev/dri/renderD128', ]
-###     PIPELINE_ARG = [ '-vf', 'deinterlace_vaapi,hwmap=derive_device=va',]
-###
-###
-###
-###
-###     # 1. Video Filter: Map and format the data for QSV, removing the problematic upload step
-###     #    (The 'hwmap' step might be confusing the internal scaler, let's simplify to a pure format filter)
-###     #    We are changing the filter entirely to focus on format conversion within the hardware context.
-###
-###     # 2. Output Pixel Format (CRITICAL)
-###
-###     # 3. Quality Control (ICQ is QSV's CRF equivalent)
-###     # Target value {QSV_QUALITY_AGGRESSIVE} for aggressive (low bitrate) compression.
-###     # QUALITY_ARG = ['-global_quality', str(QSV_QUALITY_AGGRESSI# 5. THE FIX: Use the native VAAPI HEVC encoder
-###     QUALITY_ARG = ['-qp', '22',] # Quality parameter (Good balance for HEVC)VE)]
-###
-###     # Note: QSV presets are often simple numbers (1-7) for speed/quality trade-offs.
-###     # The 'medium' preset may not be an exact QSV equivalent, but it's a good default.
-###
-### else:
-###     print(f"❌ No Intel QSV support detected. Falling back to libx265 software encoding.")
-###
-###     # 1. Software Encoder
-###     VIDEO_CODEC = 'libx265'
-###
-###     # 2. No HW acceleration needed here
-###     HWACCEL_FLAG = []
-###
-###     # 3. Quality Control (CRF)
-###     # Target value {CRF_VALUE_AGGRESSIVE} for aggressive (low bitrate) compression.
-###     QUALITY_ARG = ['-crf', str(CRF_VALUE_AGGRESSIVE)]
-
 # FfmpegMon class moved to FfmpegMon.py
 # Job class moved to Models.py
 
@@ -263,16 +105,9 @@ class Converter:
         re.IGNORECASE
     )
 
-    # A common list of video extensions ffmpeg can typically handle.
-    # NOTE: The check is *case-insensitive* by converting to lowercase.
-    VIDEO_EXTENSIONS = {
-        '.mp4', '.mov', '.mkv', '.avi', '.webm', '.flv',
-        '.wmv', '.mpg', '.mpeg', '.3gp', '.m4v', '.ts',
-        '.ogg', '.ogv'
-        # You may need to add or remove extensions based on your specific requirements
-    }
-    # Prefixes to skip (case-sensitive as requested)
-    SKIP_PREFIXES = ('TEMP.', 'ORIG.')
+    # Constants moved to ConvertUtils.py
+    VIDEO_EXTENSIONS = ConvertUtils.VIDEO_EXTENSIONS
+    SKIP_PREFIXES = ConvertUtils.SKIP_PREFIXES
     sample_seconds = 30
     singleton = None
 
@@ -394,20 +229,8 @@ class Converter:
             vid.doit = '[ ]' if vid.all_ok or self.dont_doit(vid) else '[X]'
         vid.doit_auto = vid.doit # auto value of doit saved for ease of re-init
 
-    @staticmethod
-    def bash_quote(args):
-        """
-        Converts a Python list of arguments into a single, properly quoted
-        Bash command string.
-        """
-        quoted_args = []
-        for arg in args:
-            # 1. Check if simple quoting is enough (no need to handle embedded quotes)
-            # shlex.quote is the preferred, robust way in Python 3.3+
-            quoted_arg = shlex.quote(arg)
-            quoted_args.append(quoted_arg)
-
-        return ' '.join(quoted_args)
+    # Utility functions moved to ConvertUtils.py
+    bash_quote = staticmethod(ConvertUtils.bash_quote)
 
 
     def generate_taskset_core_list(self, desired_cores: int = 3) -> str:
@@ -744,212 +567,26 @@ class Converter:
             else:
                 return got
 
-    @staticmethod
-    def human_readable_size(size_bytes: int) -> str:
+    human_readable_size = staticmethod(ConvertUtils.human_readable_size)
+
+    is_valid_video_file = staticmethod(ConvertUtils.is_valid_video_file)
+
+    def standard_name(self, pathname: str, height: int) -> tuple[bool, str]:
         """
-        Converts a raw size in bytes to a human-readable string (e.g., 10 KB, 5.5 MB).
-        Returns:
-            A string representing the size in human-readable format.
-        """
-        if size_bytes is None:
-            return "0 Bytes"
+        Delegates to ConvertUtils.standard_name() with quality from opts.
 
-        if size_bytes == 0:
-            return "0 Bytes"
-
-        # Define the unit list (using 1024 for base-2, which is standard for file sizes)
-        size_names = ("Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-
-        # Use a loop to find the appropriate unit index (i)
-        i = 0
-        size = size_bytes
-        while size >= 1024 and i < len(size_names) - 1:
-            size /= 1024
-            i += 1
-
-        # Format the number, keeping two decimal places if it's not the 'Bytes' unit
-        if i == 0:
-            return f"{size_bytes} {size_names[i]}"
-        else:
-            return f"{size:.2f} {size_names[i]}"
-
-    @staticmethod
-    def is_valid_video_file(filename):
-        """
-        Checks if a file meets all the criteria:
-        1. Does not start with 'TEMP.' or 'ORIG.'.
-        2. Has a common video file extension (case-insensitive).
-        """
-
-        # 1. Check for prefixes to skip
-        if filename.startswith(Converter.SKIP_PREFIXES):
-            # print(f"Skipping '{filename}': Starts with a forbidden prefix.")
-            return False
-
-        # Get the file extension and convert to lowercase for case-insensitive check
-        # os.path.splitext returns a tuple: (root, ext)
-        _, ext = os.path.splitext(filename)
-
-        # 2. Check if the extension is a recognized video format
-        if ext.lower() not in Converter.VIDEO_EXTENSIONS:
-            # print(f"Skipping '{filename}': Not a recognized video file extension ('{ext.lower()}').")
-            return False
-
-        # The file meets all criteria
-        return True
-
-    def standard_name(self, pathname: str, height: int) -> str:
-        """
-        If "parsed" create a simple standard name from the titile
-        and episode number (if episode) OR title and year (if movie).
-        Otherwise ...
-        Replaces common H.264/AVC/Xvid/DivX codec strings in a filename
-        with 'x265' or 'X265', preserving the original case where possible.
-        Also change the height indicator if not in agreement with actual.
         Returns: Whether changed and filename string with x265 codec.
         """
-
-        basename = os.path.basename(pathname)
-        parsed = VideoParser(pathname)
-        if parsed.is_movie_year() or parsed.is_tv_episode():
-            if parsed.is_tv_episode():
-                name = parsed.title
-                if parsed.year:
-                    name += f' {parsed.year}'
-                name += f' s{parsed.season:02d}e{parsed.episode:02d}'
-                name += f'-{parsed.episode_hi:02d}' if parsed.episode_hi else ''
-            else:
-                name = f'{parsed.title} {parsed.year}'
-
-            name +=  f' {height}p x265-cmf{self.opts.quality} recode'
-            name = re.sub(r'[\s\.\-]+', '.', name) + '.mkv'
-
-            return bool(name != basename), name
-
-        new_basename = basename
-        # Regular expressions for the codecs to be replaced.
-        # The groups will capture the exact string for case-checking later.
-        pattern = r'\b([xh]\.?264|avc|xvid|divx)\b'
-        regex = re.compile(pattern, re.IGNORECASE)
-        end = 0
-        while True:
-            match = re.search(regex, new_basename[end:])
-            if not match:
-                break
-            sub = 'X265' if match.group(1).isupper() else 'x265'
-            start, end = match.span(1)
-            new_basename = new_basename[:start] + sub + new_basename[end:]
-
-        pattern = r'\b(\d+[pi]|UHD|4K|2160p|1440p|2K|8K)\b'
-        regex = re.compile(pattern, re.IGNORECASE)
-        height_str = f'{height}p' # e.g., '1080p'
-
-        end = 0
-        while True:
-            match = re.search(regex, new_basename[end:])
-            if not match:
-                break
-            matched_group = match.group(1) # The matched string (e.g., '4K' or '720i')
-            start, end = match.span(1)
-
-            if matched_group.lower().endswith(('k', 'hd')):
-                # For '4K', 'UHD', etc. you can't rely on 'height_str' being correct,
-                # so you must manually format the replacement based on the original's case.
-                is_upper = matched_group.isupper() # Check if '4K' was '4K' or '4k'
-                # The canonical replacement should be f'{height}p'
-                sub = height_str.upper() if is_upper else height_str
-            else:
-                # Standard p/i resolution match (e.g., '720p', '1080i')
-                sub = height_str.upper() if matched_group.isupper() else height_str
-
-            new_basename = new_basename[:start] + sub + new_basename[end:]
-
-
-        # nail down extension
-        different = bool(new_basename != basename)
-        base, _ = os.path.splitext(new_basename)
-        new_basename = base + '.mkv'
-
-
-        return different, new_basename
+        return ConvertUtils.standard_name(pathname, height, self.opts.quality)
 
     def bulk_rename(self, old_file_name: str, new_file_name: str,
                     trashes: set):
         """
         Renames files and directories in the current working directory (CWD).
 
-        It finds all items whose non-extension part matches the non-extension part
-        of `old_file_name`, and renames them using the non-extension part of
-        `new_file_name`, preserving the original file extensions.
-
-        Args:
-            old_file_name: A sample filename (e.g., 'oldie.mp4') used to define
-                           the base name to look for ('oldie').
-            new_file_name: A sample filename (e.g., 'newbie.mkv') used to define
-                           the base name to rename to ('newbie').
+        Delegates to FileOps.bulk_rename() for the actual operation.
         """
-        ops = []
-        dry_run = self.opts.dry_run
-        would = 'WOULD ' if dry_run else ''
-
-        old_base_name, _ = os.path.splitext(old_file_name)
-        new_base_name, _ = os.path.splitext(new_file_name)
-
-        # Define the special suffix to look for (case-insensitive search)
-        special_ext = ".REFERENCE.srt"
-        # 2. Use os.walk for recursive traversal starting from the current directory ('.')
-        for root, dirs, files in os.walk('.', topdown=False):
-
-            # Combine files and directories for unified processing.
-            items_to_check = files + dirs
-
-            for item_name in items_to_check:
-                # Skip if the item is a special directory reference
-                if item_name in ('.', '..'):
-                    continue
-
-                full_old_path = os.path.join(root, item_name)
-                current_base, extension = os.path.splitext(item_name)
-                current_base2, extension2 = os.path.splitext(current_base)
-                extension2 = extension2 + extension
-
-                new_item_name = None
-
-                # --- Rule 1: Special Case - Full Name Match (item_name == old_base_name) ---
-                if item_name == old_base_name:
-                    new_item_name = new_base_name
-
-                # --- Rule 2: Special Case - Reference SRT Suffix Match ---
-                # Requires the item to end with ".reference.srt" AND the base part to match old_base_name
-                elif (item_name.lower().endswith(special_ext.lower())
-                      and item_name[:-len(special_ext)] == old_base_name):
-                    new_item_name = new_base_name + special_ext
-
-                elif current_base2 == old_base_name:
-                    new_item_name = new_base_name + extension2
-
-                # --- Rule 3: General Case - Base Name Match ---
-                # Applies if the non-extension part matches the intended old base name,
-                # and was not caught by the specific rules above.
-                elif current_base == old_base_name:
-                    # General Case: New name is new_base_name + original extension
-                    new_item_name = new_base_name + extension
-
-                # 4. If no matching rule was triggered, skip this one
-                if not new_item_name:
-                    continue
-
-                # 5. Perform the rename operation
-                full_new_path = os.path.join(root, new_item_name)
-                try:
-                    if os.path.basename(item_name) not in trashes:
-                        if not dry_run:
-                            os.rename(full_old_path, full_new_path)
-                        ops.append(f"{would}rename {full_old_path!r} {full_new_path!r}")
-                except Exception as e:
-                    # Handle potential errors (e.g., permission errors, file in use)
-                    ops.append(f"ERR: rename '{full_old_path}' '{full_new_path}': {e}")
-        return ops
+        return FileOps.bulk_rename(old_file_name, new_file_name, trashes, self.opts.dry_run)
 
     def process_one_ppp(self, ppp):
         """ Handle just one """
@@ -1017,22 +654,9 @@ class Converter:
             basename = os.path.basename(vid.filepath)
 
             # Preserve timestamps from original file
-            orig_stat = None
+            timestamps = None
             if not dry_run:
-                try:
-                    orig_stat = os.stat(basename)
-                    # Get atime and mtime
-                    atime = orig_stat.st_atime
-                    mtime = orig_stat.st_mtime
-
-                    # If timestamps are in the future, set them to 1 year ago
-                    now = time.time()
-                    one_year_ago = now - (365 * 24 * 60 * 60)
-                    if atime > now or mtime > now:
-                        atime = one_year_ago
-                        mtime = one_year_ago
-                except OSError:
-                    orig_stat = None  # Failed to get timestamps
+                timestamps = FileOps.preserve_timestamps(basename)
 
             try:
                 # Rename original to backup
@@ -1059,11 +683,7 @@ class Converter:
 
                 if not dry_run:
                     # Apply preserved timestamps to the new file
-                    if orig_stat is not None:
-                        try:
-                            os.utime(vid.standard_name, (atime, mtime))
-                        except OSError:
-                            pass  # Ignore timestamp setting errors
+                    FileOps.apply_timestamps(vid.standard_name, timestamps)
 
                     # probe = self.get_video_metadata(vid.standard_name)
                     vid.basename1 = vid.standard_name
@@ -1083,91 +703,7 @@ class Converter:
                 print(f"FFmpeg failed. Deleted incomplete {job.temp_file}.")
             self.probe_cache.set_anomaly(vid.filepath, 'Err')
 
-    @staticmethod
-    def get_candidate_video_files(file_args):
-        """
-        Gather candidate video file paths from command-line arguments.
-
-        Args:
-            file_args: List of file/directory paths or "-" for stdin
-
-        Returns:
-            tuple: (paths_to_probe, read_pipe)
-                - paths_to_probe: List of absolute file paths to probe
-                - read_pipe: True if stdin was read (caller needs to restore TTY)
-        """
-        read_pipe = False
-        enqueued_paths = set()
-        paths_from_args = []
-
-        # 1. Gather all unique, absolute paths from arguments and stdin
-        for file_arg in file_args:
-            if file_arg == "-":
-                # Handle STDIN
-                if not read_pipe:
-                    paths_from_args.extend(sys.stdin.read().splitlines())
-                    read_pipe = True
-            else:
-                # Convert to absolute path immediately
-                abs_path = os.path.abspath(file_arg)
-                if abs_path not in enqueued_paths:
-                    paths_from_args.append(abs_path)
-                    enqueued_paths.add(abs_path)
-
-        # 2. Separate into directories and individual files, and sort for processing order
-        directories = []
-        immediate_files = []
-
-        for path in paths_from_args:
-            # Ignore empty lines from stdin
-            if not path:
-                continue
-
-            if os.path.isdir(path):
-                directories.append(path)
-            else:
-                immediate_files.append(path)
-
-        # Sort the list of directories to be processed (case-insensitively)
-        directories.sort(key=str.lower)
-
-        # Sort the list of individual files (case-insensitively)
-        immediate_files.sort(key=str.lower)
-
-        # List to hold all file paths in the final desired, grouped, and sorted order
-        paths_to_probe = []
-
-        # 3. Process Directories: Find and group files recursively
-        for dir_path in directories:
-            # This list will hold all valid video files found in the current directory group
-            group_files = []
-
-            # Recursively walk the directory structure
-            for root, dirs, files in os.walk(dir_path):
-
-                # Sort the directory names before os.walk processes them (case-insensitive)
-                # This ensures predictable traversal order of subdirectories
-                dirs.sort(key=str.lower)
-
-                # Sort the files within the current directory (case-insensitive)
-                files.sort(key=str.lower)
-
-                for file_name in files:
-                    full_path = os.path.join(root, file_name)
-
-                    # Check for validity and duplicates
-                    if Converter.is_valid_video_file(full_path):
-                        if full_path not in enqueued_paths:
-                            group_files.append(full_path)
-                            enqueued_paths.add(full_path)
-
-            # Append all grouped and sorted file paths for the current directory
-            paths_to_probe.extend(group_files)
-
-        # 4. Process Individual Files: Append sorted immediate files
-        paths_to_probe.extend(immediate_files)
-
-        return paths_to_probe, read_pipe
+    get_candidate_video_files = staticmethod(ConvertUtils.get_candidate_video_files)
 
     def create_video_file_list(self):
         """ TBD """
