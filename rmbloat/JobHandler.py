@@ -3,7 +3,7 @@
 Job handling for video conversion - manages transcoding jobs and progress monitoring
 """
 # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-# pylint: disable=import-outside-toplevel,broad-exception-caught,invalid-name
+# pylint: disable=broad-exception-caught,invalid-name
 # pylint: disable=too-many-instance-attributes,no-else-return
 import os
 import re
@@ -135,7 +135,7 @@ class JobHandler:
         if self.opts.sample:
             duration_secs = self.sample_seconds
 
-        job = Job(vid, orig_backup_file, temp_file, duration_secs)
+        job = Job(vid, orig_backup_file, temp_file, duration_secs, dry_run=self.opts.dry_run)
         job.input_file = basename
 
         # Create namespace with defaults
@@ -361,7 +361,12 @@ class JobHandler:
                 return got
 
     def finish_transcode_job(self, success, job, is_allowed_codec_func):
-        """ Complete a transcoding job and handle file operations """
+        """
+        Complete a transcoding job and handle file operations.
+
+        Returns:
+            probe: The probe of the transcoded file (or None if failed/dry_run)
+        """
         # 4. Atomic Swap (Safe Replacement)
         dry_run = self.opts.dry_run
         vid = job.vid
@@ -429,32 +434,30 @@ class JobHandler:
                     f"{would}rename {job.temp_file!r} {vid.standard_name!r}")
 
                 if vid.do_rename:
-                    # Import here to avoid circular dependency
-                    from .rmbloat import Converter
-                    vid.ops += Converter.singleton.bulk_rename(basename, vid.standard_name, trashes)
+                    # Call FileOps.bulk_rename directly
+                    vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes, dry_run)
 
                 if not dry_run:
                     # Apply preserved timestamps to the new file
                     FileOps.apply_timestamps(vid.standard_name, timestamps)
 
-                    # probe = self.get_video_metadata(vid.standard_name)
+                    # Set basename1 for the successfully converted file
                     vid.basename1 = vid.standard_name
-                    # Import here to avoid circular dependency
-                    from .rmbloat import Converter
-                    vid.probe1 = Converter.singleton.apply_probe(vid, probe)
+                    # probe will be returned to Converter for apply_probe
 
             except OSError as e:
                 print(f"ERROR during swap of {vid.filepath}: {e}")
                 print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
         elif success and self.opts.sample:
-            # probe = self.get_video_metadata(job.temp_file)
+            # Set basename1 for the sample file
             vid.basename1 = job.temp_file
-            # Import here to avoid circular dependency
-            from .rmbloat import Converter
-            vid.probe1 = Converter.singleton.apply_probe(vid, probe)
+            # probe will be returned to Converter for apply_probe
         elif not success:
             # Transcoding failed, delete the temporary file
             if os.path.exists(job.temp_file):
                 os.remove(job.temp_file)
                 print(f"FFmpeg failed. Deleted incomplete {job.temp_file}.")
             self.probe_cache.set_anomaly(vid.filepath, 'Err')
+
+        # Return probe for Converter to apply
+        return probe

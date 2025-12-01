@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import timedelta
 from .ProbeCache import Probe
+from .FfmpegMon import FfmpegMon
 # pylint: disable=import-outside-toplevel,too-many-instance-attributes
 
 # Dataclass configuration for Python 3.10+ slots support
@@ -66,24 +67,19 @@ class Vid:
 
 class Job:
     """ Represents a video conversion job """
-    def __init__(self, vid, orig_backup_file, temp_file, duration_secs):
+    def __init__(self, vid, orig_backup_file, temp_file, duration_secs, dry_run=False):
         """
         Args:
             vid: Vid object
             orig_backup_file: Path to backup of original file
             temp_file: Path to temporary output file
             duration_secs: Video duration in seconds
+            dry_run: Whether this is a dry run (no actual conversion)
         """
         self.vid = vid
         self.start_mono = time.monotonic()
 
-        # Import here to avoid circular dependency
-        # Access Converter.singleton for dry_run status
-        from .rmbloat import Converter
-        from .FfmpegMon import FfmpegMon
-        converter = Converter.singleton
-
-        self.progress = 'DRY-RUN' if (converter and converter.opts.dry_run) else 'Started'
+        self.progress = 'DRY-RUN' if dry_run else 'Started'
         self.input_file = os.path.basename(vid.filepath)
         self.orig_backup_file = orig_backup_file
         self.temp_file = temp_file

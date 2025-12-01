@@ -221,8 +221,11 @@ class Converter:
         return self.job_handler.get_job_progress(job)
 
     def finish_transcode_job(self, success, job):
-        """Delegate to JobHandler"""
-        return self.job_handler.finish_transcode_job(success, job, self.is_allowed_codec)
+        """Delegate to JobHandler and apply probe if returned"""
+        probe = self.job_handler.finish_transcode_job(success, job, self.is_allowed_codec)
+        # Apply probe if one was returned
+        if probe:
+            job.vid.probe1 = self.apply_probe(job.vid, probe)
 
     # Utility methods delegated to ConvertUtils
     human_readable_size = staticmethod(ConvertUtils.human_readable_size)
