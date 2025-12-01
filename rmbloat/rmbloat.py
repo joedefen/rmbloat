@@ -37,7 +37,6 @@ TODO:
 
 import sys
 import os
-import math
 import argparse
 import subprocess
 import traceback
@@ -50,19 +49,20 @@ import json
 import random
 import curses
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict
 from typing import Optional, Union
 # from copy import copy
 from types import SimpleNamespace
 from datetime import timedelta
 import send2trash
 from console_window import ConsoleWindow, OptionSpinner
-from .ProbeCache import ProbeCache, Probe
+from .ProbeCache import ProbeCache
 from .VideoParser import VideoParser, Mangler
 from .IniManager import IniManager
 from .RotatingLogger import RotatingLogger
 from .CpuStatus import CpuStatus
 from .FfmpegChooser import FfmpegChooser
+from .Models import PathProbePair, Vid, Job
 # from .SetupCgroup import set_cgroup_cpu_limit
 
 lg = RotatingLogger('rmbloat')
@@ -135,59 +135,7 @@ def store_cache_on_exit():
         if Converter.singleton.probe_cache:
             Converter.singleton.probe_cache.store()
 
-_dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
-
-@dataclass(**_dataclass_kwargs)
-class PathProbePair:
-    """ TBD """
-    video_file: str
-    probe: Probe
-    do_rename: bool = field(default=False, init=False)
-    standard_name: str = field(default='', init=False)
-
-@dataclass(**_dataclass_kwargs)
-class Vid:
-    """ Our main object for the list of video entries """
-    # Init parameters
-    # ppp: PathProbePair
-
-    # Fields set from init parameters (via __post_init__)
-    video_file: str = field(init=False)
-    filepath: str = field(init=False)
-    filebase: str = field(init=False)
-    standard_name: str = field(init=False)
-    do_rename: bool = field(init=False)
-
-    # Fields with default values
-    doit: str = field(default='', init=False)
-    doit_auto: str = field(default='', init=False)
-    net: str = field(default=' ---', init=False)
-    width: Optional[int] = field(default=None, init=False)
-    height: Optional[int] = field(default=None, init=False)
-    command: Optional[str] = field(default=None, init=False)
-    res_ok: Optional[bool] = field(default=None, init=False)
-    duration: Optional[float] = field(default=None, init=False)
-    codec: Optional[str] = field(default=None, init=False)
-    bitrate: Optional[float] = field(default=None, init=False)
-    bloat: Optional[float] = field(default=None, init=False)
-    bloat_ok: Optional[bool] = field(default=None, init=False)
-    codec_ok: Optional[bool] = field(default=None, init=False)
-    gb: Optional[float] = field(default=None, init=False)
-    all_ok: Optional[bool] = field(default=None, init=False)
-    probe0: Optional[Probe] = field(default=None, init=False)
-    probe1: Optional[Probe] = field(default=None, init=False)
-    basename1: Optional[str] = field(default=None, init=False)
-    return_code: Optional[int] = field(default=None, init=False)
-    texts: list = field(default_factory=list, init=False)
-    ops: list = field(default_factory=list, init=False)
-
-    def post_init(self, ppp):
-        """ Custom initialization logic after dataclass __init__ """
-        self.video_file = ppp.video_file
-        self.filepath = ppp.video_file
-        self.filebase = os.path.basename(ppp.video_file)
-        self.standard_name = ppp.standard_name
-        self.do_rename = ppp.do_rename
+# Data models moved to Models.py
 
 ###
 ### import subprocess
@@ -443,37 +391,7 @@ class FfmpegMon:
         """Ensure the subprocess is terminated when the object is destroyed."""
         self.stop()
 
-class Job: # class FfmpegJob:
-    """ TBD """
-    def __init__(self, vid, orig_backup_file, temp_file, duration_secs):
-        converter = Converter.singleton
-        self.vid = vid
-        self.start_mono = time.monotonic()
-        self.progress='DRY-RUN' if converter.opts.dry_run else 'Started'
-        self.input_file = os.path.basename(vid.filepath)
-        self.orig_backup_file=orig_backup_file
-        self.temp_file=temp_file
-        self.duration_secs=duration_secs
-        self.total_duration_formatted=self.trim0(
-                        str(timedelta(seconds=int(duration_secs))))
-        self.ffsubproc=FfmpegMon()
-        self.return_code = None
-
-    @staticmethod
-    def trim0(string):
-        """ TBD """
-        if string.startswith('0:'):
-            return string[2:]
-        return string
-
-    @staticmethod
-    def duration_spec(secs):
-        """ TBD """
-        secs = int(round(secs))
-        hours = math.floor(secs / 3600)
-        minutes = math.floor((secs % 3600) / 60)
-        secs = secs % 60
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+# Job class moved to Models.py
 
 class Converter:
     """ TBD """
