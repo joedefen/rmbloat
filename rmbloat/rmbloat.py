@@ -43,13 +43,9 @@ import atexit
 import re
 import time
 import json
-import random
 import curses
-from pathlib import Path
 from dataclasses import asdict
 from types import SimpleNamespace
-from datetime import timedelta
-import send2trash
 from console_window import ConsoleWindow, OptionSpinner
 from .ProbeCache import ProbeCache
 from .VideoParser import Mangler
@@ -57,9 +53,10 @@ from .IniManager import IniManager
 from .RotatingLogger import RotatingLogger
 from .CpuStatus import CpuStatus
 from .FfmpegChooser import FfmpegChooser
-from .Models import PathProbePair, Vid, Job
+from .Models import PathProbePair, Vid
 from . import FileOps
 from . import ConvertUtils
+from .JobHandler import JobHandler
 
 lg = RotatingLogger('rmbloat')
 
@@ -86,29 +83,9 @@ class Converter:
     TARGET_CODECS = ['h265', 'hevc']
     MAX_BITRATE_KBPS = 2100 # about 15MB/min (or 600MB for 40m)
 
-#       # Regex to find FFmpeg progress lines (from stderr)
-#       # Looks for 'frame=  XXXXX' and 'time=00:00:00.00' and 'speed=XX.XXx'
-#       "frame= 2091 fps= 26 q=35.9 size=   11264KiB time=00:01:27.12 bitrate=1059.1kbits/s speed= 1.1x    \r",
-    PROGRESS_RE = re.compile(
-        # 1. Mandatory Frame Number (Group 1)
-        # The \s* at the beginning accounts for possible leading whitespace
-        r"\s*frame[=\s]+(\d+)\s+"
-
-        # 2. Time Section (Optional, Strict Numerical Capture)
-        # Looks for 'time=', then attempts to capture the precise HH:MM:SS.cs format (G2-G5).
-        r"(?:.*?time[=\s]+(\d{2}):(\d{2}):(\d{2})\.(\d{2}))?"
-
-        # 3. Speed Section (Optional, Strict Numerical Capture)
-        # Looks for 'speed=', then captures the float (G6).
-        r"(?:.*?speed[=\s]+(\d+\.\d+)x)?",
-
-        re.IGNORECASE
-    )
-
     # Constants moved to ConvertUtils.py
     VIDEO_EXTENSIONS = ConvertUtils.VIDEO_EXTENSIONS
     SKIP_PREFIXES = ConvertUtils.SKIP_PREFIXES
-    sample_seconds = 30
     singleton = None
 
     def __init__(self, opts, cache_dir='/tmp'):
@@ -134,19 +111,17 @@ class Converter:
         self.probe_cache = ProbeCache(cache_dir_name=cache_dir, chooser=self.chooser)
         self.probe_cache.load()
         self.probe_cache.store()
-        self.progress_line_mono = 0
         self.start_job_mono = 0
         self.cpu = CpuStatus()
         # self.cgroup_prefix = set_cgroup_cpu_limit(opts.thread_cnt*100)
         atexit.register(store_cache_on_exit)
 
-        # Auto mode tracking
+        # Auto mode tracking (separate from JobHandler for overall session tracking)
         self.auto_mode_enabled = bool(opts.auto_hr is not None)
-        self.auto_mode_start_time = time.monotonic() if self.auto_mode_enabled else None
         self.auto_mode_hrs_limit = opts.auto_hr if self.auto_mode_enabled else None
-        self.consecutive_failures = 0
-        self.ok_count = 0
-        self.error_count = 0
+
+        # Job handler (created when entering convert screen, destroyed when leaving)
+        self.job_handler = None
 
         # Build options suffix for display
         self.options_suffix = self.build_options_suffix()
@@ -232,344 +207,27 @@ class Converter:
     # Utility functions moved to ConvertUtils.py
     bash_quote = staticmethod(ConvertUtils.bash_quote)
 
-
-    def generate_taskset_core_list(self, desired_cores: int = 3) -> str:
-        """
-        Generates a comma-separated list of core indices for taskset, prioritizing
-        physically separate cores when utilization is low (<= 50% of capacity).
-        Args:
-            total_logical_cores (int): Total logical cores (e.g., 16 for 8 cores with HT).
-            desired_cores (int): The number of cores to select (e.g., 3).
-        Returns:
-            str: A comma-separated string of unique core indices (e.g., "0,4,8").
-        """
-        total_logical_cores = self.cpu.core_count
-        desired_cores = max(1, min(total_logical_cores, desired_cores))
-        selected_cores = set()
-        mask = 0
-
-        # 1. Determine the step size based on utilization
-        # Half the total logical cores (e.g., 16 / 2 = 8). This is the number of physical cores.
-        step = 2 if desired_cores <= total_logical_cores // 2  else 1
-
-        # 2. Choose a random starting core
-        current_core = random.randrange(desired_cores)
-
-        # 3. Select the cores
-        for _ in range(desired_cores):
-            # Add the core, then use the step and modulo operation to find the next one
-            selected_cores.add(current_core)
-            mask += 1<<current_core
-            current_core = (current_core + step) % total_logical_cores
-
-        # 4. Format and return
-        # Sort for cleaner display, then convert to string
-        return f'{mask:#x}'
-        # return '--cpu-set " + ",".join(map(str, sorted(list(selected_cores))))
-
-    def make_color_opts(self, color_spt):
-        """ TBD """
-        spt_parts = color_spt.split(',')
-
-        # 1. Reconstruct the three full, original values (can contain 'unknown')
-        space_orig = spt_parts[0]
-        primaries_orig = spt_parts[1] if spt_parts[1] != "~" else space_orig
-        trc_orig = spt_parts[2] if spt_parts[2] != "~" else primaries_orig
-
-        # 2. Define the final, valid FFmpeg values using fallback logic
-
-        # Use BT.709 as the default standard for all three components
-        DEFAULT_SPACE = 'bt709'
-        DEFAULT_PRIMARIES = 'bt709'
-        DEFAULT_TRC = '709' # Note: TRC often uses '709' instead of 'bt709' string
-
-        # Check and replace 'unknown' or invalid values with the safe default
-
-        # Color Space:
-        if space_orig == 'unknown':
-            space = DEFAULT_SPACE
-        else:
-            space = space_orig
-
-        # Color Primaries:
-        if primaries_orig == 'unknown':
-            primaries = DEFAULT_PRIMARIES
-        else:
-            primaries = primaries_orig
-
-        # Color TRC:
-        if trc_orig == 'unknown':
-            trc = DEFAULT_TRC
-        # FFmpeg also sometimes prefers the numerical '709' over 'bt709' for TRC
-        elif trc_orig == 'bt709':
-            trc = DEFAULT_TRC
-        else:
-            trc = trc_orig
-
-        # --- Use these final 'space', 'primaries', and 'trc' variables in the FFmpeg command ---
-
-        color_opts = [
-            '-colorspace', space,
-            '-color_primaries', primaries,
-            '-color_trc', trc
-        ]
-        return color_opts
-
+    # Job handling methods delegated to JobHandler
     def start_transcode_job(self, vid):
-        """Start a transcoding job using FfmpegChooser."""
-        os.chdir(os.path.dirname(vid.filepath))
-        basename = os.path.basename(vid.filepath)
-        probe = vid.probe0
-
-        merged_external_subtitle = None
-        if self.opts.merge_subtitles:  # Assuming you'll add this flag to opts
-            subtitle_path = Path(vid.filepath).with_suffix('.en.srt')
-            if subtitle_path.exists():
-                merged_external_subtitle = str(subtitle_path)
-                vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
-
-        # Determine output file paths
-        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        temp_file = f"{prefix}.{vid.standard_name}"
-        orig_backup_file = f"ORIG.{basename}"
-
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-
-        # Calculate duration
-        duration_secs = probe.duration
-        if self.opts.sample:
-            duration_secs = self.sample_seconds
-
-        job = Job(vid, orig_backup_file, temp_file, duration_secs)
-        job.input_file = basename
-
-        # Create namespace with defaults
-        params = self.chooser.make_namespace(
-            input_file=job.input_file,
-            output_file=job.temp_file
-        )
-
-        # Set quality
-        params.crf = self.opts.quality
-
-        # Set priority
-        params.use_nice_ionice = not self.opts.full_speed
-
-        # Set thread count
-        params.thread_count = self.opts.thread_cnt
-
-        # Sampling options
-        if self.opts.sample:
-            params.sample_mode = True
-            start_secs = max(120, job.duration_secs) * 0.20
-            params.pre_input_opts = ['-ss', job.duration_spec(start_secs)]
-            params.post_input_opts = ['-t', str(self.sample_seconds)]
-
-        # Scaling options
-        MAX_HEIGHT = 1080
-        if probe.height > MAX_HEIGHT:
-            width = MAX_HEIGHT * probe.width // probe.height
-            params.scale_opts = ['-vf', f'scale={width}:-2']
-
-        # Color options
-        params.color_opts = self.make_color_opts(vid.probe0.color_spt)
-
-        # Stream mapping options
-        map_copy = '-map 0:v:0 -map 0:a? -c:a copy -map'
-
-        # Check for external subtitle file
-        if merged_external_subtitle:
-            # Don't copy internal subtitles, we're replacing with external
-            map_copy += ' -0:s -map -0:t -map -0:d'
-        else:
-            # Copy internal subtitles, but drop unsafe ones (bitmap codecs like dvd_subtitle)
-            # Check if probe has custom instructions to drop specific subtitle streams
-            if probe.customs and 'drop_subs' in probe.customs:
-                # Map all subtitles first, then explicitly exclude the unsafe ones
-                map_copy += ' 0:s?'
-                for sub_idx in probe.customs['drop_subs']:
-                    map_copy += f' -map -0:s:{sub_idx}'
-                map_copy += ' -map -0:t -map -0:d'
-            else:
-                # No custom subtitle filtering needed
-                map_copy += ' 0:s? -map -0:t -map -0:d'
-
-        params.map_opts = map_copy.split()
-        params.external_subtitle = merged_external_subtitle
-
-        # Set subtitle codec to srt for MKV compatibility (transcodes mov_text, ass, etc.)
-        # When external subtitle is used, FfmpegChooser handles the codec internally
-        params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
-
-        # Generate the command
-        ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
-
-        # Store command for logging
-        vid.command = self.bash_quote(ffmpeg_cmd)
-
-        # Start the job
-        if not self.opts.dry_run:
-            job.ffsubproc.start(ffmpeg_cmd, temp_file=job.temp_file)
-            self.progress_line_mono = time.monotonic()
-        return job
+        """Delegate to JobHandler"""
+        return self.job_handler.start_transcode_job(vid, self.bash_quote)
 
     def monitor_transcode_progress(self, job):
-        """
-        Runs the FFmpeg transcode command and monitors its output for a non-scrolling display.
-        """
-        if not self.opts.dry_run:
-            # --- Progress Monitoring Loop ---
-            # Read stderr line-by-line until the process finishes
-            while True:
-                time.sleep(0.1)
-
-                got = self.get_job_progress(job)
-
-                    # 4. Print and reset timer
-                if isinstance(got, str):
-                    print('\r' + got, end='', flush=True)
-                elif isinstance(got, int):
-                    return_code = got
-                    break
-
-            # Clear the progress line and print final status
-            print('\r' + ' ' * 120, end='', flush=True) # Overwrite last line with spaces
-
-        if self.opts.dry_run or return_code == 0:
-            print(f"\r{job.input_file}: Transcoding FINISHED"
-                  f" (Elapsed: {timedelta(seconds=int(time.monotonic() - job.start_mono))})")
-            return True # Success
-        else:
-            # Print a final error message
-            print(f"\r{job.input_file}: Transcoding FAILED (Return Code: {job.return_code})")
-            # In a real script, you'd save or display the full error output from stderr here.
-            return False
+        """Delegate to JobHandler"""
+        return self.job_handler.monitor_transcode_progress(job)
 
     def get_job_progress(self, job):
-        """ TBD """
-        def rough_progress(frame_number):
-            nonlocal job, vid
-            total_frames = int(round(vid.probe0.fps * vid.probe0.duration))
-            frame_number = int(frame_number)
+        """Delegate to JobHandler"""
+        return self.job_handler.get_job_progress(job)
 
-            elapsed_time_sec = int(time.monotonic() - job.start_mono)
+    def finish_transcode_job(self, success, job):
+        """Delegate to JobHandler"""
+        return self.job_handler.finish_transcode_job(success, job, self.is_allowed_codec)
 
-            if elapsed_time_sec < 5 or total_frames == 0:
-                # Too early for a reliable estimate or total frames unknown
-                return f"Frame {frame_number}: MAKING PROGRESS..."
-
-            # 1. Calculate Estimated Total Time (based on elapsed time and frames done)
-            # T_est = (Elapsed Time / Frames Done) * Total Frames
-            # Avoid division by zero:
-            if frame_number == 0:
-                return f"Frame {frame_number}: MAKING PROGRESS..."
-            estimated_total_time = (elapsed_time_sec / frame_number) * total_frames
-            # 2. Calculate Remaining Time
-            remaining_seconds = estimated_total_time - elapsed_time_sec
-            # 3. Calculate Current FPS (Virtual Speed)
-            current_fps, speed = frame_number / elapsed_time_sec, 'UNKx'
-            if vid.probe0.fps > 0:
-                speed = f'{round(current_fps / vid.probe0.fps, 1)}x'
-
-            # --- Format the output line using the estimated values ---
-            percent_complete = (frame_number / total_frames) * 100
-            remaining_time_formatted = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
-            elapsed_time_formatted = job.trim0(str(timedelta(seconds=elapsed_time_sec)))
-            if job.duration_secs > 0:
-                at_seconds = (frame_number / total_frames) * job.duration_secs
-                at_seconds_formatted = job.trim0( str(timedelta(seconds=int(at_seconds))))
-                at_formatted = f'At ~{at_seconds_formatted}/{job.total_duration_formatted}'
-            else:
-                at_formatted = f"Frame {frame_number}/{total_frames}"
-
-            # Use the estimated FPS for the speed report
-            progress_line = (
-                f"{percent_complete:.1f}% | "
-                f"{elapsed_time_formatted} | "
-                f"-{remaining_time_formatted} | "
-                f"~{speed} | " # Report FPS clearly as Estimated
-                + at_formatted
-            )
-            return progress_line
-
-
-        vid = job.vid
-        secs_max = self.opts.progress_secs_max
-        while True:
-            got = job.ffsubproc.poll()
-            now_mono = time.monotonic()
-            # print(f'\r{delta=} {got=}')
-            if now_mono - self.progress_line_mono > secs_max:
-                got = 254
-                vid.texts.append('PROGRESS TIMEOUT')
-                job.ffsubproc.stop(return_code=got)
-                self.progress_line_mono = time.monotonic() + 1000000000
-                continue
-
-            if isinstance(got, str):
-                line = got
-                match = self.PROGRESS_RE.search(line)
-                if not match:
-                    vid.texts.append(line)
-                    continue
-
-                if now_mono - self.progress_line_mono < 3:
-                    continue # don't update progress crazy often
-                self.progress_line_mono = time.monotonic()
-
-                # 1. Extract values from the regex match
-                groups = match.groups()
-                try:
-
-                    # The first two parts (H and M) are integers. The third part (S.ms) is the float.
-                    h = int(groups[1])
-                    m = int(groups[2])
-                    s = int(groups[3])
-                    ms = int(groups[4])
-                    time_encoded_seconds = h * 3600 + m * 60 + s + ms / 100
-                    time_encoded_seconds = round(int(time_encoded_seconds))
-                    speed = float(match.group(6))
-                except Exception:
-                    # return f"Frame {groups[0]}:  MAKING PROGRESS..."
-                    return rough_progress(groups[0])
-
-                elapsed_time_sec = int(time.monotonic() - job.start_mono)
-
-                    # 2. Calculate remaining time
-                if job.duration_secs > 0:
-                    percent_complete = (time_encoded_seconds / job.duration_secs) * 100
-                    if percent_complete > 0 and speed > 0:
-                        # Time Remaining calculation (rough estimate)
-                        # Remaining Time = (Total Time - Encoded Time) / Speed
-                        remaining_seconds = (job.duration_secs - time_encoded_seconds) / speed
-                        remaining_time_formatted = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
-                    else:
-                        remaining_time_formatted = "N/A"
-                else:
-                    percent_complete = 0.0
-                    remaining_time_formatted = "N/A"
-
-                # 3. Format the output line
-                # \r at the start makes the console cursor go back to the beginning of the line
-                cur_time_formatted = job.trim0(str(timedelta(seconds=time_encoded_seconds)))
-                progress_line = (
-                    f"{percent_complete:.1f}% | "
-                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} | "
-                    f"-{remaining_time_formatted} | "
-                    f"{speed:.1f}x | "
-                    f"At {cur_time_formatted}/{job.total_duration_formatted}"
-                )
-                return progress_line
-            elif isinstance(got, int):
-                vid.return_code = got
-                return got
-            else:
-                return got
-
+    # Utility methods delegated to ConvertUtils
     human_readable_size = staticmethod(ConvertUtils.human_readable_size)
-
     is_valid_video_file = staticmethod(ConvertUtils.is_valid_video_file)
+    get_candidate_video_files = staticmethod(ConvertUtils.get_candidate_video_files)
 
     def standard_name(self, pathname: str, height: int) -> tuple[bool, str]:
         """
@@ -601,109 +259,6 @@ class Converter:
         ppp.standard_name = standard_name
 
         self.append_vid(ppp)
-
-    def convert_one_file(self, vid):
-        """ TBD """
-
-        # 3. Transcode with monitored progress
-        job = self.start_transcode_job(vid)
-        success = self.monitor_transcode_progress(job)
-        self.finish_transcode_job(success, job)
-
-    def finish_transcode_job(self, success, job):
-        """ TBD """
-        # 4. Atomic Swap (Safe Replacement)
-        dry_run = self.opts.dry_run
-        vid = job.vid
-        probe = None
-        # space_saved_gb = 0.0
-        if success:
-            if not dry_run:
-                probe = self.probe_cache.get(job.temp_file)
-            if not probe:
-                if dry_run:
-                    success = True
-                    vid.doit = 'ok'
-                    net = -20
-                    # space_saved_gb = vid.gb * 0.20  # Estimate for dry run
-                else:
-                    success = False
-                    vid.doit = 'ERR'
-                    net = 0
-            else:
-                net = (vid.gb - probe.gb) / vid.gb
-                net = int(round(-net*100))
-                # space_saved_gb = vid.gb - probe.gb
-            if self.is_allowed_codec(probe) and net > -self.opts.min_shrink_pct:
-                self.probe_cache.set_anomaly(vid.filepath, 'OPT')
-                success = False
-            vid.net = f'{net}%'
-
-        # Track auto mode vitals
-        if self.auto_mode_enabled:
-            if success and not self.opts.sample:
-                self.ok_count += 1
-                self.consecutive_failures = 0
-            elif not success:
-                self.error_count += 1
-                self.consecutive_failures += 1
-
-        if success and not self.opts.sample:
-            would = 'WOULD ' if dry_run else ''
-            trashes = set()
-            basename = os.path.basename(vid.filepath)
-
-            # Preserve timestamps from original file
-            timestamps = None
-            if not dry_run:
-                timestamps = FileOps.preserve_timestamps(basename)
-
-            try:
-                # Rename original to backup
-                if not dry_run and self.opts.keep_backup:
-                    os.rename(basename, job.orig_backup_file)
-                if self.opts.keep_backup:
-                    vid.ops.append(
-                        f"{would} rename {basename!r} {job.orig_backup_file!r}")
-                if not dry_run and not self.opts.keep_backup:
-                    send2trash.send2trash(basename)
-                if dry_run and not self.opts.keep_backup:
-                    trashes.add(basename)
-                if not self.opts.keep_backup:
-                    vid.ops.append(f"{would}trash {basename!r}")
-
-                # Rename temporary file to the original filename
-                if not dry_run:
-                    os.rename(job.temp_file, vid.standard_name)
-                vid.ops.append(
-                    f"{would}rename {job.temp_file!r} {vid.standard_name!r}")
-
-                if vid.do_rename:
-                    vid.ops += self.bulk_rename(basename, vid.standard_name, trashes)
-
-                if not dry_run:
-                    # Apply preserved timestamps to the new file
-                    FileOps.apply_timestamps(vid.standard_name, timestamps)
-
-                    # probe = self.get_video_metadata(vid.standard_name)
-                    vid.basename1 = vid.standard_name
-                    vid.probe1 = self.apply_probe(vid, probe)
-
-            except OSError as e:
-                print(f"ERROR during swap of {vid.filepath}: {e}")
-                print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
-        elif success and self.opts.sample:
-            # probe = self.get_video_metadata(job.temp_file)
-            vid.basename1 = job.temp_file
-            vid.probe1 = self.apply_probe(vid, probe)
-        elif not success:
-            # Transcoding failed, delete the temporary file
-            if os.path.exists(job.temp_file):
-                os.remove(job.temp_file)
-                print(f"FFmpeg failed. Deleted incomplete {job.temp_file}.")
-            self.probe_cache.set_anomaly(vid.filepath, 'Err')
-
-    get_candidate_video_files = staticmethod(ConvertUtils.get_candidate_video_files)
 
     def create_video_file_list(self):
         """ TBD """
@@ -764,7 +319,7 @@ class Converter:
 
     def print_auto_mode_vitals(self, stats):
         """Print vitals report and exit for auto mode."""
-        runtime_hrs = (time.monotonic() - self.auto_mode_start_time) / 3600
+        runtime_hrs = (time.monotonic() - self.job_handler.auto_mode_start_time) / 3600
 
         # Calculate space bloated from remaining TODO items
         space_bloated_gb = 0.0
@@ -777,10 +332,10 @@ class Converter:
         report += "AUTO MODE VITALS REPORT\n"
         report += "=" * 70 + "\n"
         report += f"Runtime:              {runtime_hrs:.2f} hours\n"
-        report += f"OK conversions:       {self.ok_count}\n"
-        report += f"Error conversions:    {self.error_count}"
+        report += f"OK conversions:       {self.job_handler.ok_count}\n"
+        report += f"Error conversions:    {self.job_handler.error_count}"
 
-        if self.consecutive_failures >= 10:
+        if self.job_handler.consecutive_failures >= 10:
             report += " (early termination: 10 consecutive failures)\n"
         else:
             report += "\n"
@@ -799,7 +354,7 @@ class Converter:
         lg.lg(report)
 
         # Exit with appropriate code
-        exit_code = 1 if self.consecutive_failures >= 10 else 0
+        exit_code = 1 if self.job_handler.consecutive_failures >= 10 else 0
         sys.exit(exit_code)
 
     def do_window_mode(self):
@@ -971,6 +526,13 @@ class Converter:
             if spins.go:
                 spins.go = False
                 if self.state == 'select':
+                    # Create JobHandler when entering convert screen
+                    self.job_handler = JobHandler(
+                        self.opts,
+                        self.chooser,
+                        self.probe_cache,
+                        auto_mode_enabled=self.auto_mode_enabled
+                    )
                     self.state = 'convert'
                         # self.win.set_pick_mode(False, 1)
 
@@ -1059,17 +621,19 @@ class Converter:
 
                         # Check exit conditions
                         time_exceeded = False
-                        if self.auto_mode_start_time and self.auto_mode_hrs_limit:
-                            runtime_hrs = (time.monotonic() - self.auto_mode_start_time) / 3600
+                        if self.job_handler.auto_mode_start_time and self.auto_mode_hrs_limit:
+                            runtime_hrs = (time.monotonic() - self.job_handler.auto_mode_start_time) / 3600
                             time_exceeded = runtime_hrs >= self.auto_mode_hrs_limit
 
                         no_more_todo = (stats.total - stats.done) == 0
-                        too_many_failures = self.consecutive_failures >= 10
+                        too_many_failures = self.job_handler.consecutive_failures >= 10
 
                         if time_exceeded or no_more_todo or too_many_failures:
                             self.print_auto_mode_vitals(stats)
                             # print_auto_mode_vitals exits, so we never reach here
 
+                    # Destroy JobHandler when leaving convert screen (resets counters)
+                    self.job_handler = None
                     self.state = 'select'
                     self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
                     win.set_pick_mode(True, 1)
@@ -1119,6 +683,13 @@ class Converter:
 
             # Auto-transition to convert state if auto mode enabled
             if self.auto_mode_enabled and self.state == 'select':
+                # Create JobHandler when entering convert screen
+                self.job_handler = JobHandler(
+                    self.opts,
+                    self.chooser,
+                    self.probe_cache,
+                    auto_mode_enabled=self.auto_mode_enabled
+                )
                 self.state = 'convert'
 
 
