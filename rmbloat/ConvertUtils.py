@@ -16,8 +16,8 @@ VIDEO_EXTENSIONS = {
     '.vob', '.ogv', '.m2ts', '.mts'
 }
 
-# Filename prefixes to skip during processing
-SKIP_PREFIXES = ('TEMP.', 'ORIG.')
+# Filename prefixes to skip during processing (treated as non-video files)
+SKIP_PREFIXES = ('TEMP.', 'ORIG.', 'SAMPLE.')
 
 
 def bash_quote(args):
@@ -195,19 +195,30 @@ def standard_name(pathname: str, height: int, quality: int) -> tuple[bool, str]:
     basename = os.path.basename(pathname)
     parsed = VideoParser(pathname)
     if parsed.is_movie_year() or parsed.is_tv_episode():
-        if parsed.is_tv_episode():
+        # Only use parsed name if title is not empty
+        if not parsed.title or not parsed.title.strip():
+            # Fall through to normal renaming if title is empty
+            pass
+        elif parsed.is_tv_episode():
             name = parsed.title
             if parsed.year:
                 name += f' {parsed.year}'
             name += f' s{parsed.season:02d}e{parsed.episode:02d}'
             name += f'-{parsed.episode_hi:02d}' if parsed.episode_hi else ''
+            name += f' {height}p x265-cmf{quality} recode'
+            name = re.sub(r'[\s\.\-]+', '.', name) + '.mkv'
+            # Ensure name doesn't start with a dot
+            if name.startswith('.'):
+                name = basename.split('.')[0] + name
+            return bool(name != basename), name
         else:
             name = f'{parsed.title} {parsed.year}'
-
-        name += f' {height}p x265-cmf{quality} recode'
-        name = re.sub(r'[\s\.\-]+', '.', name) + '.mkv'
-
-        return bool(name != basename), name
+            name += f' {height}p x265-cmf{quality} recode'
+            name = re.sub(r'[\s\.\-]+', '.', name) + '.mkv'
+            # Ensure name doesn't start with a dot
+            if name.startswith('.'):
+                name = basename.split('.')[0] + name
+            return bool(name != basename), name
 
     new_basename = basename
     # Regular expressions for the codecs to be replaced.

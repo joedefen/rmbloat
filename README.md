@@ -215,6 +215,9 @@ After scanning/probing the file and folder arguments, the selection screen will 
     * `Er1` is a "very soft" state (auto overriden); can manually select other values
   * `OPT` - denotes the prior conversion went OK except insuffient shrinkage
     * can manually select for conversion
+  * `DUN` - denotes already re-encoded (filename ends with `.recode.mkv`)
+    * "semi-soft" ban: first toggle attempt prompts for session-wide permission to re-encode
+    * prevents accidental re-encoding of your own output files
 * `^` denotes a value over the threshold for conversion. Besides an excessive bloat, the height could be too large, or the codec unacceptable; all depending on the program options.
 * To change whether selected, you can use:
   * the s/r/i keys to affect potentially every select, and

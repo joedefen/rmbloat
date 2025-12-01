@@ -97,6 +97,7 @@ class Converter:
         self.spins = None # spinner values
         self.search_re = None # the "accepted" search
         self.vids = []
+        self.todo_vids = []
         self.visible_vids = []
         self.original_cwd = os.getcwd()
         self.ff_pre_i_opts = []
@@ -122,6 +123,9 @@ class Converter:
 
         # Job handler (created when entering convert screen, destroyed when leaving)
         self.job_handler = None
+
+        # Session flag: allow re-encoding of already re-encoded files (DUN status)
+        self.allow_reencode_dun = False
 
         # Build options suffix for display
         self.options_suffix = self.build_options_suffix()
@@ -201,7 +205,14 @@ class Converter:
         if anomaly and anomaly not in ('Er1', ):
             vid.doit = anomaly
         else:
-            vid.doit = '[ ]' if vid.all_ok or self.dont_doit(vid) else '[X]'
+            # Check if file should be excluded from encoding
+            exclusion_status = self.dont_doit(vid)
+            if exclusion_status:
+                vid.doit = exclusion_status  # 'DUN', 'OK', etc.
+            elif vid.all_ok:
+                vid.doit = '[ ]'
+            else:
+                vid.doit = '[X]'
         vid.doit_auto = vid.doit # auto value of doit saved for ease of re-init
 
     # Utility functions moved to ConvertUtils.py
@@ -310,15 +321,25 @@ class Converter:
         return ppps
 
     def dont_doit(self, vid):
-        """ Returns true if prohibited from re-encoding """
+        """
+        Check if video should be excluded from re-encoding.
+
+        Returns:
+            str or None: Status string if should be excluded ('DUN', 'OK'), None otherwise
+        """
         base = os.path.basename(vid.filepath).lower()
-        if (base.startswith('sample.')
-                or base.startswith('test.')
-                or base.endswith('.recode.mkv')
-                or vid.doit in ('OK',)
-                ):
-            return True
-        return False
+
+        # Already re-encoded files get "DUN" (done) status
+        if base.endswith('.recode.mkv'):
+            return 'DUN'
+
+        # Files marked as OK from previous successful conversion
+        if vid.doit in ('OK',):
+            return 'OK'
+
+        # Note: SAMPLE. and TEST. files are now excluded at is_valid_video_file() level
+
+        return None
 
     def print_auto_mode_vitals(self, stats):
         """Print vitals report and exit for auto mode."""
@@ -369,9 +390,7 @@ class Converter:
                                     gb=0, delta_gb=0)
             jobcnt = 0
 
-            for vid in self.vids:
-                if self.state == 'convert' and vid.doit == '[ ]':
-                    continue
+            for vid in self.todo_vids if self.state == 'convert' else self.vids:
                 if doit_skips and vid.doit in doit_skips:
                     continue
                 basename = vid.basename1 if vid.basename1 else os.path.basename(vid.filepath)
@@ -498,13 +517,6 @@ class Converter:
                 else: # ignore pattern changes unless in select or if won't compile
                     spins.search = self.search_re
 
-#           if spins.set_all:
-#               spins.set_all = False
-#               if self.state == 'select':
-#                   for vid in self.visible_vids:
-#                       if not self.dont_doit(vid) and vid.doit_auto.startswith('['):
-#                           vid.doit = '[X]'
-
             if spins.reset_all:
                 spins.reset_all = False
                 if self.state == 'select':
@@ -537,6 +549,10 @@ class Converter:
                         auto_mode_enabled=self.auto_mode_enabled
                     )
                     self.state = 'convert'
+                    self.todo_vids = []
+                    for vid in self.vids:
+                        if vid.doit == '[X]':
+                            self.todo_vids.append(vid)
                         # self.win.set_pick_mode(False, 1)
 
             if spins.quit:
@@ -644,6 +660,17 @@ class Converter:
         def toggle_doit(vid):
             if vid.doit == '[X]':
                 vid.doit = vid.doit_auto if vid.doit_auto != '[X]' else '[ ]'
+            elif vid.doit == 'DUN':
+                # First time toggling DUN status - prompt user
+                if not self.allow_reencode_dun:
+                    answer = win.answer("Enable re-encoding of already re-encoded files for this session? (y/n): ")
+                    if answer and answer.lower() == 'y':
+                        self.allow_reencode_dun = True
+                        vid.doit = '[X]'
+                    # else: leave as DUN
+                else:
+                    # Already allowed in this session
+                    vid.doit = '[X]'
             elif not vid.doit.startswith('?') and not self.dont_doit(vid):
                 vid.doit = '[X]'
 

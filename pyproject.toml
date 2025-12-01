@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "rmbloat"
-version = "1.0.0"
+version = "1.0.1"
 readme = "README.md"
 description = "An intelligent FFmpeg utility for prioritizing and converting inefficient video files (BLOAT score)."
 authors = [
