@@ -389,7 +389,7 @@ class ProbeCache:
 
         return meta
 
-    def set_anomaly(self, filepath: str, anomaly: str) -> Optional[Probe]:
+    def set_anomaly(self, filepath: str, anomaly: Optional[str]) -> Optional[Probe]:
         """
         Sets the anomaly field to the given value and, if updated,
         adds to the dirty count.  The entry MUST exist in the cache.
@@ -398,7 +398,7 @@ class ProbeCache:
         # 1. Check for valid cache hit
         meta = self._get_valid_entry(filepath)
         if meta:
-            if anomaly.startswith('Er'):
+            if anomaly and anomaly.startswith('Er'):
                 if not meta.anomaly:
                     anomaly = 'Er1'
                 else:
@@ -413,8 +413,9 @@ class ProbeCache:
             if meta.anomaly != anomaly:
                 meta.anomaly = anomaly
                 self._set_cache(filepath, meta)
-                # this does not happen often ... make sure it is saved NOW
-                self.store()
+                # for cases it not happen often ... make sure it is saved NOW
+                if anomaly != '---':
+                    self.store()
         return meta
         
     def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[Probe]]:

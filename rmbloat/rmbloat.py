@@ -333,8 +333,8 @@ class Converter:
         if base.endswith('.recode.mkv'):
             return 'DUN'
 
-        # Files marked as OK from previous successful conversion
-        if vid.doit in ('OK',):
+        # Files marked as OK from previous successful conversion or skip
+        if vid.doit in ('OK', '---'):
             return 'OK'
 
         # Note: SAMPLE. and TEST. files are now excluded at is_valid_video_file() level
@@ -449,8 +449,7 @@ class Converter:
             else:
                 lines, stats = make_lines()
                 if self.state == 'select':
-                    # head = '[s]etAll [r]setAll [i]nit SP:toggle [g]o ?=help [q]uit'
-                    head = '[r]setAll [i]nit SP:toggle [g]o ?=help [q]uit'
+                    head = '[r]setAll [i]nit SP:toggle [s]kip [g]o ?=help [q]uit'
                     if self.search_re:
                         shown = Mangler.mangle(self.search_re) if spins.mangle else self.search_re
                         head += f' /{shown}'
@@ -462,7 +461,7 @@ class Converter:
                                    )
                     # lg.lg(f'{cpu_status=}')
                 if self.state == 'convert':
-                    head = ' ?=help q[uit]'
+                    head = ' [s]kip ?=help [q]uit'
                     if self.search_re:
                         shown = Mangler.mangle(self.search_re) if spins.mangle else self.search_re
                         head += f' /{shown}'
@@ -537,6 +536,29 @@ class Converter:
                     if 0 <= idx < len(self.visible_vids):
                         toggle_doit(self.visible_vids[idx])
                         win.pick_pos += 1
+
+            if spins.skip:
+                spins.skip = False
+                if self.state == 'select':
+                    idx = win.pick_pos
+                    if 0 <= idx < len(self.visible_vids):
+                        vid = self.visible_vids[idx]
+                        if vid.doit.startswith(('[', 'DUN')):
+                            vid.doit = '---'
+                            self.probe_cache.set_anomaly(vid.filepath, '---')
+                        elif vid.doit == '---':
+                            if vid.doit_auto == '---':
+                                vid.doit_auto = '[ ]'
+                            vid.doit = vid.doit_auto
+                            self.probe_cache.set_anomaly(vid.filepath, None)
+                        win.pick_pos += 1
+                if self.state == 'convert':
+                    if self.job:
+                        vid = self.job.vid
+                        self.job.ffsubproc.stop()
+                        self.job = None
+                        vid.doit = '---'
+                        self.probe_cache.set_anomaly(vid.filepath, '---')
 
             if spins.go:
                 spins.go = False
@@ -674,13 +696,14 @@ class Converter:
             elif not vid.doit.startswith('?') and not self.dont_doit(vid):
                 vid.doit = '[X]'
 
+
         spin = OptionSpinner()
         spin.add_key('help_mode', '? - help screen', vals=[False, True])
-        # spin.add_key('set_all', 's - set all to "[X]"', category='action')
         spin.add_key('reset_all', 'r - reset all to "[ ]"', category='action')
         spin.add_key('init_all', 'i - set all automatic state', category='action')
         spin.add_key('toggle', 'SP - toggle current line state', category='action',
                      keys={ord(' '), })
+        spin.add_key('skip', 's - skip reencoding --> "---"', category='action')
         spin.add_key('go', 'g - begin conversions', category='action')
         spin.add_key('quit', 'q - quit converting OR exit app', category='action',
                      keys={ord('q'), 0x3})

@@ -37,7 +37,7 @@ class Vid:
     # Fields with default values
     doit: str = field(default='', init=False)
     doit_auto: str = field(default='', init=False)
-    net: str = field(default=' ---', init=False)
+    net: str = field(default='  - ', init=False)
     width: Optional[int] = field(default=None, init=False)
     height: Optional[int] = field(default=None, init=False)
     command: Optional[str] = field(default=None, init=False)

@@ -208,7 +208,10 @@ After scanning/probing the file and folder arguments, the selection screen will 
 **Notes.**
 * `[ ]` denotes a video NOT selected for conversion.
 * `[X]` denotes a video selected for conversion.
-* other (uncommon normally) CVT values are:
+* other (often uncommon) CVT states are:
+  * `---` - denotes a manually "skipped" (i.e., don't convert) video:
+    * in select mode, `s` sets/clears skip mode
+    * in convert mode, `s` skips stops the current video conversion and sets the state
   * `?Pn` - denotes probe failed `n` times (stops at 9)
     * A "hard" failure which cannot be overridden to start conversion
   * `ErN` - denotes conversion failed `N` times (stops at 9)
