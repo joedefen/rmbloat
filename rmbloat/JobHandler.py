@@ -35,6 +35,12 @@ class JobHandler:
         re.IGNORECASE
     )
 
+    # Regex for validating SRT timestamp lines (HH:MM:SS,mmm --> HH:MM:SS,mmm)
+    SRT_TIMESTAMP_RE = re.compile(
+        r'^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}',
+        re.IGNORECASE
+    )
+
     sample_seconds = 30
 
     def __init__(self, opts, chooser, probe_cache, auto_mode_enabled=False):
@@ -60,6 +66,75 @@ class JobHandler:
         self.consecutive_failures = 0
         self.ok_count = 0
         self.error_count = 0
+
+    def validate_srt_file(self, filepath, min_captions=12):
+        """
+        Validate an SRT subtitle file.
+
+        Checks that the file:
+        - Is not empty
+        - Has valid SRT format (sequence numbers, timestamps, text)
+        - Contains at least min_captions caption entries
+
+        Args:
+            filepath: Path to the SRT file
+            min_captions: Minimum number of captions required (default: 12)
+
+        Returns:
+            True if valid, False otherwise
+        """
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if not lines:
+                return False  # Empty file
+
+            caption_count = 0
+            i = 0
+
+            while i < len(lines):
+                line = lines[i].strip()
+
+                # Skip blank lines
+                if not line:
+                    i += 1
+                    continue
+
+                # Expect sequence number
+                if not line.isdigit():
+                    # Could be malformed, but allow some flexibility
+                    i += 1
+                    continue
+
+                i += 1
+                if i >= len(lines):
+                    break
+
+                # Expect timestamp line
+                timestamp_line = lines[i].strip()
+                if not self.SRT_TIMESTAMP_RE.match(timestamp_line):
+                    # Not a valid timestamp, skip
+                    i += 1
+                    continue
+
+                i += 1
+
+                # Expect at least one line of caption text
+                has_text = False
+                while i < len(lines) and lines[i].strip():
+                    has_text = True
+                    i += 1
+
+                if has_text:
+                    caption_count += 1
+
+                # i is now at a blank line or EOF
+
+            return caption_count >= min_captions
+
+        except Exception:
+            return False
 
     def make_color_opts(self, color_spt):
         """ Generate FFmpeg color space options from color_spt string """
@@ -118,7 +193,7 @@ class JobHandler:
         merged_external_subtitle = None
         if self.opts.merge_subtitles:
             subtitle_path = Path(vid.filepath).with_suffix('.en.srt')
-            if subtitle_path.exists():
+            if subtitle_path.exists() and self.validate_srt_file(subtitle_path):
                 merged_external_subtitle = str(subtitle_path)
                 vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
 

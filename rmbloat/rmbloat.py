@@ -50,7 +50,7 @@ from console_window import ConsoleWindow, OptionSpinner
 from .ProbeCache import ProbeCache
 from .VideoParser import Mangler
 from .IniManager import IniManager
-from .RotatingLogger import RotatingLogger
+from .StructuredLogger import StructuredLogger
 from .CpuStatus import CpuStatus
 from .FfmpegChooser import FfmpegChooser
 from .Models import PathProbePair, Vid
@@ -58,7 +58,7 @@ from . import FileOps
 from . import ConvertUtils
 from .JobHandler import JobHandler
 
-lg = RotatingLogger('rmbloat')
+lg = StructuredLogger('rmbloat')
 
 # File operation functions moved to FileOps.py
 sanitize_file_paths = FileOps.sanitize_file_paths
