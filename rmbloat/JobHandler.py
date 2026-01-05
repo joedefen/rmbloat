@@ -43,6 +43,51 @@ class JobHandler:
 
     sample_seconds = 30
 
+    @staticmethod
+    def should_use_10bit(pix_fmt, codec):
+        """
+        Determine whether to use 10-bit encoding based on input pixel format and codec.
+
+        Args:
+            pix_fmt: Input pixel format (e.g., 'yuv420p', 'yuv420p10le', 'p010le')
+            codec: Input codec name
+
+        Returns:
+            bool: True if 10-bit encoding should be used
+
+        Strategy:
+            - Skip 10-bit for problematic codecs (mpeg4) - VAAPI compatibility issues
+            - If source is already 10-bit → use 10-bit
+            - For standard 8-bit (yuv420p) → use 10-bit for better compression
+            - For exotic/problematic formats → use 8-bit for safety
+        """
+        # If source is already 10-bit, definitely use 10-bit output
+        # (Even for problematic codecs - preserve the bit depth)
+        if '10le' in pix_fmt or '10be' in pix_fmt or 'p010' in pix_fmt or 'p210' in pix_fmt:
+            return True
+
+        # Skip 10-bit for codecs known to have VAAPI compatibility issues with 8-bit sources
+        # mpeg4 often has corrupt streams, dynamic resolution changes, and poor VAAPI support
+        problematic_codecs = {'mpeg4'}
+        if codec in problematic_codecs:
+            return False
+
+        # Standard 8-bit formats that work well with 10-bit encoding
+        safe_8bit_formats = {
+            'yuv420p',    # Standard 8-bit 4:2:0
+            'yuv422p',    # Standard 8-bit 4:2:2
+            'yuv444p',    # Standard 8-bit 4:4:4
+            'nv12',       # NVIDIA/Intel preferred format
+            'nv21',       # Alternative NV format
+        }
+
+        if pix_fmt in safe_8bit_formats:
+            return True  # Use 10-bit for better compression efficiency
+
+        # For unknown or exotic formats, stay safe with 8-bit
+        # This includes: yuvj420p (JPEG color range), bgr24, rgb24, etc.
+        return False
+
     def __init__(self, opts, chooser, probe_cache, auto_mode_enabled=False):
         """
         Initialize job handler.
@@ -184,7 +229,45 @@ class JobHandler:
         ]
         return color_opts
 
-    def start_transcode_job(self, vid, bash_quote_func):
+    def _should_retry_with_error_tolerance(self, vid):
+        """
+        Check if a failed job should be retried with error tolerance.
+        Detects filter reinitialization errors and severe corruption.
+        """
+        if vid.return_code == 0:
+            return False
+
+        # Check for filter reinitialization error (the specific issue from the bug report)
+        filter_error_signals = [
+            "Error reinitializing filters",
+            "Impossible to convert between the formats",
+            "Reconfiguring filter graph because video parameters changed"
+        ]
+
+        for signal in filter_error_signals:
+            for line in vid.texts:
+                if signal in line:
+                    return True
+
+        # Also check for severe corruption (high severity score)
+        corruption_signals = {
+            "corrupt decoded frame": 10,
+            "illegal mb_num": 9,
+            "marker does not match f_code": 9,
+        }
+
+        total_severity = 0
+        for line in vid.texts:
+            for signal, score in corruption_signals.items():
+                if signal in line:
+                    total_severity += score
+                    if total_severity >= 20:  # Quick exit if severe
+                        return True
+                    break
+
+        return False
+
+    def start_transcode_job(self, vid, bash_quote_func, retry_with_error_tolerance=False):
         """Start a transcoding job using FfmpegChooser."""
         os.chdir(os.path.dirname(vid.filepath))
         basename = os.path.basename(vid.filepath)
@@ -212,11 +295,17 @@ class JobHandler:
 
         job = Job(vid, orig_backup_file, temp_file, duration_secs, dry_run=self.opts.dry_run)
         job.input_file = basename
+        job.is_retry = retry_with_error_tolerance
+
+        # Decide on 10-bit encoding based on input pixel format
+        use_10bit = self.should_use_10bit(probe.pix_fmt, probe.codec)
 
         # Create namespace with defaults
         params = self.chooser.make_namespace(
             input_file=job.input_file,
-            output_file=job.temp_file
+            output_file=job.temp_file,
+            use_10bit=use_10bit,
+            error_tolerant=retry_with_error_tolerance
         )
 
         # Set quality
@@ -270,6 +359,11 @@ class JobHandler:
         # Set subtitle codec to srt for MKV compatibility (transcodes mov_text, ass, etc.)
         # When external subtitle is used, FfmpegChooser handles the codec internally
         params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
+
+        # For error-tolerant mode, add resolution to stabilize filter graph
+        if retry_with_error_tolerance:
+            params.width = probe.width
+            params.height = probe.height
 
         # Generate the command
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)

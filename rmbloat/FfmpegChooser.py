@@ -43,6 +43,7 @@ class FfmpegChooser:
         self.use_acceleration = False
         self.system_ffmpeg_path = None
         self.render_device = None
+        self.vaapi_supports_10bit = False  # Will be detected during init
         self.prefer_strategy = prefer_strategy
         self.quiet = quiet
         self.strategy = None  # Will be set to the chosen strategy
@@ -86,6 +87,10 @@ class FfmpegChooser:
                 print(f"  ✓ System ffmpeg has working hardware acceleration")
             else:
                 print(f"  ✗ System ffmpeg hardware acceleration not available")
+
+        # Detect 10-bit VAAPI support (only if acceleration is available)
+        if self.has_system_acceleration:
+            self.vaapi_supports_10bit = self._detect_vaapi_10bit_support()
     
     def _test_system_acceleration(self):
         """Test if system ffmpeg can use hardware acceleration."""
@@ -125,7 +130,77 @@ class FfmpegChooser:
             pass
         
         return False
-    
+
+    def _detect_vaapi_10bit_support(self):
+        """
+        Detect if VAAPI supports 10-bit HEVC encoding.
+
+        Returns:
+            bool: True if VAAPI supports main10 profile
+        """
+        if not self.render_device:
+            return False
+
+        # Try using vainfo first (fastest and most reliable)
+        if shutil.which('vainfo'):
+            try:
+                result = subprocess.run(
+                    ['vainfo', '--display', 'drm', '--device', self.render_device],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                    text=True
+                )
+                if result.returncode == 0:
+                    output = result.stdout
+                    # Look for HEVC Main10 profile
+                    # Example lines:
+                    #   VAProfileHEVCMain10             : VAEntrypointVLD
+                    #   VAProfileHEVCMain10             : VAEntrypointEncSlice
+                    if 'VAProfileHEVCMain10' in output and 'VAEntrypointEncSlice' in output:
+                        if not self.quiet:
+                            print("  ✓ VAAPI supports 10-bit HEVC encoding")
+                        return True
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+        # Fallback: test encode with 10-bit
+        # This is slower but works if vainfo isn't available
+        test_cmd = [
+            'ffmpeg',
+            '-y',
+            '-init_hw_device', f'vaapi=va:{self.render_device}',
+            '-filter_hw_device', 'va',
+            '-f', 'lavfi', '-i', 'nullsrc=s=128x128:d=1',
+            '-vf', 'format=p010le,hwupload',
+            '-c:v', 'hevc_vaapi',
+            '-profile:v', 'main10',
+            '-frames:v', '1',
+            '-f', 'null', '-'
+        ]
+
+        try:
+            result = subprocess.run(
+                test_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                text=True
+            )
+            if result.returncode == 0:
+                if not self.quiet:
+                    print("  ✓ VAAPI supports 10-bit HEVC encoding (verified by test)")
+                return True
+            else:
+                # Check if error is specifically about profile
+                if 'No usable encoding profile found' in result.stderr or 'profile' in result.stderr.lower():
+                    if not self.quiet:
+                        print("  ⚠ VAAPI does not support 10-bit HEVC encoding (will use 8-bit)")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        return False
+
     def _detect_runtime(self):
         """Detect if docker or podman is available."""
         # Try docker first
@@ -383,11 +458,11 @@ class FfmpegChooser:
     def make_namespace(self, **overrides):
         """
         Create a namespace with sensible defaults for FFmpeg encoding.
-        
+
         Required arguments (must be provided):
             input_file: Input video file path
             output_file: Output video file path
-        
+
         Optional arguments with defaults:
             crf: Quality (default: 28, lower=better quality)
             preset: Encoding preset (default: 'medium')
@@ -404,10 +479,11 @@ class FfmpegChooser:
             use_nice_ionice: Use nice/ionice for low priority (default: True)
             pre_input_opts: Options before -i (default: [])
             post_input_opts: Options after -i (default: [])
-        
+            error_tolerant: Add flags for corrupt/problematic videos (default: False)
+
         Returns:
             SimpleNamespace with all parameters
-        
+
         Example:
             params = chooser.make_namespace(
                 input_file='input.mp4',
@@ -417,7 +493,7 @@ class FfmpegChooser:
             )
         """
         from types import SimpleNamespace
-        
+
         defaults = SimpleNamespace(
             # Required - must provide
             input_file=None,
@@ -450,6 +526,9 @@ class FfmpegChooser:
             # Pre/post input opts
             pre_input_opts=[],
             post_input_opts=[],
+
+            # Error handling
+            error_tolerant=False,
         )
         
         # Apply overrides
@@ -562,9 +641,20 @@ class FfmpegChooser:
         # (Docker image already has ffmpeg as entrypoint, don't add it again)
         if not self.use_docker:
             cmd.append('ffmpeg')
-        
+
         cmd.append('-y')
-        
+
+        # Initialize hardware device (must be before inputs for modern ffmpeg)
+        if self.use_acceleration:
+            cmd.extend([
+                '-init_hw_device', f'vaapi=va:{self.render_device}',
+                '-filter_hw_device', 'va'
+            ])
+
+        # Error tolerance flags (for corrupt/problematic videos)
+        if params.error_tolerant:
+            cmd.extend(['-err_detect', 'ignore_err', '-fflags', '+genpts'])
+
         # Pre-input options (e.g., -ss for seeking)
         if params.pre_input_opts:
             cmd.extend(params.pre_input_opts)
@@ -601,17 +691,24 @@ class FfmpegChooser:
             cmd.extend(['-qp', str(qp)])
             
             # Pixel format and profile
-            if params.use_10bit:
-                pix_fmt = 'p010le'
+            # Only use 10-bit if both requested AND hardware supports it
+            use_10bit_encoding = params.use_10bit and self.vaapi_supports_10bit
+            if use_10bit_encoding:
+                # Use 10-bit format - p010le is the proper 10-bit format for VAAPI
+                filter_pix_fmt = 'p010le'
                 cmd.extend(['-profile:v', 'main10'])
             else:
-                pix_fmt = 'nv12'
-            
+                # Use 8-bit format
+                filter_pix_fmt = 'nv12'
+
             # Hardware upload filter
-            cmd.extend([
-                '-vf', f'format={pix_fmt},hwupload',
-                '-vaapi_device', self.render_device,
-            ])
+            # For error-tolerant mode, add scale filter to stabilize resolution changes
+            if params.error_tolerant and hasattr(params, 'width') and hasattr(params, 'height'):
+                filter_chain = f'scale={params.width}:{params.height},format={filter_pix_fmt},hwupload'
+            else:
+                filter_chain = f'format={filter_pix_fmt},hwupload'
+
+            cmd.extend(['-vf', filter_chain])
             
         else:
             # Software encoding
@@ -621,29 +718,32 @@ class FfmpegChooser:
                 codec = 'libx264'
             else:
                 codec = f'lib{params.codec}'
-            
+
             # Quality: use CRF for software
             cmd.extend(['-crf', str(params.crf)])
-            
+
             # Pixel format
             if params.use_10bit:
-                pix_fmt = 'yuv420p10le'
+                output_pix_fmt = 'yuv420p10le'
             else:
-                pix_fmt = 'yuv420p'
-            
+                output_pix_fmt = 'yuv420p'
+
             # Thread control for software encoding
             if params.thread_count > 0:
                 if params.codec == 'hevc':
                     cmd.extend(['-x265-params', f'pools={params.thread_count}'])
                 elif params.codec == 'h264':
                     cmd.extend(['-threads', str(params.thread_count)])
-        
+
         # Preset (mapped if needed)
         preset = self._map_preset(params.preset, self.use_acceleration)
         cmd.extend(['-preset', preset])
-        
-        # Pixel format
-        cmd.extend(['-pix_fmt', pix_fmt])
+
+        # Pixel format (for output)
+        # For VAAPI, don't specify output pix_fmt - let the encoder decide based on profile
+        # For software encoding, explicitly set the pixel format
+        if not self.use_acceleration:
+            cmd.extend(['-pix_fmt', output_pix_fmt])
         
         # Color options
         if params.color_opts:

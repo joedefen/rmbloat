@@ -27,6 +27,7 @@ class Probe:
     height: int = 0
     codec: str = '---'
     color_spt: str = 'unknown,~,~'
+    pix_fmt: str = 'unknown'
     bitrate: int = 0
     duration: float = 0.0
     fps: float = 0.0
@@ -38,7 +39,7 @@ class Probe:
 
 class ProbeCache:
     """ TBD """
-    disk_fields = set('anomaly width height codec bitrate fps duration size_bytes color_spt customs'.split())
+    disk_fields = set('anomaly width height codec bitrate fps duration size_bytes color_spt customs pix_fmt'.split())
 
     """ TBD """
     def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp", chooser=None):
@@ -64,6 +65,8 @@ class ProbeCache:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Register cleanup on exit
             atexit.register(self._release_instance_lock)
+            # Ensure cache is saved on exit
+            atexit.register(self.store)
         except IOError:
             print(f"ERROR: Another rmbloat instance is already running (lock: {self.lock_path})")
             sys.exit(1)
@@ -160,6 +163,7 @@ class ProbeCache:
                 height=int(video_stream.get('height', 0)),
                 codec=video_stream.get('codec_name', '---'),
                 color_spt=get_color_spt(),
+                pix_fmt=video_stream.get('pix_fmt', 'unknown'),
                 bitrate=int(int(metadata["format"].get('bit_rate', '0'))/1000),
                 duration=float(metadata["format"].get('duration', 0.0)),
             )

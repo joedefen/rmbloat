@@ -46,7 +46,8 @@ import json
 import curses
 from dataclasses import asdict
 from types import SimpleNamespace
-from console_window import ConsoleWindow, OptionSpinner, Screen, ScreenStack, ConsoleWindowOpts, IncrementalSearchBar
+from console_window import (ConsoleWindow, OptionSpinner, Screen, ScreenStack,
+                            ConsoleWindowOpts, IncrementalSearchBar, Context)
 from .ProbeCache import ProbeCache
 from .VideoParser import Mangler
 from .IniManager import IniManager
@@ -57,13 +58,14 @@ from .Models import PathProbePair, Vid
 from . import FileOps
 from . import ConvertUtils
 from .JobHandler import JobHandler
+from .SystemDiscovery import get_system_discovery
 
 lg = StructuredLogger('rmbloat')
 
 # Screen constants
 SELECT_ST = 0
 CONVERT_ST = 1
-HISTORY_ST = 3
+HISTORY_ST = 2
 HELP_ST = 3
 SCREEN_NAMES = ('SELECT', 'CONVERT', 'HISTORY', 'HELP')
 
@@ -253,6 +255,24 @@ class Converter:
                 if isinstance(got, str):
                     self.job.progress = got
                 elif isinstance(got, int):
+                    # Check if we should retry with error tolerance
+                    should_retry = (got != 0 and
+                                  (not hasattr(self.job, 'is_retry') or not self.job.is_retry) and
+                                  self._should_retry_with_error_tolerance(self.job.vid))
+
+                    if should_retry:
+                        # Retry with error tolerance
+                        lg.put('WARN', 'RETRY-WITH-ERROR-TOLERANCE',
+                            f'Retrying {self.job.vid.filebase} with error tolerance flags')
+                        vid = self.job.vid
+                        # Mark the error in probe cache before retrying
+                        self.probe_cache.set_anomaly(vid.filepath, 'Err')
+                        vid.doit = '[X]'  # Reset for retry
+                        self.job = self.start_transcode_job(vid, retry_with_error_tolerance=True)
+                        vid.doit = 'IP '
+                        break  # Continue with retry job
+
+                    # Job finished (either success or final failure after retry)
                     self.job.vid.doit = ' OK' if got == 0 else 'ERR'
                     self.job.vid.doit_auto = self.job.vid.doit
                     self.finish_transcode_job(
@@ -266,6 +286,8 @@ class Converter:
                         title = 'SAMPLE'
                     elif self.opts.dry_run:
                         title = 'DRY-RUN'
+                    elif hasattr(self.job, 'is_retry') and self.job.is_retry:
+                        title = 'RE-ENCODE-TO-H265-RETRY'
                     else:
                         title = 'RE-ENCODE-TO-H265'
 
@@ -601,8 +623,11 @@ class Converter:
         spin.add_key('help_mode', '? - help screen', genre="action")
         spin.add_key('screen_escape', 'ESC - return to previous screen',
                      keys=27, genre="action")
-        spin.add_key('history', 'h - go to History Screen', genre='action')
+        spin.add_key('history', 'h - go to History Screen', genre='action',
+                     scope=[SELECT_ST, CONVERT_ST])
         spin.add_key('expand', 'e - expand/collapse log entry', genre='action')
+        spin.add_key('copy_log', 'c - copy log entry to clipboard', genre='action',
+                     scope=HISTORY_ST)
         spin.add_key('reset_all', 'r - reset all to "[ ]"', genre='action')
         spin.add_key('init_all', 'i - set all automatic state', genre='action')
         spin.add_key('toggle', 'SP - toggle current line state', genre='action',
@@ -618,7 +643,11 @@ class Converter:
         spin.add_key('hist_search', '/ - search string', genre="action",
                       scope=HISTORY_ST)
         spin.add_key('mangle', 'm - mangle titles', vals=[False, True])
-        self.win.set_handled_keys(spin.keys)
+        # NOTE: With relax_handled_keys=True (default in console_window),
+        # we no longer need to call set_handled_keys() - all non-navigation
+        # keys are automatically passed to the app
+        # other = {curses.KEY_ENTER, 10}
+        # self.win.set_handled_keys(spin.keys | other)
 
         self.spins = spins = spin.default_obj
 
@@ -640,8 +669,10 @@ class Converter:
                 win.render(redraw=redraw)
                 force_redraw = False  # Reset after use
 
-            # Get user input
-            key = win.prompt(seconds=3.0)
+            # Get user input with screen-specific timeout
+            current_screen = self.screens[self.stack.curr.num]
+            timeout = current_screen.prompt_timeout
+            key = win.prompt(seconds=timeout)
 
             # Handle IncrementalSearchBar if active on history screen
             if key and self.stack.curr.num == HISTORY_ST:
@@ -649,7 +680,7 @@ class Converter:
                 if screen and screen.search_bar.is_active:
                     if screen.search_bar.handle_key(key):
                         force_redraw = True  # Force full redraw on next iteration
-                        continue  # Key was handled, skip normal processing
+                        key = None
 
             # Process spinner keys
             if key in spin.keys:
@@ -721,6 +752,7 @@ class Converter:
 class RmbloatScreen(Screen):
     """Base screen class for rmbloat video converter"""
     app: 'Converter'  # Type hint for IDE
+    prompt_timeout = 3.0  # Default timeout in seconds for win.prompt()
 
     def screen_escape_ACTION(self):
         """ESC key - Return to previous screen"""
@@ -734,7 +766,7 @@ class RmbloatScreen(Screen):
             app.stack.push(HELP_ST, app.win.pick_pos)
     
     def history_ACTION(self):
-        """? - enter help mode"""
+        """h - go to History Screen"""
         app = self.app
         if app.stack.curr.num in (SELECT_ST, CONVERT_ST):
             app.stack.push(HISTORY_ST)
@@ -756,11 +788,11 @@ class SelectScreen(RmbloatScreen):
         lines, stats, co_wid = app.make_lines()
 
         # Header line with keys
-        head = '[r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist ?;help [q]uit'
+        head = '[r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist ?:help [q]uit'
         if app.search_re:
             shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
             head += f' /{shown}'
-        win.add_header(head)
+        win.add_fancy_header(head, "Underline")
 
         # Stats header
         cpu_status = app.cpu.get_status_string()
@@ -918,16 +950,18 @@ class HelpScreen(RmbloatScreen):
 
 class HistoryScreen(RmbloatScreen):
     """History screen showing log entries with expand/collapse functionality"""
+    prompt_timeout = 60.0  # Slower refresh for reading/copying logs
 
     def __init__(self, app):
         super().__init__(app)
-        self.expands = {}  # Maps entry index -> expansion state (0=collapsed, 1=partial, 2=full)
+        self.expands = {}  # Maps timestamp -> expansion state (0=collapsed, 1=partial, 2=full)
         self.entries = []  # Cached log entries (all entries before filtering)
         self.filtered_entries = []  # Entries after search filtering
-        self.visible_lines = []  # Maps display line index -> entry index (None for expanded/blank lines)
-        self.window = None  # Window of log entries (OrderedDict)
+        self.visible_lines = []  # Maps display line index -> timestamp (None for expanded/blank lines)
+        self.window_of_logs = None  # Window of log entries (OrderedDict)
         self.window_state = None  # Window state for incremental reads
-        self.search_matches = {}  # Maps entry index -> True if deep match found in JSON
+        self.search_matches = {}  # Maps timestamp -> True if deep match found in JSON
+        self.prev_filter = ''
 
         # Setup search bar
         self.search_bar = IncrementalSearchBar(
@@ -944,6 +978,7 @@ class HistoryScreen(RmbloatScreen):
         """Called when ENTER pressed in search - keep filter active, exit input mode."""
         self.app.win.passthrough_mode = False
         # Filter remains active - just exit typing mode
+        self.prev_filter = text
 
     def _on_search_cancel(self, original_text):
         """Called when ESC pressed in search - restore and exit search mode."""
@@ -972,7 +1007,7 @@ class HistoryScreen(RmbloatScreen):
         filtered = []
         matches = {}
 
-        for idx, entry in enumerate(self.entries):
+        for entry in self.entries:
             # Extract visible text (what shows in collapsed view)
             timestamp = entry.timestamp[:19]
             level = entry.level if hasattr(entry, 'level') else "???"
@@ -1008,7 +1043,7 @@ class HistoryScreen(RmbloatScreen):
             if shallow_match or deep_match:
                 filtered.append(entry)
                 if deep_match and not shallow_match:
-                    matches[idx] = True  # Mark as deep-only match
+                    matches[entry.timestamp] = True  # Mark as deep-only match using timestamp
 
         self.filtered_entries = filtered
         self.search_matches = matches
@@ -1020,14 +1055,18 @@ class HistoryScreen(RmbloatScreen):
         win.set_pick_mode(True)
 
         # Get window of log entries (chronological order - eldest to youngest)
-        if self.window is None:
-            self.window, self.window_state = lg.get_window_of_entries(window_size=1000)
+        if self.window_of_logs is None:
+            self.window_of_logs, self.window_state = lg.get_window_of_entries(window_size=1000)
         else:
             # Refresh window with any new entries
-            self.window, self.window_state = lg.refresh_window(self.window, self.window_state, window_size=1000)
+            self.window_of_logs, self.window_state = lg.refresh_window(self.window_of_logs, self.window_state, window_size=1000)
 
         # Convert to list in reverse order (newest first for display)
-        self.entries = list(reversed(list(self.window.values())))
+        self.entries = list(reversed(list(self.window_of_logs.values())))
+
+        # Clean up self.expands: remove any timestamps that are no longer in entries
+        valid_timestamps = {entry.timestamp for entry in self.entries}
+        self.expands = {ts: state for ts, state in self.expands.items() if ts in valid_timestamps}
 
         # Apply search filter if active
         if not self.search_bar.text:
@@ -1039,20 +1078,20 @@ class HistoryScreen(RmbloatScreen):
         other_count = len(self.filtered_entries) - err_count
 
         # Build search display string
-        search_display = self.search_bar.get_display_string(prefix='Search:', suffix='')
+        search_display = self.search_bar.get_display_string(prefix='', suffix='')
 
         # Header
-        header_line = f'ESC:return [e]xpand/collapse [/]search  Entries: {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} other:{other_count})'
+        header_line = f'ESC:back [e]xpand [c]opy/export {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} oth:{other_count}) /'
         if search_display:
-            header_line += f'  {search_display}'
+            header_line += f'{search_display}'
         win.add_header(header_line)
         win.add_header(f'Log file: {lg.log_file}')
 
         # Build display
         self.visible_lines = []
-        for idx, entry in enumerate(self.filtered_entries):
-            # Get original index for tracking expands and deep matches
-            orig_idx = self.entries.index(entry) if entry in self.entries else idx
+        for entry in self.filtered_entries:
+            # Use timestamp as the unique key
+            timestamp = entry.timestamp
 
             # Extract filebase from message JSON
             filebase = None
@@ -1079,18 +1118,18 @@ class HistoryScreen(RmbloatScreen):
                     filebase = f"{entry.file}:{entry.line} {entry.function}()"
 
             # Show timestamp, level, and filebase
-            timestamp = entry.timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
+            timestamp_display = timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
             level = entry.level if hasattr(entry, 'level') else "???"
 
             # Add deep match indicator if this entry matched only in JSON
-            deep_indicator = " *" if orig_idx in self.search_matches else ""
+            deep_indicator = " *" if timestamp in self.search_matches else ""
 
-            line = f"{timestamp} [{level:>3}] {filebase}{deep_indicator}"
-            win.add_body(line)
-            self.visible_lines.append(orig_idx)
+            line = f"{timestamp_display} [{level:>3}] {filebase}{deep_indicator}"
+            win.add_body(line, attr=curses.A_BOLD, context=Context("header", timestamp=timestamp))
+            self.visible_lines.append(timestamp)
 
             # Handle expansion
-            expand_state = self.expands.get(orig_idx, 0)
+            expand_state = self.expands.get(timestamp, 0)
             if expand_state > 0 and json_str:
                 # Format JSON nicely
                 try:
@@ -1107,7 +1146,7 @@ class HistoryScreen(RmbloatScreen):
                         display_lines = lines
 
                     for line in display_lines:
-                        win.add_body(f"  {line}")
+                        win.add_body(f"  {line}", context=Context("body", timestamp=timestamp))
                         self.visible_lines.append(None)  # Placeholder for expanded lines
 
                 except (json.JSONDecodeError, ValueError):
@@ -1115,28 +1154,89 @@ class HistoryScreen(RmbloatScreen):
                     self.visible_lines.append(None)
 
             # Empty line between entries
-            win.add_body("")
+            win.add_body("", context=Context("DECOR"))
             self.visible_lines.append(None)
 
     def expand_ACTION(self):
         """'e' key - Expand/collapse current entry"""
         app = self.app
         win = app.win
-        idx = win.pick_pos
+        ctx = win.get_picked_context()
 
-        if 0 <= idx < len(self.visible_lines):
-            entry_idx = self.visible_lines[idx]
-            if entry_idx is not None:
-                # Cycle through expansion states: 0 (collapsed) -> 1 (partial) -> 2 (full) -> 0
-                current = self.expands.get(entry_idx, 0)
-                next_state = (current + 1) % 3
-                if next_state == 0:
-                    # Back to collapsed, remove from dict
-                    if entry_idx in self.expands:
-                        del self.expands[entry_idx]
+        if ctx and hasattr(ctx, 'timestamp'):
+            timestamp = ctx.timestamp
+
+            # Cycle through expansion states: 0 (collapsed) -> 1 (partial) -> 2 (full) -> 0
+            current = self.expands.get(timestamp, 0)
+            next_state = (current + 1) % 3
+            if next_state == 0:
+                # Back to collapsed, remove from dict
+                if timestamp in self.expands:
+                    del self.expands[timestamp]
+            else:
+                self.expands[timestamp] = next_state
+
+    def copy_log_ACTION(self):
+        """'c' key - Copy entire log entry to clipboard or export to file"""
+        app = self.app
+        win = app.win
+        ctx = win.get_picked_context()
+
+        if ctx and hasattr(ctx, 'timestamp'):
+            timestamp = ctx.timestamp
+
+            # Find the entry with this timestamp
+            entry = None
+            for e in self.filtered_entries:
+                if e.timestamp == timestamp:
+                    entry = e
+                    break
+
+            if entry:
+                # Build the full log entry text
+                lines = []
+                lines.append(f"Timestamp: {entry.timestamp}")
+                lines.append(f"Level: {entry.level if hasattr(entry, 'level') else 'N/A'}")
+                lines.append(f"File: {entry.file}:{entry.line}")
+                lines.append(f"Function: {entry.function}()")
+                lines.append("")
+
+                # Add the full message (including JSON if present)
+                if entry.message:
+                    lines.append("Message:")
+                    lines.append(entry.message)
+
+                    # Try to pretty-print JSON if it exists
+                    try:
+                        msg = entry.message
+                        if '{' in msg:
+                            json_start = msg.index('{')
+                            json_str = msg[json_start:]
+                            data = json.loads(json_str)
+                            lines.append("")
+                            lines.append("JSON (formatted):")
+                            lines.append(json.dumps(data, indent=2))
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        pass
+
+                text = '\n'.join(lines)
+
+                # Try clipboard first using SystemDiscovery
+                sys_disc = get_system_discovery()
+                success, error = sys_disc.copy_to_clipboard(text)
+
+                if success:
+                    win.alert(message='Log entry copied to clipboard')
                 else:
-                    self.expands[entry_idx] = next_state
-    
+                    # Clipboard failed - fall back to file export
+                    try:
+                        export_path = '/tmp/rmbloat-export.txt'
+                        with open(export_path, 'w', encoding='utf-8') as f:
+                            f.write(text)
+                        win.alert(message=f'Exported to {export_path}')
+                    except Exception as exc:
+                        win.alert(message=f'Export failed: {exc}')
+
     def hist_search_ACTION(self):
         """ Handle '/' key - start incremental filter search """
         self.search_bar.start("")
