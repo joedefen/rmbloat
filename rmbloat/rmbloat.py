@@ -46,7 +46,7 @@ import json
 import curses
 from dataclasses import asdict
 from types import SimpleNamespace
-from console_window import ConsoleWindow, OptionSpinner
+from console_window import ConsoleWindow, OptionSpinner, Screen, ScreenStack, ConsoleWindowOpts, IncrementalSearchBar
 from .ProbeCache import ProbeCache
 from .VideoParser import Mangler
 from .IniManager import IniManager
@@ -59,6 +59,13 @@ from . import ConvertUtils
 from .JobHandler import JobHandler
 
 lg = StructuredLogger('rmbloat')
+
+# Screen constants
+SELECT_ST = 0
+CONVERT_ST = 1
+HISTORY_ST = 3
+HELP_ST = 3
+SCREEN_NAMES = ('SELECT', 'CONVERT', 'HISTORY', 'HELP')
 
 # File operation functions moved to FileOps.py
 sanitize_file_paths = FileOps.sanitize_file_paths
@@ -94,6 +101,7 @@ class Converter:
         self.win = None
         self.redraw_mono = time.monotonic()
         self.opts = opts
+        self.spinner = None # spinner object
         self.spins = None # spinner values
         self.search_re = None # the "accepted" search
         self.vids = []
@@ -146,6 +154,176 @@ class Converter:
         if self.auto_mode_enabled:
             parts.append(f'Auto={self.opts.auto_hr}hr')
         return ' -- ' + ' '.join(parts)
+
+    def make_lines(self, doit_skips=None):
+        """Generate display lines and stats for video list"""
+        lines, self.visible_vids, short_list = [], [], []
+        jobcnt, co_wid = 0, len('CODEC')
+        stats = SimpleNamespace(total=0, picked=0, done=0, progress_idx=0,
+                                gb=0, delta_gb=0)
+
+        # Determine which list to use based on screen
+        vid_list = self.todo_vids if (hasattr(self, 'stack') and
+                                      self.stack.curr.num == CONVERT_ST) else self.vids
+
+        for vid in vid_list:
+            if doit_skips and vid.doit in doit_skips:
+                continue
+            short_list.append(vid)
+            co_wid = max(co_wid, len(vid.codec))
+
+        for vid in short_list:
+            basename = vid.basename1 if vid.basename1 else os.path.basename(vid.filepath)
+            dirname = os.path.dirname(vid.filepath)
+            if self.spins.mangle:
+                basename = Mangler.mangle_title(basename)
+                dirname = Mangler.mangle(dirname)
+            res = f'{vid.height}p'
+            ht_over = ' ' if vid.res_ok else '^'
+            br_over = ' ' if vid.bloat_ok else '^'
+            co_over = ' ' if vid.codec_ok else '^'
+            mins = int(round(vid.duration / 60))
+            line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
+            line += f' {vid.codec:>{co_wid}}{co_over} {mins:>4} {1024*vid.gb:>6.0f}'
+            line += f'   {basename}'
+            if self.spins.directory:
+                line += f' ---> {dirname}'
+            if self.spins.search:
+                pattern = self.spins.search
+                if self.spins.mangle:
+                    pattern = Mangler.mangle(pattern)
+                match = re.search(pattern, line, re.IGNORECASE)
+                if not match:
+                    continue
+            if vid.doit == '[X]':
+                stats.picked += 1
+            if vid.doit not in ('[X]', '[ ]', 'IP '):
+                stats.done += 1
+
+            if vid.probe0:
+                gb, delta_gb = vid.probe0.gb, 0
+                if vid.probe1 and not self.opts.sample:
+                    delta_gb = vid.probe1.gb - gb
+                stats.gb += gb
+                stats.delta_gb += delta_gb
+            lines.append(line)
+            self.visible_vids.append(vid)
+            if self.job and self.job.vid == vid:
+                jobcnt += 1
+                lines.append(f'-----> {self.job.progress}')
+                stats.progress_idx = len(self.visible_vids)
+                self.visible_vids.append(None)
+                if self.win.pick_mode:
+                    stats.progress_idx -= 1
+                    self.win.set_pick_mode(False)
+
+        stats.total = len(self.visible_vids) - jobcnt
+        stats.gb = round(stats.gb, 1)
+        stats.delta_gb = round(stats.delta_gb, 1)
+        return lines, stats, co_wid
+
+    def toggle_doit(self, vid):
+        """Toggle the doit status of a video"""
+        if vid.doit == '[X]':
+            vid.doit = vid.doit_auto if vid.doit_auto != '[X]' else '[ ]'
+        elif vid.doit == 'DUN':
+            # First time toggling DUN status - prompt user
+            if not self.allow_reencode_dun:
+                answer = self.win.answer("Enable re-encoding of already re-encoded files for this session? (y/n): ")
+                if answer and answer.lower() == 'y':
+                    self.allow_reencode_dun = True
+                    vid.doit = '[X]'
+                # else: leave as DUN
+            else:
+                # Already allowed in this session
+                vid.doit = '[X]'
+        elif not vid.doit.startswith('?') and not self.dont_doit(vid):
+            vid.doit = '[X]'
+
+    def advance_jobs(self):
+        """Process ongoing conversion jobs"""
+        # Handle running job progress
+        if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
+            while True:
+                if self.opts.dry_run:
+                    delta = time.monotonic() - self.job.start_mono
+                    got = 0 if delta >= 3 else f'{delta=}'
+                else:
+                    got = self.get_job_progress(self.job)
+                if isinstance(got, str):
+                    self.job.progress = got
+                elif isinstance(got, int):
+                    self.job.vid.doit = ' OK' if got == 0 else 'ERR'
+                    self.job.vid.doit_auto = self.job.vid.doit
+                    self.finish_transcode_job(
+                        success=bool(got == 0), job=self.job)
+                    dumped = asdict(self.job.vid)
+                    # asdict() automatically handles nested Probe dataclasses
+                    if got == 0:
+                        dumped['texts'] = []
+
+                    if self.opts.sample:
+                        title = 'SAMPLE'
+                    elif self.opts.dry_run:
+                        title = 'DRY-RUN'
+                    else:
+                        title = 'RE-ENCODE-TO-H265'
+
+                    lg.put('OK' if got == 0 else 'ERR',
+                        title + ' ', json.dumps(dumped, indent=4))
+                    self.job = None
+                    break  # finished job
+                else:
+                    break  # no progress on job
+
+        # Start new jobs if on convert screen
+        if self.stack.curr.num == CONVERT_ST and not self.job:
+            gonners = []
+            for vid in self.visible_vids:
+                if not vid:
+                    continue
+                if vid.doit == '[X]':
+                    if not os.path.isfile(vid.filepath):
+                        gonners.append(vid)
+                        continue
+                    if not self.job:  # start only one job
+                        self.prev_time_encoded_secs = -1
+                        self.job = self.start_transcode_job(vid)
+                        vid.doit = 'IP '
+            if gonners:  # any disappearing files?
+                vids = []
+                for vid in self.vids:
+                    if vid not in gonners:
+                        vids.append(vid)
+                self.vids = vids  # pruned list
+                # Convert Vid dataclass objects to dicts for JSON serialization
+                gonners_data = [asdict(v) for v in gonners]
+                lg.err('videos disappeared before conversion:\n'
+                    + json.dumps(gonners_data, indent=4))
+
+            if not self.job:
+                # Check auto mode exit conditions
+                if self.auto_mode_enabled:
+                    # Calculate current stats for vitals report
+                    _, stats, _ = self.make_lines()
+
+                    # Check exit conditions
+                    time_exceeded = False
+                    if self.job_handler.auto_mode_start_time and self.auto_mode_hrs_limit:
+                        runtime_hrs = (time.monotonic() - self.job_handler.auto_mode_start_time) / 3600
+                        time_exceeded = runtime_hrs >= self.auto_mode_hrs_limit
+
+                    no_more_todo = (stats.total - stats.done) == 0
+                    too_many_failures = self.job_handler.consecutive_failures >= 10
+
+                    if time_exceeded or no_more_todo or too_many_failures:
+                        self.print_auto_mode_vitals(stats)
+                        # print_auto_mode_vitals exits, so we never reach here
+
+                # Destroy JobHandler when leaving convert screen (resets counters)
+                self.job_handler = None
+                self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
+                self.stack.pop()  # Return to select screen
 
     def is_allowed_codec(self, probe):
         """ Return whether the codec is 'allowed' """
@@ -381,195 +559,114 @@ class Converter:
         exit_code = 1 if self.job_handler.consecutive_failures >= 10 else 0
         sys.exit(exit_code)
 
+    def handle_search_change(self):
+        """Handle search pattern changes"""
+        if self.spins.search != self.search_re:
+            valid = True
+            if self.stack.curr.num != SELECT_ST:
+                self.win.alert(message='Cannot change search unless in select screen')
+                valid = False
+            try:
+                re.compile(self.spins.search)
+            except Exception as exc:
+                self.win.alert(message=f'Ignoring invalid search: {exc}')
+                valid = False
+            if valid:
+                self.search_re = self.spins.search
+            else:  # ignore pattern changes unless in select or if won't compile
+                self.spins.search = self.search_re
+
     def do_window_mode(self):
-        """ TBD """
-        def make_lines(doit_skips=None):
-            nonlocal self
-            lines, self.visible_vids, short_list = [], [], []
-            jobcnt, co_wid = 0, len('CODEC')
-            stats = SimpleNamespace(total=0, picked=0, done=0, progress_idx=0,
-                                    gb=0, delta_gb=0)
+        """Main UI loop using Screen-based architecture"""
+        # Create ConsoleWindow
+        win_opts = ConsoleWindowOpts(
+            head_line=True,
+            head_rows=4,
+            body_rows=10+len(self.vids),
+            min_cols_rows=(60,10),
+            ctrl_c_terminates=True,
+        )
+        self.win = win = ConsoleWindow(win_opts)
+        # Initialize screens
+        self.screens = {
+            SELECT_ST: SelectScreen(self),
+            CONVERT_ST: ConvertScreen(self),
+            HELP_ST: HelpScreen(self),
+            HISTORY_ST: HistoryScreen(self),
+        }
+        self.stack = ScreenStack(self.win, None, SCREEN_NAMES, self.screens)
+        # Setup OptionSpinner
+        self.spinner = spin = OptionSpinner(stack=self.stack)
+        spin.default_obj = self.opts
+        spin.add_key('help_mode', '? - help screen', genre="action")
+        spin.add_key('screen_escape', 'ESC - return to previous screen',
+                     keys=27, genre="action")
+        spin.add_key('history', 'h - go to History Screen', genre='action')
+        spin.add_key('expand', 'e - expand/collapse log entry', genre='action')
+        spin.add_key('reset_all', 'r - reset all to "[ ]"', genre='action')
+        spin.add_key('init_all', 'i - set all automatic state', genre='action')
+        spin.add_key('toggle', 'SP - toggle current line state', genre='action',
+                     keys={ord(' '), })
+        spin.add_key('skip', 's - skip reencoding --> "---"', genre='action')
+        spin.add_key('go', 'g - begin conversions', genre='action')
+        spin.add_key('quit', 'q - quit converting OR exit app', genre='action',
+                     keys={ord('q'), 0x3})
+        spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
+        spin.add_key('directory', 'd - show directory', vals=[False, True])
+        spin.add_key('search', '/ - search string',
+                      prompt='Set search string, then Enter', scope=SELECT_ST)
+        spin.add_key('hist_search', '/ - search string', genre="action",
+                      scope=HISTORY_ST)
+        spin.add_key('mangle', 'm - mangle titles', vals=[False, True])
+        self.win.set_handled_keys(spin.keys)
 
-            for vid in self.todo_vids if self.state == 'convert' else self.vids:
-                if doit_skips and vid.doit in doit_skips:
-                    continue
-                short_list.append(vid)
-                co_wid = max(co_wid, len(vid.codec))
+        self.spins = spins = spin.default_obj
 
-            for vid in short_list:
-                basename = vid.basename1 if vid.basename1 else os.path.basename(vid.filepath)
-                dirname = os.path.dirname(vid.filepath)
-                if self.spins.mangle:
-                    basename = Mangler.mangle_title(basename)
-                    dirname = Mangler.mangle(dirname)
-                res = f'{vid.height}p'
-                ht_over = ' ' if vid.res_ok else '^' # '■'
-                br_over = ' ' if vid.bloat_ok else '^' # '■'
-                co_over = ' ' if vid.codec_ok else '^'
-                mins = int(round(vid.duration / 60))
-                line = f'{vid.doit:>3} {vid.net} {vid.bloat:5}{br_over} {res:>5}{ht_over}'
-                line += f' {vid.codec:>{co_wid}}{co_over} {mins:>4} {1024*vid.gb:>6.0f}'
-                line += f'   {basename}'
-                if self.spins.directory:
-                    line += f' ---> {dirname}'
-                if self.spins.search:
-                    pattern = self.spins.search
-                    if self.spins.mangle:
-                        pattern = Mangler.mangle(pattern)
-                    match = re.search(pattern, line, re.IGNORECASE)
-                    if not match:
-                        continue
-                if vid.doit == '[X]':
-                    stats.picked += 1
-                if vid.doit not in ('[X]', '[ ]', 'IP '):
-                    stats.done += 1
+        curses.intrflush(False)
 
-                if vid.probe0:
-                    gb, delta_gb = vid.probe0.gb, 0
-                    if vid.probe1 and not self.opts.sample:
-                        delta_gb = vid.probe1.gb - gb
-                    stats.gb += gb
-                    stats.delta_gb += delta_gb
-                lines.append(line)
-                # nses.append(vid)
-                self.visible_vids.append(vid)
-                if self.job and self.job.vid == vid:
-                    jobcnt += 1
-                    lines.append(f'-----> {self.job.progress}')
-                    stats.progress_idx = len(self.visible_vids)
-                    self.visible_vids.append(None)
-                    if self.win.pick_mode:
-                        stats.progress_idx -= 1
-                        self.win.set_pick_mode(False)
 
-                # print(line)
-            stats.total = len(self.visible_vids) - jobcnt
-            stats.gb = round(stats.gb, 1)
-            stats.delta_gb = round(stats.delta_gb, 1)
-            return lines, stats, co_wid
+        # Start in select screen
+        win.set_pick_mode(True, 1)
 
-        def render_screen():
-            nonlocal self, spin, win
-            if self.state == 'help':
-                spin.show_help_nav_keys(win)
-                spin.show_help_body(win)
-            else:
-                lines, stats, co_wid = make_lines()
-                if self.state == 'select':
-                    head = '[r]setAll [i]nit SP:toggle [s]kip [g]o ?=help [q]uit'
-                    if self.search_re:
-                        shown = Mangler.mangle(self.search_re) if spins.mangle else self.search_re
-                        head += f' /{shown}'
-                    win.add_header(head)
-                    cpu_status = self.cpu.get_status_string()
-                    win.add_header(f'     Picked={stats.picked}/{stats.total}'
-                                   f'  GB={stats.gb}({stats.delta_gb})'
-                                   f'  {cpu_status}'
-                                   )
-                    # lg.lg(f'{cpu_status=}')
-                if self.state == 'convert':
-                    head = ' [s]kip ?=help [q]uit'
-                    if self.search_re:
-                        shown = Mangler.mangle(self.search_re) if spins.mangle else self.search_re
-                        head += f' /{shown}'
-                    cpu_status = self.cpu.get_status_string()
-                    head += (f'     ToDo={stats.total-stats.done}/{stats.total}'
-                                f'  GB={stats.gb}({stats.delta_gb})'
-                                f'  {cpu_status}'
-                                )
-                    win.add_header(head)
-                    # lg.lg(f'{cpu_status=}')
+        # Main event loop
+        force_redraw = False
+        while True:
+            # Draw current screen
+            if not spins.freeze:
+                current_screen = self.screens[self.stack.curr.num]
+                current_screen.draw_screen()
+                redraw = bool(time.monotonic() - self.redraw_mono >= 60) or force_redraw
+                self.redraw_mono = time.monotonic() if redraw else self.redraw_mono
+                win.render(redraw=redraw)
+                force_redraw = False  # Reset after use
 
-                win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  {"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{self.options_suffix}')
-                if self.state == 'convert':
-                    win.pick_pos = stats.progress_idx
-                    win.scroll_pos = stats.progress_idx - win.scroll_view_size + 2
-                for line in lines:
-                    win.add_body(line)
-            redraw = bool(time.monotonic() - self.redraw_mono >= 60)
-            self.redraw_mono = time.monotonic() if redraw else self.redraw_mono
-            win.render(redraw=redraw)
+            # Get user input
+            key = win.prompt(seconds=3.0)
 
-        def handle_keyboard():
-            nonlocal self, spins, not_help_state
+            # Handle IncrementalSearchBar if active on history screen
+            if key and self.stack.curr.num == HISTORY_ST:
+                screen = self.stack.get_curr_obj()
+                if screen and screen.search_bar.is_active:
+                    if screen.search_bar.handle_key(key):
+                        force_redraw = True  # Force full redraw on next iteration
+                        continue  # Key was handled, skip normal processing
 
-            if spins.help_mode:
-                if self.state != 'help':
-                    # enter help mode
-                    not_help_state = self.state
-                    self.state = 'help'
-                    win.set_pick_mode(False, 1)
-            else:
-                if self.state == 'help':
-                    # leave help mode
-                    self.state = not_help_state
-                    if self.state == 'select':
-                        win.set_pick_mode(True, 1)
-                    else:
-                        win.set_pick_mode(False, 1)
+            # Process spinner keys
+            if key in spin.keys:
+                spin.do_key(key, win)
 
-            if spins.search != self.search_re:
-                valid = True
-                if self.state != 'select':
-                    win.alert(message='Cannot change search unless in select screen')
-                    valid = False
-                try:
-                    re.compile(spins.search)
-                except Exception as exc:
-                    win.alert(message=f'Ignoring invalid search: {exc}')
-                    valid = False
-                if valid:
-                    self.search_re = spins.search
-                else: # ignore pattern changes unless in select or if won't compile
-                    spins.search = self.search_re
+            # Handle search pattern changes
+            if self.stack.curr.num == SELECT_ST:
+                self.handle_search_change()
 
-            if spins.reset_all:
-                spins.reset_all = False
-                if self.state == 'select':
-                    for vid in self.visible_vids:
-                        if vid.doit_auto.startswith('['):
-                            vid.doit = '[ ]'
+            # Let ScreenStack perform any pending actions
+            self.stack.perform_actions(spin)
 
-            if spins.init_all:
-                spins.init_all = False
-                if self.state == 'select':
-                    for vid in self.visible_vids:
-                        vid.doit = vid.doit_auto
-
-            if spins.toggle:
-                spins.toggle = False
-                if self.state == 'select':
-                    idx = win.pick_pos
-                    if 0 <= idx < len(self.visible_vids):
-                        toggle_doit(self.visible_vids[idx])
-                        win.pick_pos += 1
-
-            if spins.skip:
-                spins.skip = False
-                if self.state == 'select':
-                    idx = win.pick_pos
-                    if 0 <= idx < len(self.visible_vids):
-                        vid = self.visible_vids[idx]
-                        if vid.doit.startswith(('[', 'DUN')):
-                            vid.doit = '---'
-                            self.probe_cache.set_anomaly(vid.filepath, '---')
-                        elif vid.doit == '---':
-                            if vid.doit_auto == '---':
-                                vid.doit_auto = '[ ]'
-                            vid.doit = vid.doit_auto
-                            self.probe_cache.set_anomaly(vid.filepath, None)
-                        win.pick_pos += 1
-                if self.state == 'convert':
-                    if self.job:
-                        vid = self.job.vid
-                        self.job.ffsubproc.stop()
-                        self.job = None
-                        vid.doit = '---'
-                        self.probe_cache.set_anomaly(vid.filepath, '---')
-
-            if spins.go:
-                spins.go = False
-                if self.state == 'select':
+            # Auto-transition to convert state if auto mode enabled
+            if self.auto_mode_enabled and self.stack.curr.num == SELECT_ST and not self.job:
+                # Collect checked videos
+                self.todo_vids = [v for v in self.vids if v.doit == '[X]']
+                if self.todo_vids:
                     # Create JobHandler when entering convert screen
                     self.job_handler = JobHandler(
                         self.opts,
@@ -577,185 +674,12 @@ class Converter:
                         self.probe_cache,
                         auto_mode_enabled=self.auto_mode_enabled
                     )
-                    self.state = 'convert'
-                    self.todo_vids = []
-                    for vid in self.vids:
-                        if vid.doit == '[X]':
-                            self.todo_vids.append(vid)
-                        # self.win.set_pick_mode(False, 1)
+                    self.stack.push(CONVERT_ST, win.pick_pos)
 
-            if spins.quit:
-                spins.quit = False
-                if self.state == 'select':
-                    sys.exit(0)
-                elif self.state == 'convert':
-                    if self.job:
-                        self.job.ffsubproc.stop()
-                        self.job.vid.doit = '[X]'
-                        self.job = None
-                    # Disable auto mode when user interrupts
-                    if self.auto_mode_enabled:
-                        self.auto_mode_enabled = False
-                        self.options_suffix = self.build_options_suffix()
-                    self.state = 'select'
-                    self.vids.sort(key=lambda vid: vid.bloat, reverse=True)
-                    win.set_pick_mode(True, 1)
+            # Process jobs
+            self.advance_jobs()
 
-        def advance_jobs():
-            nonlocal self
-
-            if self.job and self.state in ('convert', 'help'):
-                while True:
-                    if self.opts.dry_run:
-                        delta = time.monotonic() - self.job.start_mono
-                        got = 0 if delta >= 3 else f'{delta=}'
-                    else:
-                        got = self.get_job_progress(self.job)
-                    if isinstance(got, str):
-                        self.job.progress = got
-                    elif isinstance(got, int):
-                        self.job.vid.doit = ' OK' if got == 0 else 'ERR'
-                        self.job.vid.doit_auto = self.job.vid.doit
-                        self.finish_transcode_job(
-                            success=bool(got == 0), job=self.job)
-                        dumped = asdict(self.job.vid)
-                        # asdict() automatically handles nested Probe dataclasses
-                        if got == 0:
-                            dumped['texts'] = []
-
-                        if self.opts.sample:
-                            title = 'SAMPLE'
-                        elif self.opts.dry_run:
-                            title = 'DRY-RUN'
-                        else:
-                            title = 'RE-ENCODE-TO-H265'
-
-                        lg.put('OK' if got == 0 else 'ERR',
-                            title + ' ', json.dumps(dumped, indent=4))
-                        self.job = None
-                        break # finished job
-                    else:
-                        break # no progress on job
-            if self.state == 'convert' and not self.job:
-                gonners = []
-                for vid in self.visible_vids:
-                    if not vid:
-                        continue
-                    if vid.doit == '[X]':
-                        if not os.path.isfile(vid.filepath):
-                            gonners.append(vid)
-                            continue
-                        if not self.job: # start only one job
-                            self.prev_time_encoded_secs = -1
-                            self.job = self.start_transcode_job(vid)
-                            vid.doit = 'IP '
-                if gonners:  # any disappearing files?
-                    vids = []
-                    for vid in self.vids:
-                        if vid not in gonners:
-                            vids.append(vid)
-                    self.vids = vids # pruned list
-                    # Convert Vid dataclass objects to dicts for JSON serialization
-                    # asdict() automatically handles nested Probe dataclasses
-                    gonners_data = [asdict(v) for v in gonners]
-                    lg.err('videos disappeared before conversion:\n'
-                        + json.dumps(gonners_data, indent=4))
-
-                if not self.job:
-                    # Check auto mode exit conditions
-                    if self.auto_mode_enabled:
-                        # Calculate current stats for vitals report
-                        _, stats = make_lines()
-
-                        # Check exit conditions
-                        time_exceeded = False
-                        if self.job_handler.auto_mode_start_time and self.auto_mode_hrs_limit:
-                            runtime_hrs = (time.monotonic() - self.job_handler.auto_mode_start_time) / 3600
-                            time_exceeded = runtime_hrs >= self.auto_mode_hrs_limit
-
-                        no_more_todo = (stats.total - stats.done) == 0
-                        too_many_failures = self.job_handler.consecutive_failures >= 10
-
-                        if time_exceeded or no_more_todo or too_many_failures:
-                            self.print_auto_mode_vitals(stats)
-                            # print_auto_mode_vitals exits, so we never reach here
-
-                    # Destroy JobHandler when leaving convert screen (resets counters)
-                    self.job_handler = None
-                    self.state = 'select'
-                    self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
-                    win.set_pick_mode(True, 1)
-
-        def toggle_doit(vid):
-            if vid.doit == '[X]':
-                vid.doit = vid.doit_auto if vid.doit_auto != '[X]' else '[ ]'
-            elif vid.doit == 'DUN':
-                # First time toggling DUN status - prompt user
-                if not self.allow_reencode_dun:
-                    answer = win.answer("Enable re-encoding of already re-encoded files for this session? (y/n): ")
-                    if answer and answer.lower() == 'y':
-                        self.allow_reencode_dun = True
-                        vid.doit = '[X]'
-                    # else: leave as DUN
-                else:
-                    # Already allowed in this session
-                    vid.doit = '[X]'
-            elif not vid.doit.startswith('?') and not self.dont_doit(vid):
-                vid.doit = '[X]'
-
-
-        spin = OptionSpinner()
-        spin.add_key('help_mode', '? - help screen', vals=[False, True])
-        spin.add_key('reset_all', 'r - reset all to "[ ]"', category='action')
-        spin.add_key('init_all', 'i - set all automatic state', category='action')
-        spin.add_key('toggle', 'SP - toggle current line state', category='action',
-                     keys={ord(' '), })
-        spin.add_key('skip', 's - skip reencoding --> "---"', category='action')
-        spin.add_key('go', 'g - begin conversions', category='action')
-        spin.add_key('quit', 'q - quit converting OR exit app', category='action',
-                     keys={ord('q'), 0x3})
-        spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
-        spin.add_key('directory', 'd - show directory', vals=[False, True])
-        spin.add_key('search', '/ - search string',
-                          prompt='Set search string, then Enter')
-        spin.add_key('mangle', 'm - mangle titles', vals=[False, True])
-
-        self.spins = spins = spin.default_obj
-
-        self.win = win = ConsoleWindow(keys=spin.keys,
-                        body_rows=10+len(self.vids), ctrl_c_terminates=False)
-        curses.intrflush(False)
-        self.state = 'select'
-
-        win.set_pick_mode(True, 1)
-        not_help_state = self.state
-
-        while True:
-
-            if not spins.freeze:
-                render_screen()
-
-            key = win.prompt(seconds=3.0) # Wait for half a second or a keypress
-
-            if key in spin.keys:
-                spin.do_key(key, win)
-
-            handle_keyboard()
-
-            # Auto-transition to convert state if auto mode enabled
-            if self.auto_mode_enabled and self.state == 'select':
-                # Create JobHandler when entering convert screen
-                self.job_handler = JobHandler(
-                    self.opts,
-                    self.chooser,
-                    self.probe_cache,
-                    auto_mode_enabled=self.auto_mode_enabled
-                )
-                self.state = 'convert'
-
-
-            advance_jobs()
-
+            # Clear screen for next render
             if not spins.freeze:
                 win.clear()
 
@@ -788,6 +712,435 @@ class Converter:
             finally:
                 os.chdir(self.original_cwd)
         self.do_window_mode()
+
+
+# ============================================================================
+# Screen Classes
+# ============================================================================
+
+class RmbloatScreen(Screen):
+    """Base screen class for rmbloat video converter"""
+    app: 'Converter'  # Type hint for IDE
+
+    def screen_escape_ACTION(self):
+        """ESC key - Return to previous screen"""
+        if self.app.stack.curr.num != SELECT_ST:
+            self.app.stack.pop()
+    
+    def help_mode_ACTION(self):
+        """? - enter help mode"""
+        app = self.app
+        if app.stack.curr.num != HELP_ST:
+            app.stack.push(HELP_ST, app.win.pick_pos)
+    
+    def history_ACTION(self):
+        """? - enter help mode"""
+        app = self.app
+        if app.stack.curr.num in (SELECT_ST, CONVERT_ST):
+            app.stack.push(HISTORY_ST)
+
+
+
+class SelectScreen(RmbloatScreen):
+    """Video selection screen - choose which videos to convert"""
+
+    def draw_screen(self):
+        """Draw the video selection screen"""
+        app = self.app
+        win = app.win
+        spins = app.spins
+
+        app.win.set_pick_mode(True)
+
+        # Get video list and stats
+        lines, stats, co_wid = app.make_lines()
+
+        # Header line with keys
+        head = '[r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist ?;help [q]uit'
+        if app.search_re:
+            shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
+            head += f' /{shown}'
+        win.add_header(head)
+
+        # Stats header
+        cpu_status = app.cpu.get_status_string()
+        win.add_header(f'     Picked={stats.picked}/{stats.total}'
+                      f'  GB={stats.gb}({stats.delta_gb})'
+                      f'  {cpu_status}')
+
+        # Column headers
+        win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
+                      f'{"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{app.options_suffix}')
+
+        # Video list
+        for line in lines:
+            win.add_body(line)
+
+    def reset_all_ACTION(self):
+        """'r' key - Reset all checkboxes"""
+        app = self.app
+        for vid in app.visible_vids:
+            if vid and vid.doit_auto.startswith('['):
+                vid.doit = '[ ]'
+
+    def init_all_ACTION(self):
+        """'i' key - Initialize all to auto state"""
+        app = self.app
+        for vid in app.visible_vids:
+            if vid:
+                vid.doit = vid.doit_auto
+
+    def toggle_ACTION(self):
+        """Space key - Toggle current line state"""
+        app = self.app
+        idx = app.win.pick_pos
+        if 0 <= idx < len(app.visible_vids):
+            vid = app.visible_vids[idx]
+            if vid:
+                app.toggle_doit(vid)
+                app.win.pick_pos += 1
+
+    def skip_ACTION(self):
+        """'s' key - Skip/unskip current video"""
+        app = self.app
+        win = app.win
+        idx = win.pick_pos
+        if 0 <= idx < len(app.visible_vids):
+            vid = app.visible_vids[idx]
+            if vid:
+                if vid.doit.startswith(('[', 'DUN')):
+                    vid.doit = '---'
+                    app.probe_cache.set_anomaly(vid.filepath, '---')
+                elif vid.doit == '---':
+                    if vid.doit_auto == '---':
+                        vid.doit_auto = '[ ]'
+                    vid.doit = vid.doit_auto
+                    app.probe_cache.set_anomaly(vid.filepath, None)
+                win.pick_pos += 1
+
+    def go_ACTION(self):
+        """'g' key - Go to convert screen"""
+        app = self.app
+
+        # Collect checked videos
+        app.todo_vids = []
+        for vid in app.vids:
+            if vid.doit == '[X]':
+                app.todo_vids.append(vid)
+
+        if app.todo_vids:
+            # Create JobHandler when entering convert screen
+            app.job_handler = JobHandler(
+                app.opts,
+                app.chooser,
+                app.probe_cache,
+                auto_mode_enabled=app.auto_mode_enabled
+            )
+            app.stack.push(CONVERT_ST, app.win.pick_pos)
+
+    def quit_ACTION(self):
+        """'q' key - Quit application"""
+        sys.exit(0)
+
+
+class ConvertScreen(RmbloatScreen):
+    """Conversion progress screen - shows encoding progress"""
+
+    def draw_screen(self):
+        """Draw the conversion progress screen"""
+        app = self.app
+        win = app.win
+        spins = app.spins
+
+        app.win.set_pick_mode(False)
+
+        # Get video list and stats
+        lines, stats, co_wid = app.make_lines()
+
+        # Header line with keys
+        head = ' [s]kip ?=help [q]uit'
+        if app.search_re:
+            shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
+            head += f' /{shown}'
+
+        cpu_status = app.cpu.get_status_string()
+        head += (f'     ToDo={stats.total-stats.done}/{stats.total}'
+                f'  GB={stats.gb}({stats.delta_gb})'
+                f'  {cpu_status}')
+        win.add_header(head)
+
+        # Column headers
+        win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
+                      f'{"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{app.options_suffix}')
+
+        # Set scroll position to show current job
+        win.pick_pos = stats.progress_idx
+        win.scroll_pos = stats.progress_idx - win.scroll_view_size + 2
+
+        # Video list
+        for line in lines:
+            win.add_body(line)
+
+    def skip_ACTION(self):
+        """'s' key - Skip current conversion job"""
+        app = self.app
+        if app.job:
+            vid = app.job.vid
+            app.job.ffsubproc.stop()
+            app.job = None
+            vid.doit = '---'
+            app.probe_cache.set_anomaly(vid.filepath, '---')
+
+    def quit_ACTION(self):
+        """'q' key - Return to select screen (stop conversions)"""
+        app = self.app
+        if app.job:
+            app.job.ffsubproc.stop()
+            app.job.vid.doit = '[X]'
+            app.job = None
+
+        # Disable auto mode when user interrupts
+        if app.auto_mode_enabled:
+            app.auto_mode_enabled = False
+            app.options_suffix = app.build_options_suffix()
+
+        app.stack.pop()
+
+
+class HelpScreen(RmbloatScreen):
+    """Help screen showing keyboard shortcuts"""
+
+    def draw_screen(self):
+        """Draw the help screen"""
+        app = self.app
+        app.spinner.show_help_nav_keys(app.win)
+        app.spinner.show_help_body(app.win)
+
+class HistoryScreen(RmbloatScreen):
+    """History screen showing log entries with expand/collapse functionality"""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.expands = {}  # Maps entry index -> expansion state (0=collapsed, 1=partial, 2=full)
+        self.entries = []  # Cached log entries (all entries before filtering)
+        self.filtered_entries = []  # Entries after search filtering
+        self.visible_lines = []  # Maps display line index -> entry index (None for expanded/blank lines)
+        self.window = None  # Window of log entries (OrderedDict)
+        self.window_state = None  # Window state for incremental reads
+        self.search_matches = {}  # Maps entry index -> True if deep match found in JSON
+
+        # Setup search bar
+        self.search_bar = IncrementalSearchBar(
+            on_change=self._on_search_change,
+            on_accept=self._on_search_accept,
+            on_cancel=self._on_search_cancel
+        )
+
+    def _on_search_change(self, text):
+        """Called when search text changes - filter entries incrementally."""
+        self._filter_entries(text)
+
+    def _on_search_accept(self, text):
+        """Called when ENTER pressed in search - keep filter active, exit input mode."""
+        self.app.win.passthrough_mode = False
+        # Filter remains active - just exit typing mode
+
+    def _on_search_cancel(self, original_text):
+        """Called when ESC pressed in search - restore and exit search mode."""
+        self._filter_entries(original_text)
+        self.app.win.passthrough_mode = False
+
+    def _filter_entries(self, search_text):
+        """Filter entries based on search text (shallow or deep)."""
+        if not search_text:
+            self.filtered_entries = self.entries
+            self.search_matches = {}
+            return
+
+        # Deep search mode if starts with /
+        deep_search = search_text.startswith('/')
+        pattern = search_text[1:] if deep_search else search_text
+
+        if not pattern:
+            self.filtered_entries = self.entries
+            self.search_matches = {}
+            return
+
+        # Case-insensitive search
+        pattern_lower = pattern.lower()
+
+        filtered = []
+        matches = {}
+
+        for idx, entry in enumerate(self.entries):
+            # Extract visible text (what shows in collapsed view)
+            timestamp = entry.timestamp[:19]
+            level = entry.level if hasattr(entry, 'level') else "???"
+
+            # Get filebase
+            filebase = None
+            json_str = None
+            try:
+                msg = entry.message if entry.message else ""
+                if '{' in msg:
+                    json_start = msg.index('{')
+                    json_str = msg[json_start:]
+                    data = json.loads(json_str)
+                    filebase = data.get('filebase', data.get('file', None))
+            except (json.JSONDecodeError, ValueError, AttributeError, KeyError):
+                pass
+
+            if not filebase:
+                if entry.message:
+                    filebase = entry.message[:70]
+                else:
+                    filebase = f"{entry.file}:{entry.line} {entry.function}()"
+
+            # Shallow search: check visible text
+            visible_text = f"{timestamp} {level} {filebase}".lower()
+            shallow_match = pattern_lower in visible_text
+
+            # Deep search: also check JSON content
+            deep_match = False
+            if deep_search and json_str:
+                deep_match = pattern_lower in json_str.lower()
+
+            if shallow_match or deep_match:
+                filtered.append(entry)
+                if deep_match and not shallow_match:
+                    matches[idx] = True  # Mark as deep-only match
+
+        self.filtered_entries = filtered
+        self.search_matches = matches
+
+    def draw_screen(self):
+        """Draw the history screen"""
+        app = self.app
+        win = app.win
+        win.set_pick_mode(True)
+
+        # Get window of log entries (chronological order - eldest to youngest)
+        if self.window is None:
+            self.window, self.window_state = lg.get_window_of_entries(window_size=1000)
+        else:
+            # Refresh window with any new entries
+            self.window, self.window_state = lg.refresh_window(self.window, self.window_state, window_size=1000)
+
+        # Convert to list in reverse order (newest first for display)
+        self.entries = list(reversed(list(self.window.values())))
+
+        # Apply search filter if active
+        if not self.search_bar.text:
+            self.filtered_entries = self.entries
+            self.search_matches = {}
+
+        # Count errors vs others in filtered results
+        err_count = sum(1 for e in self.filtered_entries if e.level == 'ERR')
+        other_count = len(self.filtered_entries) - err_count
+
+        # Build search display string
+        search_display = self.search_bar.get_display_string(prefix='Search:', suffix='')
+
+        # Header
+        header_line = f'ESC:return [e]xpand/collapse [/]search  Entries: {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} other:{other_count})'
+        if search_display:
+            header_line += f'  {search_display}'
+        win.add_header(header_line)
+        win.add_header(f'Log file: {lg.log_file}')
+
+        # Build display
+        self.visible_lines = []
+        for idx, entry in enumerate(self.filtered_entries):
+            # Get original index for tracking expands and deep matches
+            orig_idx = self.entries.index(entry) if entry in self.entries else idx
+
+            # Extract filebase from message JSON
+            filebase = None
+            json_str = None
+
+            # Parse the JSON from the message
+            try:
+                # The message may contain "RE-ENCODE-TO-H265 {json...}" or similar
+                # Extract just the JSON part
+                msg = entry.message if entry.message else ""
+                if '{' in msg:
+                    json_start = msg.index('{')
+                    json_str = msg[json_start:]
+                    data = json.loads(json_str)
+                    filebase = data.get('filebase', data.get('file', None))
+            except (json.JSONDecodeError, ValueError, AttributeError, KeyError):
+                pass
+
+            # If no filebase from JSON, use the message itself (truncated)
+            if not filebase:
+                if entry.message:
+                    filebase = entry.message[:70]
+                else:
+                    filebase = f"{entry.file}:{entry.line} {entry.function}()"
+
+            # Show timestamp, level, and filebase
+            timestamp = entry.timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
+            level = entry.level if hasattr(entry, 'level') else "???"
+
+            # Add deep match indicator if this entry matched only in JSON
+            deep_indicator = " *" if orig_idx in self.search_matches else ""
+
+            line = f"{timestamp} [{level:>3}] {filebase}{deep_indicator}"
+            win.add_body(line)
+            self.visible_lines.append(orig_idx)
+
+            # Handle expansion
+            expand_state = self.expands.get(orig_idx, 0)
+            if expand_state > 0 and json_str:
+                # Format JSON nicely
+                try:
+                    data = json.loads(json_str)
+                    formatted = json.dumps(data, indent=2)
+                    lines = formatted.split('\n')
+
+                    if expand_state == 1:  # Partial: first 10 and last 10
+                        if len(lines) <= 20:
+                            display_lines = lines
+                        else:
+                            display_lines = lines[:10] + ['  ...'] + lines[-10:]
+                    else:  # expand_state == 2: Full
+                        display_lines = lines
+
+                    for line in display_lines:
+                        win.add_body(f"  {line}")
+                        self.visible_lines.append(None)  # Placeholder for expanded lines
+
+                except (json.JSONDecodeError, ValueError):
+                    win.add_body("  (invalid JSON)")
+                    self.visible_lines.append(None)
+
+            # Empty line between entries
+            win.add_body("")
+            self.visible_lines.append(None)
+
+    def expand_ACTION(self):
+        """'e' key - Expand/collapse current entry"""
+        app = self.app
+        win = app.win
+        idx = win.pick_pos
+
+        if 0 <= idx < len(self.visible_lines):
+            entry_idx = self.visible_lines[idx]
+            if entry_idx is not None:
+                # Cycle through expansion states: 0 (collapsed) -> 1 (partial) -> 2 (full) -> 0
+                current = self.expands.get(entry_idx, 0)
+                next_state = (current + 1) % 3
+                if next_state == 0:
+                    # Back to collapsed, remove from dict
+                    if entry_idx in self.expands:
+                        del self.expands[entry_idx]
+                else:
+                    self.expands[entry_idx] = next_state
+    
+    def hist_search_ACTION(self):
+        """ Handle '/' key - start incremental filter search """
+        self.search_bar.start("")
+        self.app.win.passthrough_mode = True
 
 
 def main(args=None):

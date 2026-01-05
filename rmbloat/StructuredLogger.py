@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Structured Logger with JSON Lines format and fast indexing for TUI display.
+Structured Logger with JSON Lines format and weighted-age trimming.
+ERR entries age 10x slower than other entries, so they persist longer.
 """
 import os
 import sys
 import json
-import gzip
 import inspect
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass, asdict, field
-from typing import Optional, List, Dict, Any, Set, Tuple
-import mmap
-from collections import defaultdict
+from typing import Optional, List, Dict, Any
 
 # ============================================================================
 # Data Classes for Structured Logging
@@ -31,36 +29,29 @@ class LogEntry:
     data: Dict[str, Any] = field(default_factory=dict)
     session_id: str = ""
     _raw: str = ""  # Original raw message
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         result = asdict(self)
         # Remove private fields
         result.pop('_raw', None)
         return result
-    
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> 'LogEntry':
+        """Safely create LogEntry from dict, filtering unknown fields."""
+        # Only extract known fields to avoid TypeError from extra fields
+        known_fields = {
+            'timestamp', 'level', 'file', 'line', 'function',
+            'module', 'message', 'data', 'session_id'
+        }
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return LogEntry(**filtered)
+
     @property
     def location(self) -> str:
         """Short location string for display."""
         return f"{self.file}:{self.line}"
-
-@dataclass
-class LogIndexEntry:
-    """Lightweight index entry for fast TUI display."""
-    position: int  # Byte position in file
-    timestamp: str
-    level: str
-    file: str
-    line: int
-    function: str
-    message_preview: str
-    data_size: int = 0  # Size of data field in bytes
-    
-    def summary_line(self, show_time: bool = True) -> str:
-        """Create a summary line for TUI display."""
-        time_part = f"{self.timestamp[11:19]} " if show_time else ""
-        preview = self.message_preview[:40] + "..." if len(self.message_preview) > 40 else self.message_preview
-        return f"{time_part}[{self.level}] {self.file}:{self.line} {preview}"
 
 # ============================================================================
 # Main Logger Class
@@ -68,25 +59,25 @@ class LogIndexEntry:
 
 class StructuredLogger:
     """
-    Structured logger using JSON Lines format with separate error/event files
-    and fast indexing for TUI display.
+    Structured logger using JSON Lines format with single log file
+    and weighted-age trimming (ERR entries age 10x slower).
     """
-    
+
     # Size limits (adjust as needed)
-    MAX_EVENTS_SIZE = 10 * 1024 * 1024  # 10 MB
-    MAX_ERRORS_SIZE = 5 * 1024 * 1024   # 5 MB
-    TRIM_RATIO = 0.33  # Cut by 1/3 when trimming
-    
+    MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
+    TRIM_TO_RATIO = 0.67  # Trim to 67% when max exceeded
+    ERR_AGE_WEIGHT = 10  # ERR entries age 10x slower
+
     # Compression for archived logs
     COMPRESS_ARCHIVES = True
     ARCHIVE_DAYS_TO_KEEP = 30
-    
-    def __init__(self, app_name: str = 'my_app', 
+
+    def __init__(self, app_name: str = 'rmbloat',
                  log_dir: Optional[Path] = None,
                  session_id: str = ""):
         """
         Initialize the structured logger.
-        
+
         Args:
             app_name: Application name for log directory
             log_dir: Optional override for log directory
@@ -95,18 +86,10 @@ class StructuredLogger:
         self.app_name = app_name
         self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         self._setup_paths(log_dir)
-        
-        # In-memory indices for fast TUI access
-        self.events_index: List[LogIndexEntry] = []
-        self.errors_index: List[LogIndexEntry] = []
-        
-        # Load existing indices
-        self._build_indices()
-        
+
         # Statistics
         self.stats = {
-            'events_written': 0,
-            'errors_written': 0,
+            'entries_written': 0,
             'last_trim': datetime.now()
         }
     
@@ -117,25 +100,23 @@ class StructuredLogger:
                 base_dir = Path(log_dir)
             else:
                 base_dir = Path.home() / '.config'
-            
+
             # Create app-specific directory
             self.log_dir = base_dir / self.app_name
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Main log files (JSON Lines format)
-            self.events_file = self.log_dir / "events.jsonl"
-            self.errors_file = self.log_dir / "errors.jsonl"
+
+            # Single log file (JSON Lines format)
+            self.log_file = self.log_dir / "events.jsonl"
 
             # Archive directory
             self.archive_dir = self.log_dir / "archive"
             self.archive_dir.mkdir(exist_ok=True)
-            
+
         except Exception as e:
             print(f"FATAL: Cannot setup log directory: {e}", file=sys.stderr)
             # Fallback to current directory
             self.log_dir = Path.cwd()
-            self.events_file = Path("events.jsonl")
-            self.errors_file = Path("errors.jsonl")
+            self.log_file = Path("events.jsonl")
             self.archive_dir = Path("archive")
     
     def _get_caller_info(self, depth: int = 3) -> tuple:
@@ -178,205 +159,117 @@ class StructuredLogger:
             _raw=message
         )
     
-    def _create_index_entry(self, entry: LogEntry, position: int) -> LogIndexEntry:
-        """Create an index entry from a log entry."""
-        return LogIndexEntry(
-            position=position,
-            timestamp=entry.timestamp,
-            level=entry.level,
-            file=entry.file,
-            line=entry.line,
-            function=entry.function,
-            message_preview=entry.message[:50],
-            data_size=len(json.dumps(entry.data)) if entry.data else 0
-        )
-    
-    def _append_jsonl(self, file_path: Path, entry: LogEntry, 
-                     max_size: int, is_error: bool = False) -> None:
+    def _append_log(self, entry: LogEntry) -> None:
         """
-        Append entry to JSONL file, trimming if necessary.
-        
+        Append entry to log file, trimming if necessary.
+
         Args:
-            file_path: Path to JSONL file
             entry: Log entry to append
-            max_size: Maximum file size before trimming
-            is_error: Whether this is an error log (different trimming)
         """
         # Check if we need to trim
-        if file_path.exists() and file_path.stat().st_size >= max_size:
-            self._trim_jsonl_file(file_path, max_size, is_error)
-        
+        if self.log_file.exists() and self.log_file.stat().st_size >= self.MAX_LOG_SIZE:
+            self._trim_log_file()
+
         # Write the entry
         try:
-            with open(file_path, 'a', encoding='utf-8') as f:
-                position = f.tell()
+            with open(self.log_file, 'a', encoding='utf-8') as f:
                 json_line = json.dumps(entry.to_dict())
                 f.write(json_line + '\n')
-            
-            # Update in-memory index
-            index_entry = self._create_index_entry(entry, position)
-            if is_error:
-                self.errors_index.append(index_entry)
-                self.stats['errors_written'] += 1
-            else:
-                self.events_index.append(index_entry)
-                self.stats['events_written'] += 1
+
+            self.stats['entries_written'] += 1
 
         except Exception as e:
             print(f"LOG WRITE ERROR: {e}", file=sys.stderr)
 
-    def _trim_jsonl_file(self, file_path: Path, max_size: int, 
-                        is_error: bool = False) -> None:
+    def _trim_log_file(self) -> None:
         """
-        Trim JSONL file by removing oldest complete entries.
-        
-        Args:
-            file_path: Path to JSONL file
-            max_size: Maximum allowed size
-            is_error: Whether this is an error file (different behavior)
+        Trim log file by removing oldest entries (by weighted age) until size < MAX_LOG_SIZE * TRIM_TO_RATIO.
+        ERR entries have age/ERR_AGE_WEIGHT, so they're kept longer.
         """
-        if not file_path.exists():
+        if not self.log_file.exists():
             return
-        
-        current_size = file_path.stat().st_size
-        if current_size <= max_size:
-            return
-        
+
         try:
-            # Read all lines
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # Calculate how many lines to remove (keep newest)
-            target_size = int(len(lines) * (1 - self.TRIM_RATIO))
-            if target_size < 1:
-                target_size = 1
-            
-            # Keep only the newest lines
-            trimmed_lines = lines[-target_size:]
-            
-            # Write back
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(trimmed_lines)
-            
-            # Archive the removed lines if they contain errors
-            if is_error and len(lines) > target_size:
-                self._archive_entries(lines[:-target_size], is_error=True)
-            
-            # Rebuild index for this file
-            self._rebuild_file_index(file_path, is_error)
-            
-            self.stats['last_trim'] = datetime.now()
-            
-        except Exception as e:
-            print(f"TRIM ERROR for {file_path}: {e}", file=sys.stderr)
-    
-    def _archive_entries(self, lines: List[str], is_error: bool = False) -> None:
-        """Archive old log entries."""
-        if not lines:
-            return
-        
-        # Create archive filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_type = "errors" if is_error else "events"
-        archive_name = f"{archive_type}_{timestamp}.jsonl"
-        
-        if self.COMPRESS_ARCHIVES:
-            archive_name += ".gz"
-            archive_path = self.archive_dir / archive_name
-            
-            try:
-                with gzip.open(archive_path, 'wt', encoding='utf-8') as f:
-                    f.writelines(lines)
-            except Exception:
-                pass  # Non-critical
-        else:
-            archive_path = self.archive_dir / archive_name
-            try:
-                with open(archive_path, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-            except Exception:
-                pass
-        
-        # Clean old archives
-        self._clean_old_archives()
-    
-    def _clean_old_archives(self) -> None:
-        """Remove archive files older than ARCHIVE_DAYS_TO_KEEP."""
-        cutoff = datetime.now() - timedelta(days=self.ARCHIVE_DAYS_TO_KEEP)
-        
-        for archive_file in self.archive_dir.glob("*.jsonl*"):
-            try:
-                if archive_file.stat().st_mtime < cutoff.timestamp():
-                    archive_file.unlink()
-            except Exception:
-                pass
-    
-    def _build_indices(self) -> None:
-        """Build in-memory indices from log files."""
-        self._build_file_index(self.events_file, is_error=False)
-        self._build_file_index(self.errors_file, is_error=True)
-    
-    def _build_file_index(self, file_path: Path, is_error: bool) -> None:
-        """Build index for a specific file."""
-        if not file_path.exists():
-            return
-        
-        index = []
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                position = 0
-                for line in f:
+            # Read all entries
+            entries = []  # (timestamp, level, line, line_size)
+            with open(self.log_file, 'r', encoding='utf-8') as f:
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
                     if line.strip():
                         try:
-                            entry_dict = json.loads(line)
-                            # Convert back to LogEntry structure
-                            entry = LogEntry(**entry_dict)
-                            index_entry = self._create_index_entry(entry, position)
-                            index.append(index_entry)
-                        except json.JSONDecodeError:
-                            pass
-                    position = f.tell()
+                            data = json.loads(line)
+                            timestamp = datetime.fromisoformat(data['timestamp'])
+                            level = data.get('level', 'OK')
+                            line_size = len(line.encode('utf-8'))
+                            entries.append((timestamp, level, line, line_size))
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            pass  # Skip malformed entries
+
+            # Calculate effective age for each entry
+            now = datetime.now()
+            weighted = []  # (effective_age_seconds, line, line_size)
+            for timestamp, level, line, line_size in entries:
+                age_seconds = (now - timestamp).total_seconds()
+                # ERRs age slower (kept longer)
+                effective_age = age_seconds / self.ERR_AGE_WEIGHT if level == 'ERR' else age_seconds
+                weighted.append((effective_age, line, line_size))
+
+            # Sort by effective age (oldest first)
+            weighted.sort(key=lambda x: x[0])
+
+            # Target: keep newest entries until total size <= MAX_LOG_SIZE * TRIM_TO_RATIO
+            target_size = int(self.MAX_LOG_SIZE * self.TRIM_TO_RATIO)
+            kept = []
+            total_size = 0
+
+            # Work backwards (newest first) until we hit target
+            for effective_age, line, line_size in reversed(weighted):
+                if total_size + line_size <= target_size:
+                    kept.append(line)
+                    total_size += line_size
+                # else: discard (too old with weighted age)
+
+            # Write back (reverse to restore chronological order)
+            kept.reverse()
+            with open(self.log_file, 'w', encoding='utf-8') as f:
+                f.writelines(kept)
+
+            self.stats['last_trim'] = datetime.now()
+
         except Exception as e:
-            print(f"INDEX BUILD ERROR for {file_path}: {e}", file=sys.stderr)
-        
-        if is_error:
-            self.errors_index = index
-        else:
-            self.events_index = index
+            print(f"TRIM ERROR: {e}", file=sys.stderr)
     
-    def _rebuild_file_index(self, file_path: Path, is_error: bool) -> None:
-        """Rebuild index for a file after trimming."""
-        self._build_file_index(file_path, is_error)
     
     # ========================================================================
     # Public API
     # ========================================================================
-    
+
     def event(self, *args, data: Optional[Dict] = None, **kwargs) -> None:
         """Log an event (successful operation)."""
         entry = self._create_log_entry("OK", *args, data=data, **kwargs)
-        self._append_jsonl(self.events_file, entry, self.MAX_EVENTS_SIZE, is_error=False)
-    
+        self._append_log(entry)
+
     def error(self, *args, data: Optional[Dict] = None, **kwargs) -> None:
         """Log an error."""
         entry = self._create_log_entry("ERR", *args, data=data, **kwargs)
-        self._append_jsonl(self.errors_file, entry, self.MAX_ERRORS_SIZE, is_error=True)
-        
+        self._append_log(entry)
+
         # Also print to stderr for immediate visibility
         print(f"ERROR: {args[0] if args else ''}", file=sys.stderr)
         if data:
             print(f"  Data: {json.dumps(data, indent=2)[:200]}...", file=sys.stderr)
-    
+
     def info(self, *args, data: Optional[Dict] = None, **kwargs) -> None:
         """Log informational message."""
         entry = self._create_log_entry("MSG", *args, data=data, **kwargs)
-        self._append_jsonl(self.events_file, entry, self.MAX_EVENTS_SIZE, is_error=False)
-    
+        self._append_log(entry)
+
     def debug(self, *args, data: Optional[Dict] = None, **kwargs) -> None:
         """Log debug message."""
         entry = self._create_log_entry("DBG", *args, data=data, **kwargs)
-        self._append_jsonl(self.events_file, entry, self.MAX_EVENTS_SIZE, is_error=False)
+        self._append_log(entry)
 
     # ========================================================================
     # Backward Compatibility Aliases (for RotatingLogger API)
@@ -425,319 +318,120 @@ class StructuredLogger:
         # Create entry with custom level
         entry = self._create_log_entry(str(message_type).upper(), *args,
                                       data=kwargs.get('data'), **kwargs)
-        self._append_jsonl(self.events_file, entry, self.MAX_EVENTS_SIZE, is_error=False)
+        self._append_log(entry)
 
     # ========================================================================
-    # Query Methods
+    # Query Methods - Window-based for efficient incremental reads
     # ========================================================================
 
-    def get_errors(self, limit: int = 100) -> List[LogEntry]:
-        """Get recent error entries."""
-        return self._get_entries(self.errors_file, self.errors_index, limit)
-    
-    def get_events(self, limit: int = 100) -> List[LogEntry]:
-        """Get recent event entries."""
-        return self._get_entries(self.events_file, self.events_index, limit)
-    
-    def _get_entries(self, file_path: Path, index: List[LogIndexEntry], 
-                    limit: int) -> List[LogEntry]:
-        """Get entries from file using index."""
-        results = []
-        if not file_path.exists():
-            return results
-        
+    def get_window_of_entries(self, window_size: int = 1000):
+        """
+        Get a window of log entries (newest first).
+        Returns: (entries_dict, window_state)
+            entries_dict: OrderedDict keyed by timestamp
+            window_state: dict with 'file_size' and 'last_position'
+        """
+        from collections import OrderedDict
+
+        entries = OrderedDict()
+        if not self.log_file.exists():
+            return entries, {'file_size': 0, 'last_position': 0}
+
+        file_size = self.log_file.stat().st_size
+
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                # Get last 'limit' entries from index
-                for idx_entry in index[-limit:]:
-                    f.seek(idx_entry.position)
+            with open(self.log_file, 'r', encoding='utf-8') as f:
+                while True:
                     line = f.readline()
-                    if line:
+                    if not line:
+                        break
+                    if line.strip():
                         try:
                             entry_dict = json.loads(line)
-                            results.append(LogEntry(**entry_dict))
-                        except json.JSONDecodeError:
-                            pass
-        except Exception as e:
-            print(f"READ ERROR for {file_path}: {e}", file=sys.stderr)
-        
-        return results
-    
-    def search(self, level: Optional[str] = None, 
-               file: Optional[str] = None,
-               function: Optional[str] = None,
-               after: Optional[datetime] = None,
-               before: Optional[datetime] = None,
-               limit: int = 50) -> List[LogEntry]:
-        """Search across both error and event logs."""
-        all_entries = []
-        
-        # Search errors
-        all_entries.extend(self._search_file(self.errors_file, self.errors_index, 
-                                           level, file, function, after, before))
-        # Search events
-        all_entries.extend(self._search_file(self.events_file, self.events_index,
-                                           level, file, function, after, before))
-        
-        # Sort by timestamp
-        all_entries.sort(key=lambda x: x.timestamp, reverse=True)
-        
-        return all_entries[:limit]
-    
-    def _search_file(self, file_path: Path, index: List[LogIndexEntry],
-                    level: Optional[str], file: Optional[str],
-                    function: Optional[str], after: Optional[datetime],
-                    before: Optional[datetime]) -> List[LogEntry]:
-        """Search a specific file."""
-        results = []
-        if not file_path.exists():
-            return results
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for idx_entry in index:
-                    # Apply filters to index first (fast)
-                    if level and idx_entry.level != level:
-                        continue
-                    if file and file not in idx_entry.file:
-                        continue
-                    if function and function != idx_entry.function:
-                        continue
-                    
-                    # Read the actual entry
-                    f.seek(idx_entry.position)
-                    line = f.readline()
-                    if line:
-                        try:
-                            entry_dict = json.loads(line)
-                            entry = LogEntry(**entry_dict)
-                            
-                            # Apply timestamp filters
-                            entry_time = datetime.fromisoformat(entry.timestamp)
-                            if after and entry_time < after:
-                                continue
-                            if before and entry_time > before:
-                                continue
-                            
-                            results.append(entry)
-                        except json.JSONDecodeError:
+                            entry = LogEntry.from_dict(entry_dict)
+                            entries[entry.timestamp] = entry
+                        except (json.JSONDecodeError, TypeError, KeyError):
                             pass
         except Exception:
             pass
-        
-        return results
 
-# ============================================================================
-# TUI Viewer Class
-# ============================================================================
+        # Keep only newest window_size entries
+        if len(entries) > window_size:
+            # OrderedDict preserves insertion order (chronological)
+            # Keep last window_size items
+            items = list(entries.items())
+            entries = OrderedDict(items[-window_size:])
 
-class TUIStructuredLogViewer:
-    """
-    TUI viewer for structured logs with fast indexing and expandable entries.
-    """
-    
-    def __init__(self, logger: StructuredLogger):
-        self.logger = logger
-        self.current_view = "errors"  # "errors", "events", or "all"
-        self.selected_idx = 0
-        self.scroll_offset = 0
-        self.expanded_positions: Set[int] = set()
-        self.filter_level: Optional[str] = None
-        self.filter_file: Optional[str] = None
-        self.search_term: Optional[str] = None
-        
-        # Cache for expanded entries
-        self.entry_cache: Dict[int, LogEntry] = {}
-    
-    def get_current_index(self) -> List[LogIndexEntry]:
-        """Get the appropriate index for current view."""
-        if self.current_view == "errors":
-            return self.logger.errors_index
-        elif self.current_view == "events":
-            return self.logger.events_index
-        else:  # "all"
-            # Combine and sort by timestamp (most recent first)
-            combined = self.logger.errors_index + self.logger.events_index
-            return sorted(combined, key=lambda x: x.timestamp, reverse=True)
-    
-    def get_filtered_index(self) -> List[LogIndexEntry]:
-        """Get filtered index based on current filters."""
-        index = self.get_current_index()
-        
-        filtered = []
-        for entry in index:
-            if self.filter_level and entry.level != self.filter_level:
-                continue
-            if self.filter_file and self.filter_file not in entry.file:
-                continue
-            filtered.append(entry)
-        
-        return filtered
-    
-    def render(self, height: int, width: int) -> List[str]:
-        """Render log viewer interface."""
-        lines = []
-        
-        # Header
-        header = f"LOG VIEWER: {self.current_view.upper()}"
-        if self.filter_level:
-            header += f" [Level: {self.filter_level}]"
-        if self.filter_file:
-            header += f" [File: {self.filter_file}]"
-        lines.append(header)
-        lines.append("=" * min(width, 80))
-        
-        # Get filtered entries
-        filtered_index = self.get_filtered_index()
-        total_entries = len(filtered_index)
-        
-        if not filtered_index:
-            lines.append("No log entries found.")
-            return lines
-        
-        # Calculate viewport
-        start_idx = max(0, self.selected_idx - height // 2)
-        end_idx = min(total_entries, start_idx + height - 3)  # -3 for header/footer
-        
-        # Display entries
-        for i in range(start_idx, end_idx):
-            idx_entry = filtered_index[i]
-            is_selected = (i == self.selected_idx)
-            is_expanded = idx_entry.position in self.expanded_positions
-            
-            # Selection indicator
-            prefix = "▶ " if is_selected else "  "
-            
-            # Summary line
-            summary = idx_entry.summary_line(show_time=True)
-            
-            # Truncate to fit width
-            if len(summary) > width - 3:
-                summary = summary[:width - 6] + "..."
-            
-            lines.append(f"{prefix}{summary}")
-            
-            # Expanded view
-            if is_expanded:
-                entry = self._get_cached_entry(idx_entry.position)
-                if entry:
-                    # Show message
-                    msg_line = f"    Message: {entry.message}"
-                    if len(msg_line) > width:
-                        msg_line = msg_line[:width-3] + "..."
-                    lines.append(msg_line)
-                    
-                    # Show data if present
-                    if entry.data:
-                        data_str = json.dumps(entry.data, indent=2)
-                        # Show first few lines of data
-                        data_lines = data_str.split('\n')
-                        for j, data_line in enumerate(data_lines[:5]):
-                            lines.append(f"      {data_line}")
-                        if len(data_lines) > 5:
-                            lines.append(f"      ... ({len(data_lines)-5} more lines)")
-        
-        # Footer
-        lines.append("-" * min(width, 80))
-        footer = f"Entry {self.selected_idx + 1}/{total_entries}"
-        if self.expanded_positions:
-            footer += f" | {len(self.expanded_positions)} expanded"
-        lines.append(footer)
-        
-        # Help hint
-        lines.append("↑↓:Navigate  Space:Expand  E:Errors  V:Events  A:All  F:Filter  Q:Quit")
-        
-        return lines[:height]  # Ensure we don't exceed available height
-    
-    def _get_cached_entry(self, position: int) -> Optional[LogEntry]:
-        """Get entry from cache or load from file."""
-        if position in self.entry_cache:
-            return self.entry_cache[position]
-        
-        # Determine which file contains this position
-        file_path = None
-        for idx_entry in self.logger.errors_index:
-            if idx_entry.position == position:
-                file_path = self.logger.errors_file
-                break
-        
-        if not file_path:
-            for idx_entry in self.logger.events_index:
-                if idx_entry.position == position:
-                    file_path = self.logger.events_file
-                    break
-        
-        if file_path and file_path.exists():
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    f.seek(position)
+        window_state = {
+            'file_size': file_size,
+            'last_position': file_size  # Next read starts here
+        }
+
+        return entries, window_state
+
+    def refresh_window(self, window, window_state, window_size: int = 1000):
+        """
+        Refresh window with new entries from log file.
+        Returns: updated (entries_dict, window_state)
+        """
+        from collections import OrderedDict
+
+        if not self.log_file.exists():
+            return window, window_state
+
+        current_file_size = self.log_file.stat().st_size
+        last_file_size = window_state.get('file_size', 0)
+        last_position = window_state.get('last_position', 0)
+
+        # File was trimmed (size dropped), reset and re-read
+        if current_file_size < last_file_size:
+            return self.get_window_of_entries(window_size)
+
+        # No new data
+        if current_file_size == last_position:
+            return window, window_state
+
+        # Read new entries from last position
+        try:
+            with open(self.log_file, 'r', encoding='utf-8') as f:
+                f.seek(last_position)
+                while True:
                     line = f.readline()
-                    if line:
-                        entry_dict = json.loads(line)
-                        entry = LogEntry(**entry_dict)
-                        self.entry_cache[position] = entry
-                        return entry
-            except Exception:
-                pass
-        
-        return None
-    
-    def move_selection(self, delta: int) -> None:
-        """Move selection up or down."""
-        filtered_index = self.get_filtered_index()
-        if not filtered_index:
-            return
-        
-        new_idx = self.selected_idx + delta
-        if 0 <= new_idx < len(filtered_index):
-            self.selected_idx = new_idx
-            
-            # Auto-scroll
-            if delta > 0 and self.selected_idx >= self.scroll_offset + 10:
-                self.scroll_offset += 1
-            elif delta < 0 and self.selected_idx < self.scroll_offset:
-                self.scroll_offset = max(0, self.scroll_offset - 1)
-    
-    def toggle_expand(self) -> None:
-        """Expand or collapse selected entry."""
-        filtered_index = self.get_filtered_index()
-        if not filtered_index or self.selected_idx >= len(filtered_index):
-            return
-        
-        idx_entry = filtered_index[self.selected_idx]
-        if idx_entry.position in self.expanded_positions:
-            self.expanded_positions.remove(idx_entry.position)
-            # Clear from cache if not used elsewhere
-            if idx_entry.position in self.entry_cache:
-                del self.entry_cache[idx_entry.position]
-        else:
-            self.expanded_positions.add(idx_entry.position)
-    
-    def set_view(self, view_type: str) -> None:
-        """Switch between error, event, or all views."""
-        if view_type in ["errors", "events", "all"]:
-            self.current_view = view_type
-            self.selected_idx = 0
-            self.scroll_offset = 0
-            self.expanded_positions.clear()
-            self.entry_cache.clear()
-    
-    def set_filter(self, level: Optional[str] = None, 
-                  file: Optional[str] = None) -> None:
-        """Set filters for log display."""
-        self.filter_level = level
-        self.filter_file = file
-        self.selected_idx = 0
-        self.scroll_offset = 0
-        self.expanded_positions.clear()
-    
-    def clear_filters(self) -> None:
-        """Clear all filters."""
-        self.filter_level = None
-        self.filter_file = None
-        self.search_term = None
-        self.selected_idx = 0
-        self.scroll_offset = 0
+                    if not line:
+                        break
+                    if line.strip():
+                        try:
+                            entry_dict = json.loads(line)
+                            entry = LogEntry.from_dict(entry_dict)
+                            window[entry.timestamp] = entry
+                        except (json.JSONDecodeError, TypeError, KeyError):
+                            pass
+
+                new_position = f.tell()
+        except Exception:
+            new_position = last_position
+
+        # Trim window if too large (keep newest)
+        if len(window) > window_size:
+            items = list(window.items())
+            window = OrderedDict(items[-window_size:])
+
+        window_state = {
+            'file_size': current_file_size,
+            'last_position': new_position
+        }
+
+        return window, window_state
+
+    # ========================================================================
+    # Properties
+    # ========================================================================
+
+    @property
+    def log_paths(self) -> List[str]:
+        """Return list of log file paths (for backward compatibility with -L option)."""
+        return [str(self.log_file)]
+
 
 # ============================================================================
 # Aliases for Backward Compatibility
@@ -752,20 +446,19 @@ Log = StructuredLogger
 
 def example_usage():
     """Example of how to use the structured logger."""
-    
+
     # Create logger
     logger = StructuredLogger(
         app_name="VideoProcessor",
         session_id="session_12345"
     )
-    
+
     print(f"Logs will be written to: {logger.log_dir}")
-    print(f"Events file: {logger.events_file}")
-    print(f"Errors file: {logger.errors_file}")
-    
+    print(f"Log file: {logger.log_file}")
+
     # Log some events
     logger.info("Starting video processing batch")
-    
+
     # Simulate processing
     for i in range(5):
         if i == 2:
@@ -791,36 +484,17 @@ def example_usage():
                     "duration_seconds": 120.5
                 }
             )
-    
+
     logger.info("Batch processing complete")
-    
-    # Demonstrate TUI viewer
+
+    # Get recent entries programmatically using window
     print("\n" + "="*60)
-    print("TUI Viewer Simulation")
-    print("="*60)
-    
-    viewer = TUIStructuredLogViewer(logger)
-    
-    # Show errors view
-    viewer.set_view("errors")
-    print("\nErrors View (simulated):")
-    for line in viewer.render(height=20, width=80):
-        print(line)
-    
-    # Show expanded view
-    viewer.toggle_expand()
-    print("\nExpanded Error View:")
-    for line in viewer.render(height=20, width=80):
-        print(line)
-    
-    # Get recent errors programmatically
-    print("\n" + "="*60)
-    print("Recent Errors (programmatic access):")
-    recent_errors = logger.get_errors(limit=3)
-    for error in recent_errors:
-        print(f"{error.timestamp} [{error.level}] {error.location}: {error.message}")
-        if error.data:
-            print(f"  Data keys: {list(error.data.keys())}")
+    print("Recent Log Entries (window-based access):")
+    window, _ = logger.get_window_of_entries(window_size=10)
+    for _, entry in window.items():
+        print(f"{entry.timestamp} [{entry.level}] {entry.location}: {entry.message}")
+        if entry.data:
+            print(f"  Data keys: {list(entry.data.keys())}")
 
 if __name__ == "__main__":
     example_usage()
