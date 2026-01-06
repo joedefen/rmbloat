@@ -53,6 +53,76 @@ class LogEntry:
         """Short location string for display."""
         return f"{self.file}:{self.line}"
 
+    @property
+    def display_summary(self) -> str:
+        """
+        Extract display-friendly summary from message.
+
+        If message contains JSON with 'filebase' or 'filepath', use that.
+        Otherwise return truncated message or location.
+        """
+        if not self.message:
+            return f"{self.file}:{self.line} {self.function}()"
+
+        # Try to extract filebase from JSON in message
+        if '{' in self.message:
+            try:
+                json_start = self.message.index('{')
+                json_str = self.message[json_start:]
+                data = json.loads(json_str)
+                filebase = data.get('filebase', data.get('filepath', None))
+                if filebase:
+                    return filebase
+            except (json.JSONDecodeError, ValueError, KeyError):
+                pass
+
+        # Fall back to truncated message
+        return self.message[:70]
+
+    @staticmethod
+    def format_time_delta(seconds: float, signed: bool = False) -> str:
+        """
+        Format time delta in compact form (e.g., '18h39m', '5d3h').
+
+        Args:
+            seconds: Time difference in seconds
+            signed: If True, include '-' prefix for negative values
+
+        Returns:
+            Compact time string (e.g., '2h30m', '5d', '45s')
+        """
+        ago = int(max(0, abs(seconds)))
+        divs = (60, 60, 24, 7, 52, 9999999)
+        units = ('s', 'm', 'h', 'd', 'w', 'y')
+        vals = (ago % 60, int(ago / 60))  # seed with secs, mins
+        uidx = 1  # best units
+
+        for div in divs[1:]:
+            if vals[1] < div:
+                break
+            vals = (vals[1] % div, int(vals[1] / div))
+            uidx += 1
+
+        rv = '-' if signed and seconds < 0 else ''
+        rv += f'{vals[1]}{units[uidx]}' if vals[1] else ''
+        rv += f'{vals[0]:d}{units[uidx-1]}'
+        return rv
+
+    def format_ago(self) -> str:
+        """
+        Format this entry's timestamp as relative time (e.g., '5m', '2h39m').
+
+        Returns:
+            Compact relative time string, or '???' if timestamp is invalid
+        """
+        try:
+            ts = datetime.fromisoformat(self.timestamp)
+            now = datetime.now()
+            delta = now - ts
+            return LogEntry.format_time_delta(delta.total_seconds())
+        except (ValueError, AttributeError):
+            return "???"
+
 # ============================================================================
 # Main Logger Class
 # ============================================================================
@@ -319,6 +389,61 @@ class StructuredLogger:
         entry = self._create_log_entry(str(message_type).upper(), *args,
                                       data=kwargs.get('data'), **kwargs)
         self._append_log(entry)
+
+    # ========================================================================
+    # Filtering and Search Methods
+    # ========================================================================
+
+    @staticmethod
+    def filter_entries(entries: List[LogEntry], pattern: str,
+                      deep: bool = False) -> tuple[List[LogEntry], set]:
+        """
+        Filter log entries by pattern (case-insensitive).
+
+        Args:
+            entries: List of LogEntry objects to filter
+            pattern: Search pattern (case-insensitive)
+            deep: If True, also search within JSON data in messages
+
+        Returns:
+            (filtered_entries, deep_match_timestamps): Tuple of filtered list and
+            set of timestamps that matched only in deep (JSON) search
+        """
+        if not pattern:
+            return entries, set()
+
+        pattern_lower = pattern.lower()
+        filtered = []
+        deep_matches = set()
+
+        for entry in entries:
+            # Build visible text (what shows in collapsed view)
+            timestamp_short = entry.timestamp[:19]
+            level = entry.level
+            summary = entry.display_summary
+
+            # Shallow search: check visible text
+            visible_text = f"{timestamp_short} {level} {summary}".lower()
+            shallow_match = pattern_lower in visible_text
+
+            # Deep search: check JSON content if requested
+            deep_match = False
+            if deep and '{' in entry.message:
+                try:
+                    json_start = entry.message.index('{')
+                    json_str = entry.message[json_start:]
+                    deep_match = pattern_lower in json_str.lower()
+                except (ValueError, IndexError):
+                    pass
+
+            # Include if either match
+            if shallow_match or deep_match:
+                filtered.append(entry)
+                # Mark as deep-only match
+                if deep_match and not shallow_match:
+                    deep_matches.add(entry.timestamp)
+
+        return filtered, deep_matches
 
     # ========================================================================
     # Query Methods - Window-based for efficient incremental reads

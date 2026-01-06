@@ -267,7 +267,29 @@ class JobHandler:
 
         return False
 
-    def start_transcode_job(self, vid, bash_quote_func, retry_with_error_tolerance=False):
+    def _should_retry_with_software(self, vid):
+        """
+        Check if a failed job should be retried with software encoding.
+        Detects hardware-specific failures like filter reinitialization.
+        """
+        if vid.return_code == 0:
+            return False
+
+        # Check for filter reinitialization error (hardware can't handle dynamic changes)
+        filter_reconfig_signals = [
+            "Error reinitializing filters",
+            "Impossible to convert between the formats",
+        ]
+
+        for signal in filter_reconfig_signals:
+            for line in vid.texts:
+                if signal in line:
+                    return True
+
+        return False
+
+    def start_transcode_job(self, vid, bash_quote_func, retry_with_error_tolerance=False,
+                            force_software=False):
         """Start a transcoding job using FfmpegChooser."""
         os.chdir(os.path.dirname(vid.filepath))
         basename = os.path.basename(vid.filepath)
@@ -296,9 +318,17 @@ class JobHandler:
         job = Job(vid, orig_backup_file, temp_file, duration_secs, dry_run=self.opts.dry_run)
         job.input_file = basename
         job.is_retry = retry_with_error_tolerance
+        job.is_software_fallback = force_software
 
         # Decide on 10-bit encoding based on input pixel format
         use_10bit = self.should_use_10bit(probe.pix_fmt, probe.codec)
+
+        # Determine encoding strategy
+        # If force_software is True, override chooser's acceleration setting
+        original_use_acceleration = None
+        if force_software:
+            original_use_acceleration = self.chooser.use_acceleration
+            self.chooser.use_acceleration = False
 
         # Create namespace with defaults
         params = self.chooser.make_namespace(
@@ -361,12 +391,16 @@ class JobHandler:
         params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
 
         # For error-tolerant mode, add resolution to stabilize filter graph
-        if retry_with_error_tolerance:
+        if retry_with_error_tolerance and not force_software:
             params.width = probe.width
             params.height = probe.height
 
         # Generate the command
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
+
+        # Restore original acceleration setting if it was overridden
+        if force_software and original_use_acceleration is not None:
+            self.chooser.use_acceleration = original_use_acceleration
 
         # Store command for logging
         vid.command = bash_quote_func(ffmpeg_cmd)

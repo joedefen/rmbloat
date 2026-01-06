@@ -47,7 +47,7 @@ import curses
 from dataclasses import asdict
 from types import SimpleNamespace
 from console_window import (ConsoleWindow, OptionSpinner, Screen, ScreenStack,
-                            ConsoleWindowOpts, IncrementalSearchBar, Context)
+                            ConsoleWindowOpts, IncrementalSearchBar, Context, Theme)
 from .ProbeCache import ProbeCache
 from .VideoParser import Mangler
 from .IniManager import IniManager
@@ -67,7 +67,8 @@ SELECT_ST = 0
 CONVERT_ST = 1
 HISTORY_ST = 2
 HELP_ST = 3
-SCREEN_NAMES = ('SELECT', 'CONVERT', 'HISTORY', 'HELP')
+THEME_ST = 4
+SCREEN_NAMES = ('SELECT', 'CONVERT', 'HISTORY', 'HELP', 'THEME')
 
 # File operation functions moved to FileOps.py
 sanitize_file_paths = FileOps.sanitize_file_paths
@@ -163,14 +164,34 @@ class Converter:
         jobcnt, co_wid = 0, len('CODEC')
         stats = SimpleNamespace(total=0, picked=0, done=0, progress_idx=0,
                                 gb=0, delta_gb=0)
+        is_convert = bool(hasattr(self, 'stack') and self.stack.curr.num == CONVERT_ST)
 
         # Determine which list to use based on screen
-        vid_list = self.todo_vids if (hasattr(self, 'stack') and
-                                      self.stack.curr.num == CONVERT_ST) else self.vids
+        vid_list = self.todo_vids if is_convert else self.vids
+
+        # Get current filter setting
+        filter_mode = self.spins.filter if hasattr(self.spins, 'filter') else 'all'
 
         for vid in vid_list:
             if doit_skips and vid.doit in doit_skips:
                 continue
+
+            # Apply status filter (always show IP - in progress)
+            if vid.doit != 'IP ' and filter_mode:
+                doit = vid.doit if is_convert else vid.doit_auto
+                is_err = bool(doit in ('ERR',) or doit.startswith('Er'))
+                is_dun = bool(doit == 'DUN')
+                is_unchk = vid.doit_auto == '[ ]'
+
+                if filter_mode == '-DUN' and is_dun:
+                    continue
+                elif filter_mode == '-DUN-ERR' and (is_dun or is_err):
+                    continue
+                elif filter_mode == '-DUN-ERR-UnChk' and (is_dun or is_err or is_unchk):
+                    continue
+                elif filter_mode == '+ERR' and not is_err:
+                    continue
+
             short_list.append(vid)
             co_wid = max(co_wid, len(vid.codec))
 
@@ -190,8 +211,8 @@ class Converter:
             line += f'   {basename}'
             if self.spins.directory:
                 line += f' ---> {dirname}'
-            if self.spins.search:
-                pattern = self.spins.search
+            if self.search_re:
+                pattern = self.search_re
                 if self.spins.mangle:
                     pattern = Mangler.mangle(pattern)
                 match = re.search(pattern, line, re.IGNORECASE)
@@ -255,28 +276,64 @@ class Converter:
                 if isinstance(got, str):
                     self.job.progress = got
                 elif isinstance(got, int):
-                    # Check if we should retry with error tolerance
-                    should_retry = (got != 0 and
-                                  (not hasattr(self.job, 'is_retry') or not self.job.is_retry) and
-                                  self._should_retry_with_error_tolerance(self.job.vid))
+                    # Check if we should retry with error tolerance (2nd attempt)
+                    should_retry_tolerant = (got != 0 and
+                                            (not hasattr(self.job, 'is_retry') or not self.job.is_retry) and
+                                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
+                                            self.job_handler and
+                                            self.job_handler._should_retry_with_error_tolerance(self.job.vid))
 
-                    if should_retry:
-                        # Retry with error tolerance
-                        lg.put('WARN', 'RETRY-WITH-ERROR-TOLERANCE',
-                            f'Retrying {self.job.vid.filebase} with error tolerance flags')
+                    # Check if we should retry with software encoding (3rd attempt)
+                    should_retry_software = (got != 0 and
+                                            hasattr(self.job, 'is_retry') and self.job.is_retry and
+                                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
+                                            self.job_handler and
+                                            self.job_handler._should_retry_with_software(self.job.vid))
+
+                    if should_retry_tolerant:
+                        # Retry with error tolerance (2nd attempt)
                         vid = self.job.vid
-                        # Mark the error in probe cache before retrying
-                        self.probe_cache.set_anomaly(vid.filepath, 'Err')
+                        lg.put('WARN', 'RETRY-WITH-ERROR-TOLERANCE',
+                            f'Retrying {vid.filebase} with error tolerance flags\n' +
+                            json.dumps(asdict(vid), indent=4))
+                        # Note: Don't set anomaly here - let finish_transcode_job handle it
                         vid.doit = '[X]'  # Reset for retry
                         self.job = self.start_transcode_job(vid, retry_with_error_tolerance=True)
                         vid.doit = 'IP '
                         break  # Continue with retry job
 
+                    if should_retry_software:
+                        # Retry with software encoding (3rd attempt)
+                        vid = self.job.vid
+                        lg.put('WARN', 'RETRY-WITH-SOFTWARE',
+                            f'Retrying {vid.filebase} with software encoding (libx265)\n' +
+                            json.dumps(asdict(vid), indent=4))
+                        vid.doit = '[X]'  # Reset for retry
+                        self.job = self.start_transcode_job(vid, retry_with_error_tolerance=True,
+                                                           force_software=True)
+                        vid.doit = 'IP '
+                        break  # Continue with retry job
+
                     # Job finished (either success or final failure after retry)
-                    self.job.vid.doit = ' OK' if got == 0 else 'ERR'
+                    success = bool(got == 0)
+
+                    # Clear any 'Err' anomaly if this was a successful retry
+                    if success and hasattr(self.job, 'is_retry') and self.job.is_retry:
+                        self.probe_cache.set_anomaly(self.job.vid.filepath, None)
+
+                    # Set status with retry indicator for successful retries
+                    if success:
+                        if hasattr(self.job, 'is_software_fallback') and self.job.is_software_fallback:
+                            self.job.vid.doit = 'OK3'  # Succeeded on 3rd attempt (software fallback)
+                        elif hasattr(self.job, 'is_retry') and self.job.is_retry:
+                            self.job.vid.doit = 'OK2'  # Succeeded on 2nd attempt (error-tolerant)
+                        else:
+                            self.job.vid.doit = ' OK'  # Succeeded on 1st attempt
+                    else:
+                        self.job.vid.doit = 'ERR'
+
                     self.job.vid.doit_auto = self.job.vid.doit
-                    self.finish_transcode_job(
-                        success=bool(got == 0), job=self.job)
+                    self.finish_transcode_job(success=success, job=self.job)
                     dumped = asdict(self.job.vid)
                     # asdict() automatically handles nested Probe dataclasses
                     if got == 0:
@@ -286,6 +343,8 @@ class Converter:
                         title = 'SAMPLE'
                     elif self.opts.dry_run:
                         title = 'DRY-RUN'
+                    elif hasattr(self.job, 'is_software_fallback') and self.job.is_software_fallback:
+                        title = 'RE-ENCODE-TO-H265-SOFTWARE'
                     elif hasattr(self.job, 'is_retry') and self.job.is_retry:
                         title = 'RE-ENCODE-TO-H265-RETRY'
                     else:
@@ -419,9 +478,10 @@ class Converter:
     bash_quote = staticmethod(ConvertUtils.bash_quote)
 
     # Job handling methods delegated to JobHandler
-    def start_transcode_job(self, vid):
+    def start_transcode_job(self, vid, retry_with_error_tolerance=False, force_software=False):
         """Delegate to JobHandler"""
-        return self.job_handler.start_transcode_job(vid, self.bash_quote)
+        return self.job_handler.start_transcode_job(vid, self.bash_quote,
+                                                    retry_with_error_tolerance, force_software)
 
     def monitor_transcode_progress(self, job):
         """Delegate to JobHandler"""
@@ -534,8 +594,9 @@ class Converter:
             return 'DUN'
 
         # Files marked as OK from previous successful conversion or skip
-        if vid.doit in ('OK', '---'):
-            return 'OK'
+        # OK2/OK3 mean succeeded after retries - still done
+        if vid.doit in ('OK', 'OK2', 'OK3', ' OK', '---'):
+            return vid.doit if vid.doit != '---' else 'OK'
 
         # Note: SAMPLE. and TEST. files are now excluded at is_valid_video_file() level
 
@@ -581,23 +642,6 @@ class Converter:
         exit_code = 1 if self.job_handler.consecutive_failures >= 10 else 0
         sys.exit(exit_code)
 
-    def handle_search_change(self):
-        """Handle search pattern changes"""
-        if self.spins.search != self.search_re:
-            valid = True
-            if self.stack.curr.num != SELECT_ST:
-                self.win.alert(message='Cannot change search unless in select screen')
-                valid = False
-            try:
-                re.compile(self.spins.search)
-            except Exception as exc:
-                self.win.alert(message=f'Ignoring invalid search: {exc}')
-                valid = False
-            if valid:
-                self.search_re = self.spins.search
-            else:  # ignore pattern changes unless in select or if won't compile
-                self.spins.search = self.search_re
-
     def do_window_mode(self):
         """Main UI loop using Screen-based architecture"""
         # Create ConsoleWindow
@@ -610,11 +654,13 @@ class Converter:
         )
         self.win = win = ConsoleWindow(win_opts)
         # Initialize screens
+        ThemeScreen = Theme.create_picker_screen(RmbloatScreen)
         self.screens = {
             SELECT_ST: SelectScreen(self),
             CONVERT_ST: ConvertScreen(self),
             HELP_ST: HelpScreen(self),
             HISTORY_ST: HistoryScreen(self),
+            THEME_ST: ThemeScreen(self),
         }
         self.stack = ScreenStack(self.win, None, SCREEN_NAMES, self.screens)
         # Setup OptionSpinner
@@ -625,7 +671,11 @@ class Converter:
                      keys=27, genre="action")
         spin.add_key('history', 'h - go to History Screen', genre='action',
                      scope=[SELECT_ST, CONVERT_ST])
-        spin.add_key('expand', 'e - expand/collapse log entry', genre='action')
+        spin.add_key('theme_screen', 't - theme picker', genre='action',
+                     scope=[SELECT_ST, CONVERT_ST])
+        spin.add_key('spin_theme', 't - theme', genre='action', scope=THEME_ST)
+        spin.add_key('expand', 'e - expand/collapse log entry', genre='action',
+                     scope=HISTORY_ST)
         spin.add_key('copy_log', 'c - copy log entry to clipboard', genre='action',
                      scope=HISTORY_ST)
         spin.add_key('reset_all', 'r - reset all to "[ ]"', genre='action')
@@ -638,11 +688,23 @@ class Converter:
                      keys={ord('q'), 0x3})
         spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
         spin.add_key('directory', 'd - show directory', vals=[False, True])
-        spin.add_key('search', '/ - search string',
-                      prompt='Set search string, then Enter', scope=SELECT_ST)
+        spin.add_key('filter', 'f - filter status',
+                     vals=['', '-DUN', '-DUN-ERR', '-DUN-ERR-UnChk', '+ERR'],
+                     scope=[SELECT_ST, CONVERT_ST])
+        spin.add_key('search', '/ - incremental search', genre="action",
+                      scope=SELECT_ST)
         spin.add_key('hist_search', '/ - search string', genre="action",
                       scope=HISTORY_ST)
+        spin.add_key('hist_time_format', 'a - time format',
+                     vals=['ago+time', 'ago', 'time'], scope=HISTORY_ST)
         spin.add_key('mangle', 'm - mangle titles', vals=[False, True])
+        spin.add_key('fancy_hdr', '_ - header style',
+                     vals=['Underline', 'Reverse', 'Off'])
+
+        # Initialize theme
+        self.opts.theme = ''
+        Theme.set(self.opts.theme)
+
         # NOTE: With relax_handled_keys=True (default in console_window),
         # we no longer need to call set_handled_keys() - all non-navigation
         # keys are automatically passed to the app
@@ -674,8 +736,8 @@ class Converter:
             timeout = current_screen.prompt_timeout
             key = win.prompt(seconds=timeout)
 
-            # Handle IncrementalSearchBar if active on history screen
-            if key and self.stack.curr.num == HISTORY_ST:
+            # Handle IncrementalSearchBar if active on history or select screen
+            if key and self.stack.curr.num in (HISTORY_ST, SELECT_ST):
                 screen = self.stack.get_curr_obj()
                 if screen and screen.search_bar.is_active:
                     if screen.search_bar.handle_key(key):
@@ -685,10 +747,6 @@ class Converter:
             # Process spinner keys
             if key in spin.keys:
                 spin.do_key(key, win)
-
-            # Handle search pattern changes
-            if self.stack.curr.num == SELECT_ST:
-                self.handle_search_change()
 
             # Let ScreenStack perform any pending actions
             self.stack.perform_actions(spin)
@@ -771,10 +829,39 @@ class RmbloatScreen(Screen):
         if app.stack.curr.num in (SELECT_ST, CONVERT_ST):
             app.stack.push(HISTORY_ST)
 
+    def theme_screen_ACTION(self):
+        """t - go to Theme Screen"""
+        app = self.app
+        if app.stack.curr.num in (SELECT_ST, CONVERT_ST):
+            app.stack.push(THEME_ST, app.win.pick_pos)
+
 
 
 class SelectScreen(RmbloatScreen):
     """Video selection screen - choose which videos to convert"""
+
+    def __init__(self, app):
+        super().__init__(app)
+        # Setup incremental search bar
+        self.search_bar = IncrementalSearchBar(
+            on_change=self._on_search_change,
+            on_accept=self._on_search_accept,
+            on_cancel=self._on_search_cancel
+        )
+
+    def _on_search_change(self, text):
+        """Called when search text changes - apply filter incrementally."""
+        self.app.search_re = text
+
+    def _on_search_accept(self, text):
+        """Called when ENTER pressed in search - keep filter active, exit input mode."""
+        self.app.win.passthrough_mode = False
+        self.app.search_re = text
+
+    def _on_search_cancel(self, original_text):
+        """Called when ESC pressed in search - restore and exit search mode."""
+        self.app.search_re = original_text
+        self.app.win.passthrough_mode = False
 
     def draw_screen(self):
         """Draw the video selection screen"""
@@ -788,11 +875,24 @@ class SelectScreen(RmbloatScreen):
         lines, stats, co_wid = app.make_lines()
 
         # Header line with keys
-        head = '[r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist ?:help [q]uit'
-        if app.search_re:
-            shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
-            head += f' /{shown}'
-        win.add_fancy_header(head, "Underline")
+        head = '[r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist [t]heme'
+        head += f' [f]ilt={spins.filter} ?:help [q]uit'
+
+        # Show incremental search bar if active, otherwise show current filter
+        # Use HOTSWAP color (orange) for entire header when actively editing search
+        if self.search_bar.is_active or app.win.passthrough_mode:
+            # Add search display to header
+            search_display = self.search_bar.get_display_string(prefix=' /', suffix='')
+            head += search_display
+            # Use plain header (no fancy parsing) with HOTSWAP color for entire line
+            win.add_header(head, attr=curses.color_pair(Theme.HOTSWAP) | curses.A_BOLD)
+        else:
+            # Add static search pattern if present
+            if app.search_re:
+                shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
+                head += f' /{shown}'
+            # Use fancy header with normal colors
+            win.add_fancy_header(head, app.opts.fancy_hdr)
 
         # Stats header
         cpu_status = app.cpu.get_status_string()
@@ -874,6 +974,12 @@ class SelectScreen(RmbloatScreen):
         """'q' key - Quit application"""
         sys.exit(0)
 
+    def search_ACTION(self):
+        """'/' key - Start incremental search"""
+        # Start with current search pattern
+        self.search_bar.start(self.app.search_re if self.app.search_re else "")
+        self.app.win.passthrough_mode = True
+
 
 class ConvertScreen(RmbloatScreen):
     """Conversion progress screen - shows encoding progress"""
@@ -890,7 +996,8 @@ class ConvertScreen(RmbloatScreen):
         lines, stats, co_wid = app.make_lines()
 
         # Header line with keys
-        head = ' [s]kip ?=help [q]uit'
+        head = f' [s]kip [t]heme [f]ilt={spins.filter} ?=help [q]uit'
+
         if app.search_re:
             shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
             head += f' /{shown}'
@@ -899,7 +1006,7 @@ class ConvertScreen(RmbloatScreen):
         head += (f'     ToDo={stats.total-stats.done}/{stats.total}'
                 f'  GB={stats.gb}({stats.delta_gb})'
                 f'  {cpu_status}')
-        win.add_header(head)
+        win.add_fancy_header(head, app.opts.fancy_hdr)
 
         # Column headers
         win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
@@ -960,7 +1067,7 @@ class HistoryScreen(RmbloatScreen):
         self.visible_lines = []  # Maps display line index -> timestamp (None for expanded/blank lines)
         self.window_of_logs = None  # Window of log entries (OrderedDict)
         self.window_state = None  # Window state for incremental reads
-        self.search_matches = {}  # Maps timestamp -> True if deep match found in JSON
+        self.search_matches = set()  # Set of timestamps with deep-only matches in JSON
         self.prev_filter = ''
 
         # Setup search bar
@@ -969,6 +1076,7 @@ class HistoryScreen(RmbloatScreen):
             on_accept=self._on_search_accept,
             on_cancel=self._on_search_cancel
         )
+
 
     def _on_search_change(self, text):
         """Called when search text changes - filter entries incrementally."""
@@ -989,7 +1097,7 @@ class HistoryScreen(RmbloatScreen):
         """Filter entries based on search text (shallow or deep)."""
         if not search_text:
             self.filtered_entries = self.entries
-            self.search_matches = {}
+            self.search_matches = set()
             return
 
         # Deep search mode if starts with /
@@ -998,55 +1106,13 @@ class HistoryScreen(RmbloatScreen):
 
         if not pattern:
             self.filtered_entries = self.entries
-            self.search_matches = {}
+            self.search_matches = set()
             return
 
-        # Case-insensitive search
-        pattern_lower = pattern.lower()
-
-        filtered = []
-        matches = {}
-
-        for entry in self.entries:
-            # Extract visible text (what shows in collapsed view)
-            timestamp = entry.timestamp[:19]
-            level = entry.level if hasattr(entry, 'level') else "???"
-
-            # Get filebase
-            filebase = None
-            json_str = None
-            try:
-                msg = entry.message if entry.message else ""
-                if '{' in msg:
-                    json_start = msg.index('{')
-                    json_str = msg[json_start:]
-                    data = json.loads(json_str)
-                    filebase = data.get('filebase', data.get('file', None))
-            except (json.JSONDecodeError, ValueError, AttributeError, KeyError):
-                pass
-
-            if not filebase:
-                if entry.message:
-                    filebase = entry.message[:70]
-                else:
-                    filebase = f"{entry.file}:{entry.line} {entry.function}()"
-
-            # Shallow search: check visible text
-            visible_text = f"{timestamp} {level} {filebase}".lower()
-            shallow_match = pattern_lower in visible_text
-
-            # Deep search: also check JSON content
-            deep_match = False
-            if deep_search and json_str:
-                deep_match = pattern_lower in json_str.lower()
-
-            if shallow_match or deep_match:
-                filtered.append(entry)
-                if deep_match and not shallow_match:
-                    matches[entry.timestamp] = True  # Mark as deep-only match using timestamp
-
-        self.filtered_entries = filtered
-        self.search_matches = matches
+        # Use StructuredLogger's filter method
+        self.filtered_entries, self.search_matches = lg.filter_entries(
+            self.entries, pattern, deep=deep_search
+        )
 
     def draw_screen(self):
         """Draw the history screen"""
@@ -1071,7 +1137,7 @@ class HistoryScreen(RmbloatScreen):
         # Apply search filter if active
         if not self.search_bar.text:
             self.filtered_entries = self.entries
-            self.search_matches = {}
+            self.search_matches = set()
 
         # Count errors vs others in filtered results
         err_count = sum(1 for e in self.filtered_entries if e.level == 'ERR')
@@ -1081,7 +1147,7 @@ class HistoryScreen(RmbloatScreen):
         search_display = self.search_bar.get_display_string(prefix='', suffix='')
 
         # Header
-        header_line = f'ESC:back [e]xpand [c]opy/export {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} oth:{other_count}) /'
+        header_line = f'ESC:back [e]xpand [c]opy [a]go {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} oth:{other_count}) /'
         if search_display:
             header_line += f'{search_display}'
         win.add_header(header_line)
@@ -1093,39 +1159,45 @@ class HistoryScreen(RmbloatScreen):
             # Use timestamp as the unique key
             timestamp = entry.timestamp
 
-            # Extract filebase from message JSON
-            filebase = None
+            # Get display summary from entry
+            summary = entry.display_summary
+
+            # Extract JSON string if present (for expansion)
             json_str = None
+            if '{' in entry.message:
+                try:
+                    json_start = entry.message.index('{')
+                    json_str = entry.message[json_start:]
+                except (ValueError, IndexError):
+                    pass
 
-            # Parse the JSON from the message
-            try:
-                # The message may contain "RE-ENCODE-TO-H265 {json...}" or similar
-                # Extract just the JSON part
-                msg = entry.message if entry.message else ""
-                if '{' in msg:
-                    json_start = msg.index('{')
-                    json_str = msg[json_start:]
-                    data = json.loads(json_str)
-                    filebase = data.get('filebase', data.get('file', None))
-            except (json.JSONDecodeError, ValueError, AttributeError, KeyError):
-                pass
+            # Format timestamp based on spinner setting
+            time_format = app.spins.hist_time_format if hasattr(app.spins, 'hist_time_format') else 'time'
 
-            # If no filebase from JSON, use the message itself (truncated)
-            if not filebase:
-                if entry.message:
-                    filebase = entry.message[:70]
-                else:
-                    filebase = f"{entry.file}:{entry.line} {entry.function}()"
+            if time_format == 'ago':
+                timestamp_display = f"{entry.format_ago():>6}"
+            elif time_format == 'ago+time':
+                ago = entry.format_ago()
+                time_str = timestamp[:19]
+                timestamp_display = f"{ago:>6} {time_str}"
+            else:  # 'time'
+                timestamp_display = timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
 
-            # Show timestamp, level, and filebase
-            timestamp_display = timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
-            level = entry.level if hasattr(entry, 'level') else "???"
+            level = entry.level
 
             # Add deep match indicator if this entry matched only in JSON
             deep_indicator = " *" if timestamp in self.search_matches else ""
 
-            line = f"{timestamp_display} [{level:>3}] {filebase}{deep_indicator}"
-            win.add_body(line, attr=curses.A_BOLD, context=Context("header", timestamp=timestamp))
+            # Choose color based on log level
+            if level == 'ERR':
+                level_attr = curses.color_pair(Theme.ERROR) | curses.A_BOLD
+            elif level == 'WARN':
+                level_attr = curses.color_pair(Theme.WARNING) | curses.A_BOLD
+            else:
+                level_attr = curses.A_BOLD
+
+            line = f"{timestamp_display} [{level:>3}] {summary}{deep_indicator}"
+            win.add_body(line, attr=level_attr, context=Context("header", timestamp=timestamp))
             self.visible_lines.append(timestamp)
 
             # Handle expansion
@@ -1141,7 +1213,7 @@ class HistoryScreen(RmbloatScreen):
                         if len(lines) <= 20:
                             display_lines = lines
                         else:
-                            display_lines = lines[:10] + ['  ...'] + lines[-10:]
+                            display_lines = ['  ...'*8] + lines[-20:]
                     else:  # expand_state == 2: Full
                         display_lines = lines
 
