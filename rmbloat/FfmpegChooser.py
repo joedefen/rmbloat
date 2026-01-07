@@ -3,6 +3,7 @@
 FfmpegChooser - Intelligent FFmpeg runtime selection with hardware acceleration support
 """
 
+import os
 import subprocess
 import sys
 import shutil
@@ -604,7 +605,7 @@ class FfmpegChooser:
         cmd = []
         
         # Add nice/ionice at the very beginning (affects entire process)
-        if params.use_nice_ionice:
+        if params.use_nice_ionice and not self.use_docker:
             cmd.extend(['ionice', '-c3', 'nice', '-n20'])
         
         # Determine working directory (absolute path of input file's directory)
@@ -624,9 +625,18 @@ class FfmpegChooser:
                     subtitle_basename = None
         
         # Build base command (docker/podman vs system)
+#       if self.use_docker:
+#           cmd.extend([
+#               self.runtime, 'run', '--rm',
+#               '-v', f'{workdir}:{workdir}',
+#               '-w', workdir,
+#           ])
         if self.use_docker:
             cmd.extend([
                 self.runtime, 'run', '--rm',
+                '--user', f'{os.getuid()}:{os.getgid()}',
+                '--net=host',
+                '--ipc=host',
                 '-v', f'{workdir}:{workdir}',
                 '-w', workdir,
             ])
@@ -636,6 +646,8 @@ class FfmpegChooser:
                 cmd.extend(['--device=/dev/dri:/dev/dri'])
             
             cmd.append(self.image)
+            if params.use_nice_ionice:
+                cmd.extend(['ionice', '-c3', 'nice', '-n20'])
         
         # FFmpeg arguments start here
         # (Docker image already has ffmpeg as entrypoint, don't add it again)

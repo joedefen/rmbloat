@@ -117,7 +117,7 @@ def apply_timestamps(filepath, timestamps):
         return False
 
 
-def bulk_rename(old_file_name: str, new_file_name: str, trashes: set, dry_run: bool = False):
+def bulk_rename(old_file_name: str, new_file_name: str, trashes: set):
     """
     Renames files and directories in the current working directory (CWD).
 
@@ -131,14 +131,11 @@ def bulk_rename(old_file_name: str, new_file_name: str, trashes: set, dry_run: b
         new_file_name: A sample filename (e.g., 'newbie.mkv') used to define
                        the base name to rename to ('newbie').
         trashes: Set of filenames that are being trashed (skip these)
-        dry_run: If True, don't actually rename, just report what would be done
 
     Returns:
         List of operation strings describing what was done
     """
     ops = []
-    would = 'WOULD ' if dry_run else ''
-
     old_base_name, _ = os.path.splitext(old_file_name)
     new_base_name, _ = os.path.splitext(new_file_name)
 
@@ -190,9 +187,8 @@ def bulk_rename(old_file_name: str, new_file_name: str, trashes: set, dry_run: b
             full_new_path = os.path.join(root, new_item_name)
             try:
                 if os.path.basename(item_name) not in trashes:
-                    if not dry_run:
-                        os.rename(full_old_path, full_new_path)
-                    ops.append(f"{would}rename {full_old_path!r} {full_new_path!r}")
+                    os.rename(full_old_path, full_new_path)
+                    ops.append(f"rename {full_old_path!r} {full_new_path!r}")
             except Exception as e:
                 # Handle potential errors (e.g., permission errors, file in use)
                 ops.append(f"ERR: rename '{full_old_path}' '{full_new_path}': {e}")

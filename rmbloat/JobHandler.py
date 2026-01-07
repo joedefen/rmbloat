@@ -5,13 +5,15 @@ Job handling for video conversion - manages transcoding jobs and progress monito
 # pylint: disable=too-many-locals,too-many-branches,too-many-statements
 # pylint: disable=broad-exception-caught,invalid-name
 # pylint: disable=too-many-instance-attributes,no-else-return
+# pylint: disable=line-too-long
 import os
 import re
 import time
 from datetime import timedelta
 from pathlib import Path
 import send2trash
-from .Models import Job
+from .Models import Job, Vid
+from .ConvertUtils import bash_quote
 from . import FileOps
 
 
@@ -57,8 +59,8 @@ class JobHandler:
 
         Strategy:
             - Skip 10-bit for problematic codecs (mpeg4) - VAAPI compatibility issues
-            - If source is already 10-bit → use 10-bit
-            - For standard 8-bit (yuv420p) → use 10-bit for better compression
+            - If source is already 10-bit → use 10-bit (preserve bit depth)
+            - For standard 8-bit (yuv420p) → use 8-bit (VAAPI has issues with 8→10 bit conversion)
             - For exotic/problematic formats → use 8-bit for safety
         """
         # If source is already 10-bit, definitely use 10-bit output
@@ -72,7 +74,7 @@ class JobHandler:
         if codec in problematic_codecs:
             return False
 
-        # Standard 8-bit formats that work well with 10-bit encoding
+        # Standard 8-bit formats - keep as 8-bit to avoid VAAPI conversion issues
         safe_8bit_formats = {
             'yuv420p',    # Standard 8-bit 4:2:0
             'yuv422p',    # Standard 8-bit 4:2:2
@@ -82,7 +84,7 @@ class JobHandler:
         }
 
         if pix_fmt in safe_8bit_formats:
-            return True  # Use 10-bit for better compression efficiency
+            return False  # Keep 8-bit sources as 8-bit (VAAPI has issues with 8->10 bit conversion)
 
         # For unknown or exotic formats, stay safe with 8-bit
         # This includes: yuvj420p (JPEG color range), bgr24, rgb24, etc.
@@ -104,6 +106,7 @@ class JobHandler:
 
         # Progress tracking
         self.progress_line_mono = 0
+        self.prev_ffmpeg_out_mono = 0
 
         # Auto mode tracking
         self.auto_mode_enabled = auto_mode_enabled
@@ -234,7 +237,7 @@ class JobHandler:
         Check if a failed job should be retried with error tolerance.
         Detects filter reinitialization errors and severe corruption.
         """
-        if vid.return_code == 0:
+        if vid.runs[-1].return_code == 0:
             return False
 
         # Check for filter reinitialization error (the specific issue from the bug report)
@@ -245,7 +248,7 @@ class JobHandler:
         ]
 
         for signal in filter_error_signals:
-            for line in vid.texts:
+            for line in vid.runs[-1].texts:
                 if signal in line:
                     return True
 
@@ -257,7 +260,7 @@ class JobHandler:
         }
 
         total_severity = 0
-        for line in vid.texts:
+        for line in vid.runs[-1].texts:
             for signal, score in corruption_signals.items():
                 if signal in line:
                     total_severity += score
@@ -272,7 +275,7 @@ class JobHandler:
         Check if a failed job should be retried with software encoding.
         Detects hardware-specific failures like filter reinitialization.
         """
-        if vid.return_code == 0:
+        if vid.runs[-1].return_code == 0:
             return False
 
         # Check for filter reinitialization error (hardware can't handle dynamic changes)
@@ -282,13 +285,13 @@ class JobHandler:
         ]
 
         for signal in filter_reconfig_signals:
-            for line in vid.texts:
+            for line in vid.runs[-1].texts:
                 if signal in line:
                     return True
 
         return False
 
-    def start_transcode_job(self, vid, bash_quote_func, retry_with_error_tolerance=False,
+    def start_transcode_job(self, vid: Vid, retry_with_error_tolerance=False,
                             force_software=False):
         """Start a transcoding job using FfmpegChooser."""
         os.chdir(os.path.dirname(vid.filepath))
@@ -315,11 +318,6 @@ class JobHandler:
         if self.opts.sample:
             duration_secs = self.sample_seconds
 
-        job = Job(vid, orig_backup_file, temp_file, duration_secs, dry_run=self.opts.dry_run)
-        job.input_file = basename
-        job.is_retry = retry_with_error_tolerance
-        job.is_software_fallback = force_software
-
         # Decide on 10-bit encoding based on input pixel format
         use_10bit = self.should_use_10bit(probe.pix_fmt, probe.codec)
 
@@ -329,6 +327,24 @@ class JobHandler:
         if force_software:
             original_use_acceleration = self.chooser.use_acceleration
             self.chooser.use_acceleration = False
+
+
+        # Store command for logging
+        if not retry_with_error_tolerance and not force_software:
+            vid.runs = []
+        vid.start_new_run()
+        if retry_with_error_tolerance and not force_software:
+            vid.runs[-1].descr = 'redo w err tolerance'
+        elif force_software:
+            vid.runs[-1].descr = 'retry w S/W convert'
+        else:
+            vid.runs[-1].descr = 'initial run'
+
+
+        job = Job(vid, orig_backup_file, temp_file, duration_secs)
+        job.input_file = basename
+        job.is_retry = retry_with_error_tolerance
+        job.is_software_fallback = force_software
 
         # Create namespace with defaults
         params = self.chooser.make_namespace(
@@ -366,22 +382,35 @@ class JobHandler:
         # Stream mapping options
         map_copy = '-map 0:v:0 -map 0:a? -c:a copy -map'
 
-        # Check for external subtitle file
+#       # Check for external subtitle file
+#       if merged_external_subtitle:
+#           # Don't copy internal subtitles, we're replacing with external
+#           map_copy += ' -0:s -map -0:t -map -0:d'
+#       else:
+#           # Copy internal subtitles, but drop unsafe ones (bitmap codecs like dvd_subtitle)
+#           # Check if probe has custom instructions to drop specific subtitle streams
+#           if probe.customs and 'drop_subs' in probe.customs:
+#               # Map all subtitles first, then explicitly exclude the unsafe ones
+#               map_copy += ' 0:s?'
+#               for sub_idx in probe.customs['drop_subs']:
+#                   map_copy += f' -map -0:s:{sub_idx}'
+#               map_copy += ' -map -0:t -map -0:d'
+#           else:
+#               # No custom subtitle filtering needed
+#               map_copy += ' 0:s? -map -0:t -map -0:d'
+        # Expanded unsafe list for Blu-ray/DVD bitmap subs
+
         if merged_external_subtitle:
-            # Don't copy internal subtitles, we're replacing with external
             map_copy += ' -0:s -map -0:t -map -0:d'
         else:
-            # Copy internal subtitles, but drop unsafe ones (bitmap codecs like dvd_subtitle)
-            # Check if probe has custom instructions to drop specific subtitle streams
-            if probe.customs and 'drop_subs' in probe.customs:
-                # Map all subtitles first, then explicitly exclude the unsafe ones
-                map_copy += ' 0:s?'
-                for sub_idx in probe.customs['drop_subs']:
-                    map_copy += f' -map -0:s:{sub_idx}'
-                map_copy += ' -map -0:t -map -0:d'
-            else:
-                # No custom subtitle filtering needed
-                map_copy += ' 0:s? -map -0:t -map -0:d'
+            UNSAFE_SUBS = ['dvd_subtitle', 'pgs', 'hdmv_pgs_subtitle', 'dvbsub']
+            map_copy += ' -map 0:s?'
+            # Identify and drop bitmap streams
+            for idx, s in enumerate(probe.streams):
+                if s.type == 'subtitle' and s.codec in UNSAFE_SUBS:
+                    map_copy += f' -map -0:s:{idx}'
+            # -c:s copy is the safety net for the remaining subs
+            map_copy += ' -c:s copy -map -0:t -map -0:d'
 
         params.map_opts = map_copy.split()
         params.external_subtitle = merged_external_subtitle
@@ -397,51 +426,16 @@ class JobHandler:
 
         # Generate the command
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
+        vid.runs[-1].command = bash_quote(ffmpeg_cmd)
 
         # Restore original acceleration setting if it was overridden
         if force_software and original_use_acceleration is not None:
             self.chooser.use_acceleration = original_use_acceleration
 
-        # Store command for logging
-        vid.command = bash_quote_func(ffmpeg_cmd)
-
         # Start the job
-        if not self.opts.dry_run:
-            job.ffsubproc.start(ffmpeg_cmd, temp_file=job.temp_file)
-            self.progress_line_mono = time.monotonic()
+        job.ffsubproc.start(ffmpeg_cmd, temp_file=job.temp_file)
+        self.prev_ffmpeg_out_mono = self.progress_line_mono = time.monotonic()
         return job
-
-    def monitor_transcode_progress(self, job):
-        """
-        Runs the FFmpeg transcode command and monitors its output for a non-scrolling display.
-        """
-        if not self.opts.dry_run:
-            # --- Progress Monitoring Loop ---
-            # Read stderr line-by-line until the process finishes
-            while True:
-                time.sleep(0.1)
-
-                got = self.get_job_progress(job)
-
-                # 4. Print and reset timer
-                if isinstance(got, str):
-                    print('\r' + got, end='', flush=True)
-                elif isinstance(got, int):
-                    return_code = got
-                    break
-
-            # Clear the progress line and print final status
-            print('\r' + ' ' * 120, end='', flush=True)  # Overwrite last line with spaces
-
-        if self.opts.dry_run or return_code == 0:
-            print(f"\r{job.input_file}: Transcoding FINISHED"
-                  f" (Elapsed: {timedelta(seconds=int(time.monotonic() - job.start_mono))})")
-            return True  # Success
-        else:
-            # Print a final error message
-            print(f"\r{job.input_file}: Transcoding FAILED (Return Code: {job.return_code})")
-            # In a real script, you'd save or display the full error output from stderr here.
-            return False
 
     def get_job_progress(self, job):
         """ Get current progress of a job """
@@ -482,32 +476,27 @@ class JobHandler:
 
             # Use the estimated FPS for the speed report
             progress_line = (
-                f"{percent_complete:.1f}% | "
-                f"{elapsed_time_formatted} | "
-                f"-{remaining_time_formatted} | "
+                f"{percent_complete:.1f}% "
+                f"{elapsed_time_formatted} "
+                f"-{remaining_time_formatted} "
                 f"~{speed} | "  # Report FPS clearly as Estimated
-                + at_formatted
+                + f'{at_formatted}'
             )
             return progress_line
 
         vid = job.vid
         secs_max = self.opts.progress_secs_max
+
         while True:
             got = job.ffsubproc.poll()
             now_mono = time.monotonic()
-            # print(f'\r{delta=} {got=}')
-            if now_mono - self.progress_line_mono > secs_max:
-                got = 254
-                vid.texts.append('PROGRESS TIMEOUT')
-                job.ffsubproc.stop(return_code=got)
-                self.progress_line_mono = time.monotonic() + 1000000000
-                continue
 
             if isinstance(got, str):
                 line = got
+                self.prev_ffmpeg_out_mono = now_mono
                 match = self.PROGRESS_RE.search(line)
                 if not match:
-                    vid.texts.append(line)
+                    vid.runs[-1].texts.append(line)
                     continue
 
                 if now_mono - self.progress_line_mono < 3:
@@ -550,17 +539,23 @@ class JobHandler:
                 # \r at the start makes the console cursor go back to the beginning of the line
                 cur_time_formatted = job.trim0(str(timedelta(seconds=time_encoded_seconds)))
                 progress_line = (
-                    f"{percent_complete:.1f}% | "
-                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} | "
-                    f"-{remaining_time_formatted} | "
-                    f"{speed:.1f}x | "
+                    f"{percent_complete:.1f}% "
+                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} "
+                    f"-{remaining_time_formatted} "
+                    f"{speed:.1f}x "
                     f"At {cur_time_formatted}/{job.total_duration_formatted}"
                 )
                 return progress_line
             elif isinstance(got, int):
-                vid.return_code = got
+                vid.runs[-1].return_code = got
                 return got
-            else:
+                # print(f'\r{delta=} {got=}')
+            elif now_mono - self.prev_ffmpeg_out_mono > secs_max:
+                 # got nothing  and timeout
+                vid.runs[-1].texts.append('PROGRESS TIMEOUT')
+                job.ffsubproc.stop(return_code=254)
+                self.prev_ffmpeg_out_mono = now_mono + 1000000000
+            else: # got nothing
                 return got
 
     def finish_transcode_job(self, success, job, is_allowed_codec_func):
@@ -568,7 +563,7 @@ class JobHandler:
         Complete a transcoding job and handle file operations.
 
         Returns:
-            probe: The probe of the transcoded file (or None if failed/dry_run)
+            probe: The probe of the transcoded file (or None if failed)
         """
 
         def elaborate_err(vid):
@@ -576,7 +571,7 @@ class JobHandler:
             Analyzes FFmpeg output using a severity scoring system to detect 
             severe stream corruption.
             """
-            if vid.return_code != 0:
+            if vid.runs[-1].return_code != 0:
                 CORRUPTION_SEVERITY = {
                     "corrupt decoded frame": 10,
                     "illegal mb_num": 9,
@@ -593,53 +588,30 @@ class JobHandler:
                 SEVERITY_THRESHOLD = 30
                 total_severity = 0
                 corruption_events = 0
-                
-                for line in vid.texts:
+
+                for line in vid.runs[-1].texts:
                     for signal, score in CORRUPTION_SEVERITY.items():
                         if signal in line:
                             total_severity += score
                             corruption_events += 1
                             # Stop checking other signals for this line once one is found (prevents double-counting)
-                            break 
-                
+
                 if total_severity >= SEVERITY_THRESHOLD:
-                    vid.texts.append(f"CORRUPT VIDEO: Total Severity Score {total_severity} "
+                    vid.runs[-1].texts.append(f"CORRUPT VIDEO: Total Severity Score {total_severity} "
                         f"from {corruption_events} events. FFmpeg error_code={vid.return_code}")
 
 
-        def old_elaborate_err(vid):
-            """ Analyzes FFmpeg output for signs of stream corruption and appends 
-            a single, descriptive error line to vid.texts if detected.  """
-            # 1. Define the specific error string to look for
-            CORRUPT_FRAME_SIGNAL = "corrupt decoded frame"
-            if vid.return_code != 0:
-                corruption_count = 0
-                for line in vid.texts:
-                    if CORRUPT_FRAME_SIGNAL in line:
-                        corruption_count += 1
-                if corruption_count > 0:
-                    vid.texts.append(f"CORRUPT VIDEO: {corruption_count} corrupt frames, "
-                        f"FFmpeg error_code={vid.return_code}")
-
         ##################################
-        dry_run = self.opts.dry_run
         vid = job.vid
         probe = None
         # space_saved_gb = 0.0
         if success:
-            if not dry_run:
-                probe = self.probe_cache.get(job.temp_file)
+            probe = self.probe_cache.get(job.temp_file)
             if not probe:
-                if dry_run:
-                    success = True
-                    vid.doit = 'ok'
-                    net = -20
-                    # space_saved_gb = vid.gb * 0.20  # Estimate for dry run
-                else:
-                    success = False
-                    vid.doit = 'ERR'
-                    net = 0
-                    elaborate_err(vid)
+                success = False
+                vid.doit = 'ERR'
+                net = 0
+                elaborate_err(vid)
             else:
                 net = (vid.gb - probe.gb) / vid.gb
                 net = int(round(-net*100))
@@ -659,50 +631,50 @@ class JobHandler:
                 self.consecutive_failures += 1
 
         if success and not self.opts.sample:
-            would = 'WOULD ' if dry_run else ''
             trashes = set()
             basename = os.path.basename(vid.filepath)
 
             # Preserve timestamps from original file
             timestamps = None
-            if not dry_run:
-                timestamps = FileOps.preserve_timestamps(basename)
+            timestamps = FileOps.preserve_timestamps(basename)
 
             try:
                 # Rename original to backup
-                if not dry_run and self.opts.keep_backup:
-                    os.rename(basename, job.orig_backup_file)
                 if self.opts.keep_backup:
+                    os.rename(basename, job.orig_backup_file)
                     vid.ops.append(
-                        f"{would} rename {basename!r} {job.orig_backup_file!r}")
-                if not dry_run and not self.opts.keep_backup:
-                    send2trash.send2trash(basename)
-                if dry_run and not self.opts.keep_backup:
-                    trashes.add(basename)
-                if not self.opts.keep_backup:
-                    vid.ops.append(f"{would}trash {basename!r}")
+                        f"rename {basename!r} {job.orig_backup_file!r}")
+                else:
+                    try:
+                        send2trash.send2trash(basename)
+                        trashes.add(basename)
+                        vid.ops.append(f"trash {basename!r}")
+                    except Exception as why:
+                        vid.ops.append(f"ERROR during send2trash of {basename!r}: {why}")
+                        vid.ops.append(f"ERROR: using os.unlink() instead")
+                        os.unlink(basename)
+                        trashes.add(basename)
+                        vid.ops.append(f"unlink {basename!r}")
 
                 # Rename temporary file to the original filename
-                if not dry_run:
-                    os.rename(job.temp_file, vid.standard_name)
+                os.rename(job.temp_file, vid.standard_name)
                 vid.ops.append(
-                    f"{would}rename {job.temp_file!r} {vid.standard_name!r}")
+                    f"rename {job.temp_file!r} {vid.standard_name!r}")
 
                 if vid.do_rename:
                     # Call FileOps.bulk_rename directly
-                    vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes, dry_run)
+                    vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes)
 
-                if not dry_run:
-                    # Apply preserved timestamps to the new file
-                    FileOps.apply_timestamps(vid.standard_name, timestamps)
+                # Apply preserved timestamps to the new file
+                FileOps.apply_timestamps(vid.standard_name, timestamps)
 
-                    # Set basename1 for the successfully converted file
-                    vid.basename1 = vid.standard_name
-                    # probe will be returned to Converter for apply_probe
+                # Set basename1 for the successfully converted file
+                vid.basename1 = vid.standard_name
+                # probe will be returned to Converter for apply_probe
 
             except OSError as e:
-                print(f"ERROR during swap of {vid.filepath}: {e}")
-                print(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
+                vid.ops.append(f"ERROR during swap of {vid.filepath}: {e}")
+                vid.ops.append(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
         elif success and self.opts.sample:
             # Set basename1 for the sample file
             vid.basename1 = job.temp_file

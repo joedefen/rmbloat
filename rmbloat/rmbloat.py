@@ -35,15 +35,19 @@ TODO:
 # pylint: disable=too-many-nested-blocks,try-except-raise,line-too-long
 # pylint: disable=too-many-public-methods,invalid-name
 
-import sys
+
 import os
+import sys
+import base64
 import argparse
 import traceback
+import re
 import atexit
 import re
 import time
 import json
 import curses
+import textwrap
 from dataclasses import asdict
 from types import SimpleNamespace
 from console_window import (ConsoleWindow, OptionSpinner, Screen, ScreenStack,
@@ -98,10 +102,11 @@ class Converter:
     SKIP_PREFIXES = ConvertUtils.SKIP_PREFIXES
     singleton = None
 
-    def __init__(self, opts, cache_dir='/tmp'):
+    def __init__(self, opts, cache_dir='/tmp', ini=None):
         assert Converter.singleton is None
         Converter.singleton = self
         self.win = None
+        self.ini = ini # IniManager
         self.redraw_mono = time.monotonic()
         self.opts = opts
         self.spinner = None # spinner object
@@ -140,14 +145,15 @@ class Converter:
 
         # Build options suffix for display
         self.options_suffix = self.build_options_suffix()
+        self.screens = None
+        self.stack = None
+        self.need_freeze_draw = False
 
     def build_options_suffix(self):
         """Build the options suffix string for display."""
         parts = []
         parts.append(f'Q={self.opts.quality}')
         parts.append(f'Shr>={self.opts.min_shrink_pct}')
-        if self.opts.dry_run:
-            parts.append('DRYRUN')
         if self.opts.sample:
             parts.append('SAMPLE')
         if self.opts.keep_backup:
@@ -185,11 +191,11 @@ class Converter:
 
                 if filter_mode == '-DUN' and is_dun:
                     continue
-                elif filter_mode == '-DUN-ERR' and (is_dun or is_err):
+                if filter_mode == '-DUN-ERR' and (is_dun or is_err):
                     continue
-                elif filter_mode == '-DUN-ERR-UnChk' and (is_dun or is_err or is_unchk):
+                if filter_mode == '-DUN-ERR-UnChk' and (is_dun or is_err or is_unchk):
                     continue
-                elif filter_mode == '+ERR' and not is_err:
+                if filter_mode == '+ERR' and not is_err:
                     continue
 
             short_list.append(vid)
@@ -268,49 +274,46 @@ class Converter:
         # Handle running job progress
         if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
             while True:
-                if self.opts.dry_run:
-                    delta = time.monotonic() - self.job.start_mono
-                    got = 0 if delta >= 3 else f'{delta=}'
-                else:
-                    got = self.get_job_progress(self.job)
+                got = self.job_handler.get_job_progress(self.job)
                 if isinstance(got, str):
-                    self.job.progress = got
+                    self.job.progress = f'{got}  [{self.job.vid.runs[-1].descr}]'
                 elif isinstance(got, int):
                     # Check if we should retry with error tolerance (2nd attempt)
                     should_retry_tolerant = (got != 0 and
-                                            (not hasattr(self.job, 'is_retry') or not self.job.is_retry) and
-                                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
-                                            self.job_handler and
-                                            self.job_handler._should_retry_with_error_tolerance(self.job.vid))
+                            (not hasattr(self.job, 'is_retry') or not self.job.is_retry) and
+                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
+                            self.job_handler and
+                            self.job_handler._should_retry_with_error_tolerance(self.job.vid))
 
                     # Check if we should retry with software encoding (3rd attempt)
                     should_retry_software = (got != 0 and
-                                            hasattr(self.job, 'is_retry') and self.job.is_retry and
-                                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
-                                            self.job_handler and
-                                            self.job_handler._should_retry_with_software(self.job.vid))
+                            hasattr(self.job, 'is_retry') and self.job.is_retry and
+                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
+                            self.job_handler and
+                            self.job_handler._should_retry_with_software(self.job.vid))
 
                     if should_retry_tolerant:
                         # Retry with error tolerance (2nd attempt)
                         vid = self.job.vid
-                        lg.put('WARN', 'RETRY-WITH-ERROR-TOLERANCE',
-                            f'Retrying {vid.filebase} with error tolerance flags\n' +
-                            json.dumps(asdict(vid), indent=4))
-                        # Note: Don't set anomaly here - let finish_transcode_job handle it
+#                       lg.put('WARN', 'RETRY-WITH-ERROR-TOLERANCE',
+#                           f'Retrying {vid.filebase} with error tolerance flags\n' +
+#                           json.dumps(asdict(vid), indent=4))
+#                       # Note: Don't set anomaly here - let finish_transcode_job handle it
                         vid.doit = '[X]'  # Reset for retry
-                        self.job = self.start_transcode_job(vid, retry_with_error_tolerance=True)
+                        self.job = self.job_handler.start_transcode_job(vid,
+                                                     retry_with_error_tolerance=True)
                         vid.doit = 'IP '
                         break  # Continue with retry job
 
                     if should_retry_software:
                         # Retry with software encoding (3rd attempt)
                         vid = self.job.vid
-                        lg.put('WARN', 'RETRY-WITH-SOFTWARE',
-                            f'Retrying {vid.filebase} with software encoding (libx265)\n' +
-                            json.dumps(asdict(vid), indent=4))
+#                       lg.put('WARN', 'RETRY-WITH-SOFTWARE',
+#                           f'Retrying {vid.filebase} with software encoding (libx265)\n' +
+#                           json.dumps(asdict(vid), indent=4))
                         vid.doit = '[X]'  # Reset for retry
-                        self.job = self.start_transcode_job(vid, retry_with_error_tolerance=True,
-                                                           force_software=True)
+                        self.job = self.job_handler.start_transcode_job(vid,
+                                    retry_with_error_tolerance=True, force_software=True)
                         vid.doit = 'IP '
                         break  # Continue with retry job
 
@@ -341,8 +344,6 @@ class Converter:
 
                     if self.opts.sample:
                         title = 'SAMPLE'
-                    elif self.opts.dry_run:
-                        title = 'DRY-RUN'
                     elif hasattr(self.job, 'is_software_fallback') and self.job.is_software_fallback:
                         title = 'RE-ENCODE-TO-H265-SOFTWARE'
                     elif hasattr(self.job, 'is_retry') and self.job.is_retry:
@@ -369,7 +370,7 @@ class Converter:
                         continue
                     if not self.job:  # start only one job
                         self.prev_time_encoded_secs = -1
-                        self.job = self.start_transcode_job(vid)
+                        self.job = self.job_handler.start_transcode_job(vid)
                         vid.doit = 'IP '
             if gonners:  # any disappearing files?
                 vids = []
@@ -456,6 +457,7 @@ class Converter:
         """
 
         vid = Vid()
+        vid.start_new_run()
         vid.post_init(ppp)
         vid.probe0 = self.apply_probe(vid, ppp.probe)
         self.vids.append(vid)
@@ -473,23 +475,6 @@ class Converter:
             else:
                 vid.doit = '[X]'
         vid.doit_auto = vid.doit # auto value of doit saved for ease of re-init
-
-    # Utility functions moved to ConvertUtils.py
-    bash_quote = staticmethod(ConvertUtils.bash_quote)
-
-    # Job handling methods delegated to JobHandler
-    def start_transcode_job(self, vid, retry_with_error_tolerance=False, force_software=False):
-        """Delegate to JobHandler"""
-        return self.job_handler.start_transcode_job(vid, self.bash_quote,
-                                                    retry_with_error_tolerance, force_software)
-
-    def monitor_transcode_progress(self, job):
-        """Delegate to JobHandler"""
-        return self.job_handler.monitor_transcode_progress(job)
-
-    def get_job_progress(self, job):
-        """Delegate to JobHandler"""
-        return self.job_handler.get_job_progress(job)
 
     def finish_transcode_job(self, success, job):
         """Delegate to JobHandler and apply probe if returned"""
@@ -518,7 +503,7 @@ class Converter:
 
         Delegates to FileOps.bulk_rename() for the actual operation.
         """
-        return FileOps.bulk_rename(old_file_name, new_file_name, trashes, self.opts.dry_run)
+        return FileOps.bulk_rename(old_file_name, new_file_name, trashes)
 
     def process_one_ppp(self, ppp):
         """ Handle just one """
@@ -590,7 +575,7 @@ class Converter:
         base = os.path.basename(vid.filepath).lower()
 
         # Already re-encoded files get "DUN" (done) status
-        if base.endswith('.recode.mkv'):
+        if base.endswith(('.recode.mkv', 'recode.sb.mkv')):
             return 'DUN'
 
         # Files marked as OK from previous successful conversion or skip
@@ -648,7 +633,7 @@ class Converter:
         win_opts = ConsoleWindowOpts(
             head_line=True,
             head_rows=4,
-            body_rows=10+len(self.vids),
+            body_rows=max(10+len(self.vids), 10000),
             min_cols_rows=(60,10),
             ctrl_c_terminates=True,
         )
@@ -666,27 +651,30 @@ class Converter:
         # Setup OptionSpinner
         self.spinner = spin = OptionSpinner(stack=self.stack)
         spin.default_obj = self.opts
-        spin.add_key('help_mode', '? - help screen', genre="action")
         spin.add_key('screen_escape', 'ESC - return to previous screen',
                      keys=27, genre="action")
-        spin.add_key('history', 'h - go to History Screen', genre='action',
+        spin.add_key('quit', 'q - quit converting OR exit app', genre='action',
+                     keys={ord('q'), 0x3})
+        spin.add_key('help_mode', '? - Help Screen', genre="action")
+        spin.add_key('history', 'h - History Screen', genre='action',
                      scope=[SELECT_ST, CONVERT_ST])
-        spin.add_key('theme_screen', 't - theme picker', genre='action',
+        spin.add_key('theme_screen', 't - Theme Picker', genre='action',
                      scope=[SELECT_ST, CONVERT_ST])
-        spin.add_key('spin_theme', 't - theme', genre='action', scope=THEME_ST)
+
+        spin.add_key('spin_theme', 't - next theme', genre='action', scope=THEME_ST)
+
         spin.add_key('expand', 'e - expand/collapse log entry', genre='action',
                      scope=HISTORY_ST)
         spin.add_key('copy_log', 'c - copy log entry to clipboard', genre='action',
                      scope=HISTORY_ST)
+
         spin.add_key('reset_all', 'r - reset all to "[ ]"', genre='action')
         spin.add_key('init_all', 'i - set all automatic state', genre='action')
         spin.add_key('toggle', 'SP - toggle current line state', genre='action',
                      keys={ord(' '), })
         spin.add_key('skip', 's - skip reencoding --> "---"', genre='action')
-        spin.add_key('go', 'g - begin conversions', genre='action')
-        spin.add_key('quit', 'q - quit converting OR exit app', genre='action',
-                     keys={ord('q'), 0x3})
-        spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
+        spin.add_key('go', 'g - go (start conversions)', genre='action')
+
         spin.add_key('directory', 'd - show directory', vals=[False, True])
         spin.add_key('filter', 'f - filter status',
                      vals=['', '-DUN', '-DUN-ERR', '-DUN-ERR-UnChk', '+ERR'],
@@ -697,9 +685,11 @@ class Converter:
                       scope=HISTORY_ST)
         spin.add_key('hist_time_format', 'a - time format',
                      vals=['ago+time', 'ago', 'time'], scope=HISTORY_ST)
+
         spin.add_key('mangle', 'm - mangle titles', vals=[False, True])
         spin.add_key('fancy_hdr', '_ - header style',
                      vals=['Underline', 'Reverse', 'Off'])
+        spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
 
         # Initialize theme
         self.opts.theme = ''
@@ -723,13 +713,14 @@ class Converter:
         force_redraw = False
         while True:
             # Draw current screen
-            if not spins.freeze:
+            if not spins.freeze or self.need_freeze_draw:
                 current_screen = self.screens[self.stack.curr.num]
                 current_screen.draw_screen()
                 redraw = bool(time.monotonic() - self.redraw_mono >= 60) or force_redraw
                 self.redraw_mono = time.monotonic() if redraw else self.redraw_mono
                 win.render(redraw=redraw)
                 force_redraw = False  # Reset after use
+                self.need_freeze_draw = False
 
             # Get user input with screen-specific timeout
             current_screen = self.screens[self.stack.curr.num]
@@ -743,10 +734,14 @@ class Converter:
                     if screen.search_bar.handle_key(key):
                         force_redraw = True  # Force full redraw on next iteration
                         key = None
-
+            
+            was_freeze = self.spins.freeze
             # Process spinner keys
             if key in spin.keys:
                 spin.do_key(key, win)
+
+            if self.spins.freeze and not was_freeze:
+                self.need_freeze_draw = True
 
             # Let ScreenStack perform any pending actions
             self.stack.perform_actions(spin)
@@ -769,7 +764,7 @@ class Converter:
             self.advance_jobs()
 
             # Clear screen for next render
-            if not spins.freeze:
+            if not spins.freeze or self.need_freeze_draw:
                 win.clear()
 
     def main_loop(self):
@@ -816,13 +811,13 @@ class RmbloatScreen(Screen):
         """ESC key - Return to previous screen"""
         if self.app.stack.curr.num != SELECT_ST:
             self.app.stack.pop()
-    
+
     def help_mode_ACTION(self):
         """? - enter help mode"""
         app = self.app
         if app.stack.curr.num != HELP_ST:
             app.stack.push(HELP_ST, app.win.pick_pos)
-    
+
     def history_ACTION(self):
         """h - go to History Screen"""
         app = self.app
@@ -898,7 +893,8 @@ class SelectScreen(RmbloatScreen):
         cpu_status = app.cpu.get_status_string()
         win.add_header(f'     Picked={stats.picked}/{stats.total}'
                       f'  GB={stats.gb}({stats.delta_gb})'
-                      f'  {cpu_status}')
+                      f'  {cpu_status}'
+                      + (f'  >>> PAUSED <<<' if spins.freeze else ''))
 
         # Column headers
         win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
@@ -996,7 +992,7 @@ class ConvertScreen(RmbloatScreen):
         lines, stats, co_wid = app.make_lines()
 
         # Header line with keys
-        head = f' [s]kip [t]heme [f]ilt={spins.filter} ?=help [q]uit'
+        head = f' [s]kip [f]ilt={spins.filter}  [h]ist [t]heme ?=help [q]uit'
 
         if app.search_re:
             shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
@@ -1005,7 +1001,8 @@ class ConvertScreen(RmbloatScreen):
         cpu_status = app.cpu.get_status_string()
         head += (f'     ToDo={stats.total-stats.done}/{stats.total}'
                 f'  GB={stats.gb}({stats.delta_gb})'
-                f'  {cpu_status}')
+                f'  {cpu_status}'
+                + (f'  >>> PAUSED <<<' if spins.freeze else ''))
         win.add_fancy_header(head, app.opts.fancy_hdr)
 
         # Column headers
@@ -1052,8 +1049,16 @@ class HelpScreen(RmbloatScreen):
     def draw_screen(self):
         """Draw the help screen"""
         app = self.app
+        win = app.win
+        win.set_pick_mode(on=False)
         app.spinner.show_help_nav_keys(app.win)
         app.spinner.show_help_body(app.win)
+        if app.ini:
+            win.add_body('--- CLI ARGS ---')
+            clis = vars(app.ini.vals)
+            for key in clis:
+                win.add_body(f'  ● {key}: {clis[key]}')
+
 
 class HistoryScreen(RmbloatScreen):
     """History screen showing log entries with expand/collapse functionality"""
@@ -1114,6 +1119,33 @@ class HistoryScreen(RmbloatScreen):
             self.entries, pattern, deep=deep_search
         )
 
+    def get_mangled_text(self, text):
+        """ replace text that looks like video name"""
+        extensions = self.app.VIDEO_EXTENSIONS
+        # 1. Prepare extensions into an OR group: (?:mp4|mkv|...)
+        ext_pattern = '|'.join([ext.lstrip('.') for ext in extensions])
+        
+        # 2. The Pattern:
+        # (["'])          -> Group 1: The opening quote
+        # ([^"']+?)       -> Group 2: The filename/path (non-greedy)
+        # \.              -> Literal dot
+        # ({ext_pattern}) -> Group 3: The extension
+        # \1              -> Matches the same opening quote
+
+        pattern = rf'''(["'])([^"']+?)\.({ext_pattern})\1'''
+
+        def replace(match):
+            quote = match.group(1)     # " or '
+            name_part = match.group(2) # The file/path
+            ext = match.group(3)       # The extension (e.g., mkv)
+            
+            mangled_name = Mangler.mangle(name_part)
+            
+            # Re-assemble: quote + mangled + . + preserved extension + quote
+            return f"{quote}{mangled_name}.{ext}{quote}"
+
+        return re.sub(pattern, replace, text)
+    
     def draw_screen(self):
         """Draw the history screen"""
         app = self.app
@@ -1150,7 +1182,8 @@ class HistoryScreen(RmbloatScreen):
         header_line = f'ESC:back [e]xpand [c]opy [a]go {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} oth:{other_count}) /'
         if search_display:
             header_line += f'{search_display}'
-        win.add_header(header_line)
+        header_line += f'  >>> PAUSED <<<' if app.spins.freeze else ''
+        win.add_fancy_header(header_line)
         win.add_header(f'Log file: {lg.log_file}')
 
         # Build display
@@ -1196,6 +1229,8 @@ class HistoryScreen(RmbloatScreen):
             else:
                 level_attr = curses.A_BOLD
 
+            if app.spins.mangle:
+                summary = Mangler.mangle_title(summary)
             line = f"{timestamp_display} [{level:>3}] {summary}{deep_indicator}"
             win.add_body(line, attr=level_attr, context=Context("header", timestamp=timestamp))
             self.visible_lines.append(timestamp)
@@ -1213,12 +1248,18 @@ class HistoryScreen(RmbloatScreen):
                         if len(lines) <= 20:
                             display_lines = lines
                         else:
-                            display_lines = ['  ...'*8] + lines[-20:]
+                            display_lines = lines[:3] + ['  ...'*8] + lines[-17:]
                     else:  # expand_state == 2: Full
                         display_lines = lines
 
                     for line in display_lines:
-                        win.add_body(f"  {line}", context=Context("body", timestamp=timestamp))
+                        if app.spins.mangle:
+                            line = self.get_mangled_text(line)
+                        wraps = textwrap.wrap(line, width=win.cols-3, 
+                                      subsequent_indent='     ', max_lines=3)
+                        for wrap in wraps:
+                            win.add_body(f"  {wrap}", context=
+                                         Context("body", timestamp=timestamp))
                         self.visible_lines.append(None)  # Placeholder for expanded lines
 
                 except (json.JSONDecodeError, ValueError):
@@ -1245,11 +1286,20 @@ class HistoryScreen(RmbloatScreen):
                 # Back to collapsed, remove from dict
                 if timestamp in self.expands:
                     del self.expands[timestamp]
+                pos = win.pick_pos
+                while pos >= 1:
+                    # set position back to header
+                    prev = win.body.contexts[pos-1]
+                    if prev and getattr(prev, 'timestamp', '') == timestamp:
+                        pos -= 1
+                        continue
+                    break
+                win.pick_pos = pos
             else:
                 self.expands[timestamp] = next_state
 
     def copy_log_ACTION(self):
-        """'c' key - Copy entire log entry to clipboard or export to file"""
+        """'c' key - Copy entire log entry to clipboard (OSC 52) or export to file"""
         app = self.app
         win = app.win
         ctx = win.get_picked_context()
@@ -1258,57 +1308,56 @@ class HistoryScreen(RmbloatScreen):
             timestamp = ctx.timestamp
 
             # Find the entry with this timestamp
-            entry = None
-            for e in self.filtered_entries:
-                if e.timestamp == timestamp:
-                    entry = e
-                    break
+            entry = next((e for e in self.filtered_entries if e.timestamp == timestamp), None)
 
             if entry:
-                # Build the full log entry text
-                lines = []
-                lines.append(f"Timestamp: {entry.timestamp}")
-                lines.append(f"Level: {entry.level if hasattr(entry, 'level') else 'N/A'}")
-                lines.append(f"File: {entry.file}:{entry.line}")
-                lines.append(f"Function: {entry.function}()")
-                lines.append("")
-
-                # Add the full message (including JSON if present)
-                if entry.message:
-                    lines.append("Message:")
-                    lines.append(entry.message)
-
-                    # Try to pretty-print JSON if it exists
-                    try:
-                        msg = entry.message
-                        if '{' in msg:
-                            json_start = msg.index('{')
-                            json_str = msg[json_start:]
-                            data = json.loads(json_str)
-                            lines.append("")
-                            lines.append("JSON (formatted):")
-                            lines.append(json.dumps(data, indent=2))
-                    except (json.JSONDecodeError, ValueError, AttributeError):
-                        pass
-
+                # 1. Build the full log entry text
+                lines = [
+                    f"Timestamp: {entry.timestamp}",
+                    f"Level: {getattr(entry, 'level', 'N/A')}",
+                    f"File: {entry.file}:{entry.line}",
+                    f"Function: {entry.function}()",
+                    "",
+                    "Message:",
+                    entry.message or ""
+                ]
                 text = '\n'.join(lines)
 
-                # Try clipboard first using SystemDiscovery
-                sys_disc = get_system_discovery()
-                success, error = sys_disc.copy_to_clipboard(text)
+                # 2. Prepare OSC 52 Magic
+                success = False
+                try:
+                    b64_text = base64.b64encode(text.encode('utf-8')).decode('utf-8')
+                    osc52 = f"\033]52;c;{b64_text}\a"
+                    
+                    # Wrap for Tmux if necessary
+                    if "TMUX" in os.environ:
+                        osc52 = f"\033Ptmux;\033{osc52}\033\\"
 
+                    # Write directly to terminal device to bypass Curses buffer
+                    with open('/dev/tty', 'wb') as f:
+                        f.write(osc52.encode('utf-8'))
+                        f.flush()
+                    success = True
+                except Exception:
+                    success = False
+
+                # 3. User Feedback & Fallback
                 if success:
-                    win.alert(message='Log entry copied to clipboard')
-                else:
-                    # Clipboard failed - fall back to file export
-                    try:
-                        export_path = '/tmp/rmbloat-export.txt'
-                        with open(export_path, 'w', encoding='utf-8') as f:
-                            f.write(text)
-                        win.alert(message=f'Exported to {export_path}')
-                    except Exception as exc:
-                        win.alert(message=f'Export failed: {exc}')
-
+                    # We show success, but warn the user if they are on a limited terminal
+                    win.alert(message='Copied (OSC 52). If paste fails, check /tmp/rmbloat-export.txt')
+                
+                # 4. Always export to /tmp as a "Hard" Fallback
+                try:
+                    export_path = '/tmp/rmbloat-export.txt'
+                    with open(export_path, 'w', encoding='utf-8') as f:
+                        f.write(text)
+                    
+                    if not success:
+                        win.alert(message=f'Clipboard blocked. Exported to {export_path}')
+                except Exception as exc:
+                    if not success:
+                        win.alert(message=f'All copy methods failed: {exc}')
+     
     def hist_search_ACTION(self):
         """ Handle '/' key - start incremental filter search """
         self.search_bar.start("")
@@ -1320,7 +1369,7 @@ def main(args=None):
     Convert video files to desired form
     """
     try:
-        cfg = IniManager(app_name='rmbloat',
+        ini = IniManager(app_name='rmbloat',
                                allowed_codecs='x265',
                                bloat_thresh=1600,
                                files=[],  # Default video collection paths
@@ -1332,7 +1381,7 @@ def main(args=None):
                                quality=28,
                                thread_cnt=4,
                         )
-        vals = cfg.vals
+        vals = ini.vals
         parser = argparse.ArgumentParser(
             description="CLI/curses bulk Video converter for media servers")
         # config options
@@ -1379,8 +1428,6 @@ def main(args=None):
         parser.add_argument('--auto-hr', type=float, default=None,
                     help='Auto mode: run unattended for specified hours, '
                          'auto-select [X] files and auto-start conversions')
-        parser.add_argument('-n', '--dry-run', action='store_true',
-                    help='Perform a trial run with no changes made.')
         parser.add_argument('-s', '--sample', action='store_true',
                     help='produce 30s samples called SAMPLE.{input-file}')
         parser.add_argument('-L', '--logs', action='store_true',
@@ -1420,7 +1467,7 @@ def main(args=None):
                 else:
                     print(f'- {key} {new_value}')
                 setattr(vals, key, new_value)
-            cfg.write()
+            ini.write()
             sys.exit(0)
 
         if opts.logs:
@@ -1455,16 +1502,14 @@ def main(args=None):
             # Run tests (real-world if video_file provided, basic otherwise)
             exit_code = chooser.run_tests(
                 video_file=video_file,
-                duration=30,
+                duration=120,
                 show_test_encode=bool(video_file is None)  # Show example commands if no video
             )
             sys.exit(exit_code)
 
-        if opts.sample:
-            opts.dry_run = False # cannot have both
         opts.bloat_thresh = max(500, opts.bloat_thresh)
 
-        Converter(opts, os.path.dirname(cfg.config_file_path)).main_loop()
+        Converter(opts, os.path.dirname(ini.config_file_path), ini).main_loop()
     except Exception as exc:
         # Note: We no longer call Window.exit_handler(), as ConsoleWindow handles it
         # and there is no guarantee the Window class was ever initialized.

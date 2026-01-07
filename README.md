@@ -18,6 +18,23 @@ So installing `rmbloat` is simple. And if your system has `ffmpeg` installed wit
 
 Anyhow, you have three options described below. These instructions are for Ubuntu and other Debian derived distros. For other distros, you must adjust the procedures accordingly.
 
+> **System Requirements**. To ensure smooth video transcoding and a responsive experience when navigating large logs in the History Screen, the following hardware is recommended:
+> 
+> **Processor (CPU)**. The application leverages hardware-accelerated video encoding. For the best balance of speed and quality:
+> *  Intel: 11th Gen (Tiger Lake) or newer.
+>     *   Why: These chips feature the improved QuickSync (QSV) engine with native support for 10-bit HEVC and AV1 decoding.
+> *   AMD: Ryzen 5000 Series (Zen 3) or newer.
+>     *   Why: Features the VCN 3.0+ engine, which provides parity for modern high-efficiency codecs.
+> 
+> **Memory (RAM)**
+> *   Minimum: 8GB
+> *   Recommended: 16GB (especially if processing 4K content)
+>     *   Why: While the logger is lightweight, the underlying video buffers and the TUI's 50MB log window require stable overhead to prevent interface lag during heavy I/O.
+> 
+> **Storage (SSD)**
+> *   Requirement: An SSD is highly recommended for the ~/.config directory (where events.jsonl is stored).
+>     *   Why: The History Screen performs "read-modify-write" operations when purging or trimming the 50MB log file. An SSD ensures these operations complete in milliseconds, keeping the TUI snappy and preventing "disk-wait" stutters.
+
 ### Option 1: Local FFmpeg with Hardware Acceleration (Recommended)
 
 This provides the best performance with lowest overhead.
@@ -124,7 +141,7 @@ The output will show which strategies work and recommend the best one. `rmbloat`
 ```
         bloat = 1000 * bitrate / sqrt(height*width)
 ```
-A bloat value of 1000 is roughly that of an aggressively compressed h265 file. It is common to see bloats of 4000 or more in typical collections; very bloated files can typically be reduced in size by a factor of 4 or more w/o too much loss of watchability.
+A bloat value of 1000 is roughly that of an aggressively compressed h265 file. It is common to see bloats of 4000 or more in typical collections; very bloated files can typically be reduced in size by a factor of 4 or more w/o too much loss of watchability (IMHO ... others may be more sensitive/caring).
 
 ## Using `rmbloat`
 ### Starting `rmbloat` from the CLI
@@ -170,7 +187,6 @@ options:
                         paths as defaults
   --auto-hr AUTO_HR     Auto mode: run unattended for specified hours,
                         auto-select [X] files and auto-start conversions
-  -n, --dry-run         Perform a trial run with no changes made.
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
   -L, --logs            view the logs
   -T, --chooser-tests   run tests on ffmpeg choices w 30s cvt of 1st given
@@ -408,9 +424,6 @@ Companion files, like .srt files, and folders who share the same basename w/o th
 ### Logging (--logs)
 When a conversion completes successfully or not, details are logged into files in your `~/.config/rmbloat` folder. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
 
-### Dry-Run (--dry-run)
-If started with `--dry-run`, then conversions are not done, but the log is written with details like how file(s) will be renamed. This helps with testing screens and actions more quickly than waiting for actual conversions.
-
 ### Performance and Server Impact
 By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering its priority. This will (in our experience) allow the server to run rather well.  But, your experience may vary.
 
@@ -426,7 +439,7 @@ To test your hardware acceleration support:
 rmbloat --chooser-tests /path/to/test/video.mp4
 ```
 
-This will run 30-second encoding tests with different strategies and report which work best on your system.
+This will run 120-second encoding tests with different strategies and report which work best on your system.
 
 ### Subtitle Handling
 `rmbloat` intelligently handles subtitle streams to prevent conversion failures:

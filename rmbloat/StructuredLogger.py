@@ -134,7 +134,7 @@ class StructuredLogger:
     """
 
     # Size limits (adjust as needed)
-    MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
+    MAX_LOG_SIZE = 50 * 1024 * 1024  # 10 MB
     TRIM_TO_RATIO = 0.67  # Trim to 67% when max exceeded
     ERR_AGE_WEIGHT = 10  # ERR entries age 10x slower
 
@@ -389,6 +389,34 @@ class StructuredLogger:
         entry = self._create_log_entry(str(message_type).upper(), *args,
                                       data=kwargs.get('data'), **kwargs)
         self._append_log(entry)
+
+    def purge_at_or_before(self, timestamp: str, level_filter: Optional[str] = None):
+            """
+            TUI Support: Deletes entries older than or equal to the target timestamp.
+            Allows 'cleaning up' the history screen.
+            """
+            if not self.log_file.exists():
+                return
+
+            kept = []
+            try:
+                with open(self.log_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip(): continue
+                        try:
+                            data = json.loads(line)
+                            # Delete if timestamp matches/older AND (no filter OR level matches)
+                            if data.get('timestamp', '') <= timestamp:
+                                if level_filter is None or data.get('level') == level_filter:
+                                    continue 
+                            kept.append(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                with open(self.log_file, 'w', encoding='utf-8') as f:
+                    f.writelines(kept)
+            except Exception as e:
+                print(f"PURGE ERROR: {e}", file=sys.stderr)
 
     # ========================================================================
     # Filtering and Search Methods

@@ -7,7 +7,7 @@ import sys
 import time
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 from datetime import timedelta
 from .ProbeCache import Probe
 from .FfmpegMon import FfmpegMon
@@ -23,6 +23,14 @@ class PathProbePair:
     probe: Probe
     do_rename: bool = field(default=False, init=False)
     standard_name: str = field(default='', init=False)
+
+@dataclass
+class FfmpegRun:
+    """ per ffmpeg run info"""
+    command: Optional[str] = None
+    descr: Optional[str] = None # describe the run
+    return_code: Optional[int] = None
+    texts: List[str] = field(default_factory=list)
 
 @dataclass(**_dataclass_kwargs)
 class Vid:
@@ -40,7 +48,6 @@ class Vid:
     net: str = field(default='  - ', init=False)
     width: Optional[int] = field(default=None, init=False)
     height: Optional[int] = field(default=None, init=False)
-    command: Optional[str] = field(default=None, init=False)
     res_ok: Optional[bool] = field(default=None, init=False)
     duration: Optional[float] = field(default=None, init=False)
     codec: Optional[str] = field(default=None, init=False)
@@ -53,8 +60,10 @@ class Vid:
     probe0: Optional[Probe] = field(default=None, init=False)
     probe1: Optional[Probe] = field(default=None, init=False)
     basename1: Optional[str] = field(default=None, init=False)
-    return_code: Optional[int] = field(default=None, init=False)
+
+    runs:  List[FfmpegRun] = field(default_factory=list, init=False)
     texts: list = field(default_factory=list, init=False)
+
     ops: list = field(default_factory=list, init=False)
 
     def post_init(self, ppp):
@@ -65,21 +74,24 @@ class Vid:
         self.standard_name = ppp.standard_name
         self.do_rename = ppp.do_rename
 
+    def start_new_run(self, command=None):
+        """ Creates place for new run to be stored """
+        self.runs.append(FfmpegRun(command=command))
+
 class Job:
     """ Represents a video conversion job """
-    def __init__(self, vid, orig_backup_file, temp_file, duration_secs, dry_run=False):
+    def __init__(self, vid, orig_backup_file, temp_file, duration_secs):
         """
         Args:
             vid: Vid object
             orig_backup_file: Path to backup of original file
             temp_file: Path to temporary output file
             duration_secs: Video duration in seconds
-            dry_run: Whether this is a dry run (no actual conversion)
         """
         self.vid = vid
         self.start_mono = time.monotonic()
 
-        self.progress = 'DRY-RUN' if dry_run else 'Started'
+        self.progress = f'Started  [{vid.runs[-1].descr}]'
         self.input_file = os.path.basename(vid.filepath)
         self.orig_backup_file = orig_backup_file
         self.temp_file = temp_file
