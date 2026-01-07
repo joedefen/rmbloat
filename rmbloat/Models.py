@@ -117,3 +117,8 @@ class Job:
         minutes = math.floor((secs % 3600) / 60)
         secs = secs % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    
+    def stop(self):
+        """ stop the job """
+        if self.ffsubproc:
+            self.ffsubproc.stop()

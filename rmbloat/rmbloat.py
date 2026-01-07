@@ -1,31 +1,7 @@
 #!/usr/bin/env python3
 # pylint: disable=too-many-statements
 """
-TODO:
-- make max height an option
-- error strategy
-  - to the probe cache, add an "exception" field
-  - For errors in transcoding, I was thinking of exception values "Er1" ... "Er9" where the number is
-    the number of prior failures capped at 9.   When automatically selecting videos, Er1 would be ignored,
-    in effect, and Er2 or higher would be blocked showing "Er2" instead of a checkbox ... but it
-    would act as unchecked "[ ]" so it could be manually checked showing [X].
- - Similarly, if there was not enough space reduction, the exception value would be "OPT"
-   (already space optimized ... a better designation?), and again those act as if unchecked and
-   can be manually checked (for re-encoding ... presumably because the CMF option was changed
-   or something that might allow the encoding to succeed.)
-- V2.0
-  - fully automated daemon (still running as curses app)
-  - runs during certain hours ... restarts itself to freshly read
-    disk
-
-- V3.0
-  - merge in missing subtitles
-    ffmpeg -i video.mkv -i video.en.srt
-    -map 0 -map 1:s:0
-    -c copy   # Copy all streams, no re-encoding
-    -c:s srt   # Only subtitle needs codec
-    -metadata:s:s:0 language=eng
-    video.sb.mkv
+rmbloat
 """
 
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
@@ -33,7 +9,7 @@ TODO:
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
 # pylint: disable=consider-using-with,line-too-long,too-many-lines
 # pylint: disable=too-many-nested-blocks,try-except-raise,line-too-long
-# pylint: disable=too-many-public-methods,invalid-name
+# pylint: disable=too-many-public-methods,invalid-name,multiple-statements
 
 
 import os
@@ -43,7 +19,6 @@ import argparse
 import traceback
 import re
 import atexit
-import re
 import time
 import json
 import curses
@@ -62,7 +37,6 @@ from .Models import PathProbePair, Vid
 from . import FileOps
 from . import ConvertUtils
 from .JobHandler import JobHandler
-from .SystemDiscovery import get_system_discovery
 
 lg = StructuredLogger('rmbloat')
 
@@ -269,7 +243,75 @@ class Converter:
         elif not vid.doit.startswith('?') and not self.dont_doit(vid):
             vid.doit = '[X]'
 
+    def _log_job_final(self, job, status_label):
+        """Standardized logging for finished jobs"""
+        clean_label = status_label.strip() # Remove the leading space from " OK"
+        dumped = asdict(job.vid)
+
+        if clean_label.startswith('OK'):
+            dumped['texts'] = [] # Clean up logs for successful runs
+
+        title = 'RE-ENCODE-TO-H265'
+        if clean_label == 'OK2': title += '-RETRY'
+        elif clean_label == 'OK3': title += '-SOFTWARE'
+
+        # Use the stripped label for the logic check
+        lg.put('OK' if clean_label.startswith('OK') else 'ERR',
+               f"{title} ", json.dumps(dumped, indent=4))
+
+    def _manage_queue_and_auto_mode(self):
+        """Handles starting the next [X] and checking auto-mode exit"""
+        while True:
+            next_vid = next((v for v in self.visible_vids if v and v.doit == '[X]'), None)
+
+            if next_vid:
+                if not os.path.isfile(next_vid.filepath):
+                    self.vids = [v for v in self.vids if v != next_vid] # Prune missing
+                    continue
+                self.job = self.job_handler.start_transcode_job(next_vid)
+                next_vid.doit = "IP "
+            elif not self.auto_mode_enabled:
+                # Re-sort and exit as you did before
+                self.job_handler = None
+                self.vids.sort(key=lambda v: (v.all_ok, v.bloat), reverse=True)
+                self.stack.pop()
+            return
+
     def advance_jobs(self):
+        """Process ongoing conversion jobs"""
+        # A. Handle Active Job
+        if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
+            next_job, report, is_done = self.job_handler.check_job_status(self.job)
+
+            if not is_done:
+                # Update UI progress line
+                descr = self.job.vid.runs[-1].descr
+                if isinstance(report, str):
+                    self.job.progress = f"{report} [{descr}]"
+
+                # If the handler swapped the job for a retry, update our reference
+                if next_job != self.job:
+                    self.job = next_job
+                    self.job.vid.doit = "IP "
+            else:
+                # Job is finally finished (Success or Final Failure)
+                success = report.strip().startswith('OK')
+                vid = self.job.vid
+                vid.doit = vid.doit_auto = report
+
+                # Perform file operations (cleanup, rename, etc)
+                self.job_handler.finish_transcode_job(success, self.job)
+
+                # Final Logging
+                self._log_job_final(self.job, report)
+                self.job = None
+
+        # B. Start New Jobs / Handle Queue
+        if not self.job and self.stack.curr.num == CONVERT_ST:
+            self._manage_queue_and_auto_mode()
+
+
+    def old_advance_jobs(self):
         """Process ongoing conversion jobs"""
         # Handle running job progress
         if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
@@ -407,21 +449,6 @@ class Converter:
                 self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
                 self.stack.pop()  # Return to select screen
 
-    def is_allowed_codec(self, probe):
-        """ Return whether the codec is 'allowed' """
-        if not probe:
-            return True
-        if not re.match(r'^[a-z]\w*$', probe.codec, re.IGNORECASE):
-            # if not a codec name (e.g., "---"), then it is OK
-            # in the sense we will not choose it as an exception
-            return True
-        codec_ok = bool(self.opts.allowed_codecs == 'all')
-        if self.opts.allowed_codecs == 'x265':
-            codec_ok = bool(probe.codec in ('hevc',))
-        if self.opts.allowed_codecs == 'x26*':
-            codec_ok = bool(probe.codec in ('hevc','h264'))
-        return codec_ok
-
     def apply_probe(self, vid, probe):
         """ TBD """
         # shorthand
@@ -432,7 +459,7 @@ class Converter:
         vid.duration = probe.duration
         vid.gb = probe.gb
 
-        vid.codec_ok = self.is_allowed_codec(probe)
+        vid.codec_ok = JobHandler.is_allowed_codec(self.opts, probe)
 
         vid.res_ok = bool(vid.height is not None and vid.height <= self.TARGET_HEIGHT)
         vid.bloat_ok = bool(vid.bloat < self.opts.bloat_thresh)
@@ -478,7 +505,7 @@ class Converter:
 
     def finish_transcode_job(self, success, job):
         """Delegate to JobHandler and apply probe if returned"""
-        probe = self.job_handler.finish_transcode_job(success, job, self.is_allowed_codec)
+        probe = self.job_handler.finish_transcode_job(success, job)
         # Apply probe if one was returned
         if probe:
             job.vid.probe1 = self.apply_probe(job.vid, probe)
@@ -734,7 +761,7 @@ class Converter:
                     if screen.search_bar.handle_key(key):
                         force_redraw = True  # Force full redraw on next iteration
                         key = None
-            
+
             was_freeze = self.spins.freeze
             # Process spinner keys
             if key in spin.keys:
@@ -830,6 +857,18 @@ class RmbloatScreen(Screen):
         if app.stack.curr.num in (SELECT_ST, CONVERT_ST):
             app.stack.push(THEME_ST, app.win.pick_pos)
 
+    def kill_any_job(self):
+        """ TBD """
+        job = self.app.job
+        if job:
+            self.app.win.flash('Patiently wait for job to abort...')
+            vid = job.vid
+            job.stop()
+            job = None
+            if vid:
+                vid.doit = '[X]'
+            self.app.job_handler = None
+            self.app.job = None
 
 
 class SelectScreen(RmbloatScreen):
@@ -870,7 +909,7 @@ class SelectScreen(RmbloatScreen):
         lines, stats, co_wid = app.make_lines()
 
         # Header line with keys
-        head = '[r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist [t]heme'
+        head = 'SELECT [r]setAll [i]nit SP:toggle [s]kip [g]o [h]ist [t]heme'
         head += f' [f]ilt={spins.filter} ?:help [q]uit'
 
         # Show incremental search bar if active, otherwise show current filter
@@ -894,7 +933,7 @@ class SelectScreen(RmbloatScreen):
         win.add_header(f'     Picked={stats.picked}/{stats.total}'
                       f'  GB={stats.gb}({stats.delta_gb})'
                       f'  {cpu_status}'
-                      + (f'  >>> PAUSED <<<' if spins.freeze else ''))
+                      + ('  >>> PAUSED <<<' if spins.freeze else ''))
 
         # Column headers
         win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
@@ -936,7 +975,12 @@ class SelectScreen(RmbloatScreen):
         if 0 <= idx < len(app.visible_vids):
             vid = app.visible_vids[idx]
             if vid:
-                if vid.doit.startswith(('[', 'DUN')):
+                if app.job and app.job.vid == vid:
+                    self.kill_any_job()
+                    app.job = None # This stops the progress line immediately
+                    vid.doit = '---'
+                    app.probe_cache.set_anomaly(vid.filepath, '---')
+                elif vid.doit.startswith(('[', 'DUN')):
                     vid.doit = '---'
                     app.probe_cache.set_anomaly(vid.filepath, '---')
                 elif vid.doit == '---':
@@ -968,6 +1012,7 @@ class SelectScreen(RmbloatScreen):
 
     def quit_ACTION(self):
         """'q' key - Quit application"""
+        self.kill_any_job()
         sys.exit(0)
 
     def search_ACTION(self):
@@ -979,6 +1024,11 @@ class SelectScreen(RmbloatScreen):
 
 class ConvertScreen(RmbloatScreen):
     """Conversion progress screen - shows encoding progress"""
+
+    def screen_escape_ACTION(self):
+        """ESC key - Return to previous screen"""
+        self.kill_any_job()
+        self.app.stack.pop()
 
     def draw_screen(self):
         """Draw the conversion progress screen"""
@@ -992,7 +1042,7 @@ class ConvertScreen(RmbloatScreen):
         lines, stats, co_wid = app.make_lines()
 
         # Header line with keys
-        head = f' [s]kip [f]ilt={spins.filter}  [h]ist [t]heme ?=help [q]uit'
+        head = f'CONVERT [s]kip [f]ilt={spins.filter}  [h]ist [t]heme ?=help [q]uit'
 
         if app.search_re:
             shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
@@ -1002,7 +1052,7 @@ class ConvertScreen(RmbloatScreen):
         head += (f'     ToDo={stats.total-stats.done}/{stats.total}'
                 f'  GB={stats.gb}({stats.delta_gb})'
                 f'  {cpu_status}'
-                + (f'  >>> PAUSED <<<' if spins.freeze else ''))
+                + ('  >>> PAUSED <<<' if spins.freeze else ''))
         win.add_fancy_header(head, app.opts.fancy_hdr)
 
         # Column headers
@@ -1031,8 +1081,7 @@ class ConvertScreen(RmbloatScreen):
         """'q' key - Return to select screen (stop conversions)"""
         app = self.app
         if app.job:
-            app.job.ffsubproc.stop()
-            app.job.vid.doit = '[X]'
+            self.kill_any_job()
             app.job = None
 
         # Disable auto mode when user interrupts
@@ -1124,7 +1173,7 @@ class HistoryScreen(RmbloatScreen):
         extensions = self.app.VIDEO_EXTENSIONS
         # 1. Prepare extensions into an OR group: (?:mp4|mkv|...)
         ext_pattern = '|'.join([ext.lstrip('.') for ext in extensions])
-        
+
         # 2. The Pattern:
         # (["'])          -> Group 1: The opening quote
         # ([^"']+?)       -> Group 2: The filename/path (non-greedy)
@@ -1138,14 +1187,14 @@ class HistoryScreen(RmbloatScreen):
             quote = match.group(1)     # " or '
             name_part = match.group(2) # The file/path
             ext = match.group(3)       # The extension (e.g., mkv)
-            
+
             mangled_name = Mangler.mangle(name_part)
-            
+
             # Re-assemble: quote + mangled + . + preserved extension + quote
             return f"{quote}{mangled_name}.{ext}{quote}"
 
         return re.sub(pattern, replace, text)
-    
+
     def draw_screen(self):
         """Draw the history screen"""
         app = self.app
@@ -1182,7 +1231,7 @@ class HistoryScreen(RmbloatScreen):
         header_line = f'ESC:back [e]xpand [c]opy [a]go {len(self.filtered_entries)}/{len(self.entries)} (ERR:{err_count} oth:{other_count}) /'
         if search_display:
             header_line += f'{search_display}'
-        header_line += f'  >>> PAUSED <<<' if app.spins.freeze else ''
+        header_line += '  >>> PAUSED <<<' if app.spins.freeze else ''
         win.add_fancy_header(header_line)
         win.add_header(f'Log file: {lg.log_file}')
 
@@ -1255,7 +1304,7 @@ class HistoryScreen(RmbloatScreen):
                     for line in display_lines:
                         if app.spins.mangle:
                             line = self.get_mangled_text(line)
-                        wraps = textwrap.wrap(line, width=win.cols-3, 
+                        wraps = textwrap.wrap(line, width=win.cols-3,
                                       subsequent_indent='     ', max_lines=3)
                         for wrap in wraps:
                             win.add_body(f"  {wrap}", context=
@@ -1328,7 +1377,7 @@ class HistoryScreen(RmbloatScreen):
                 try:
                     b64_text = base64.b64encode(text.encode('utf-8')).decode('utf-8')
                     osc52 = f"\033]52;c;{b64_text}\a"
-                    
+
                     # Wrap for Tmux if necessary
                     if "TMUX" in os.environ:
                         osc52 = f"\033Ptmux;\033{osc52}\033\\"
@@ -1345,19 +1394,19 @@ class HistoryScreen(RmbloatScreen):
                 if success:
                     # We show success, but warn the user if they are on a limited terminal
                     win.alert(message='Copied (OSC 52). If paste fails, check /tmp/rmbloat-export.txt')
-                
+
                 # 4. Always export to /tmp as a "Hard" Fallback
                 try:
                     export_path = '/tmp/rmbloat-export.txt'
                     with open(export_path, 'w', encoding='utf-8') as f:
                         f.write(text)
-                    
+
                     if not success:
                         win.alert(message=f'Clipboard blocked. Exported to {export_path}')
                 except Exception as exc:
                     if not success:
                         win.alert(message=f'All copy methods failed: {exc}')
-     
+
     def hist_search_ACTION(self):
         """ Handle '/' key - start incremental filter search """
         self.search_bar.start("")

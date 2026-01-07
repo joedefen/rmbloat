@@ -184,6 +184,64 @@ class JobHandler:
         except Exception:
             return False
 
+    @staticmethod
+    def is_allowed_codec(opts, probe):
+        """ Return whether the codec is 'allowed' """
+        if not probe:
+            return True
+        if not re.match(r'^[a-z]\w*$', probe.codec, re.IGNORECASE):
+            # if not a codec name (e.g., "---"), then it is OK
+            # in the sense we will not choose it as an exception
+            return True
+        codec_ok = bool(opts.allowed_codecs == 'all')
+        if opts.allowed_codecs == 'x265':
+            codec_ok = bool(probe.codec in ('hevc',))
+        if opts.allowed_codecs == 'x26*':
+            codec_ok = bool(probe.codec in ('hevc','h264'))
+        return codec_ok
+
+
+    def check_job_status(self, job):
+        """
+        Monitors progress and handles the 'Retry Ladder' logic.
+        Returns: (next_job, report_text, is_done)
+        """
+        got = self.get_job_progress(job)
+
+        # 1. Job is still running (got is None or a progress string)
+        if not isinstance(got, int):
+            return job, got, False
+
+        # 2. Job finished - check for retries
+        return_code = got
+        vid = job.vid
+        vid.runs[-1].return_code = return_code
+
+        # Tier 2: Retry with Error Tolerance
+        if (return_code != 0 and
+            not job.is_retry and not job.is_software_fallback and
+            self._should_retry_with_error_tolerance(vid)):
+
+            new_job = self.start_transcode_job(vid, retry_with_error_tolerance=True)
+            return new_job, "RETRYING (Tolerant)...", False
+
+        # Tier 3: Retry with Software
+        if (return_code != 0 and
+            job.is_retry and not job.is_software_fallback and
+            self._should_retry_with_software(vid)):
+
+            new_job = self.start_transcode_job(vid, retry_with_error_tolerance=True, force_software=True)
+            return new_job, "RETRYING (Software)...", False
+
+        # 3. Final Completion (No more retries)
+        success = (return_code == 0)
+        if success:
+            status = 'OK3' if job.is_software_fallback else ('OK2' if job.is_retry else ' OK')
+        else:
+            status = 'ERR'
+
+        return None, status, True
+
     def make_color_opts(self, color_spt):
         """ Generate FFmpeg color space options from color_spt string """
         spt_parts = color_spt.split(',')
@@ -400,19 +458,27 @@ class JobHandler:
 #               map_copy += ' 0:s? -map -0:t -map -0:d'
         # Expanded unsafe list for Blu-ray/DVD bitmap subs
 
-        if merged_external_subtitle:
-            map_copy += ' -0:s -map -0:t -map -0:d'
-        else:
-            UNSAFE_SUBS = ['dvd_subtitle', 'pgs', 'hdmv_pgs_subtitle', 'dvbsub']
-            map_copy += ' -map 0:s?'
-            # Identify and drop bitmap streams
-            for idx, s in enumerate(probe.streams):
-                if s.type == 'subtitle' and s.codec in UNSAFE_SUBS:
-                    map_copy += f' -map -0:s:{idx}'
-            # -c:s copy is the safety net for the remaining subs
-            map_copy += ' -c:s copy -map -0:t -map -0:d'
+        # Initialize map_opts as a list with video and audio defaults
+        map_opts = ['-map', '0:v:0', '-map', '0:a?', '-c:a', 'copy']
 
-        params.map_opts = map_copy.split()
+        if merged_external_subtitle:
+            # Drop all internal subs/tags to prepare for external merge
+            map_opts.extend(['-map', '-0:s', '-map', '-0:t', '-map', '-0:d'])
+        else:
+            # 1. Start with the 'copy all subs' request (the ? makes it optional)
+            map_opts.extend(['-map', '0:s?'])
+            
+            # 2. Iterate through known streams to surgically remove "unsafe" ones
+            UNSAFE_SUBS = {'dvd_subtitle', 'pgs', 'hdmv_pgs_subtitle', 'dvbsub'}
+            for idx, s in enumerate(probe.streams):
+                if s.get('type') == 'subtitle' and s.get('codec') in UNSAFE_SUBS:
+                    map_opts.extend(['-map', f'-0:s:{idx}'])
+            
+            # 3. Add safety nets and exclude attachments/data
+            map_opts.extend(['-c:s', 'copy', '-map', '-0:t', '-map', '-0:d'])
+
+        # No need to .split() since it is already a list
+        params.map_opts = map_opts
         params.external_subtitle = merged_external_subtitle
 
         # Set subtitle codec to srt for MKV compatibility (transcodes mov_text, ass, etc.)
@@ -524,10 +590,14 @@ class JobHandler:
                 # 2. Calculate remaining time
                 if job.duration_secs > 0:
                     percent_complete = (time_encoded_seconds / job.duration_secs) * 100
-                    if percent_complete > 0 and speed > 0:
-                        # Time Remaining calculation (rough estimate)
-                        # Remaining Time = (Total Time - Encoded Time) / Speed
-                        remaining_seconds = (job.duration_secs - time_encoded_seconds) / speed
+                    
+                    # MINIMAL FIX: Calculate average speed based on real time passed
+                    elapsed_real = now_mono - job.start_mono
+                    avg_speed = time_encoded_seconds / elapsed_real if elapsed_real > 0 else 0
+                    
+                    if percent_complete > 0 and avg_speed > 0:
+                        # Use avg_speed instead of the instantaneous 'speed' from the regex
+                        remaining_seconds = (job.duration_secs - time_encoded_seconds) / avg_speed
                         remaining_time_formatted = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
                     else:
                         remaining_time_formatted = "N/A"
@@ -542,7 +612,7 @@ class JobHandler:
                     f"{percent_complete:.1f}% "
                     f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} "
                     f"-{remaining_time_formatted} "
-                    f"{speed:.1f}x "
+                    f"{avg_speed:.1f}x "
                     f"At {cur_time_formatted}/{job.total_duration_formatted}"
                 )
                 return progress_line
@@ -558,7 +628,7 @@ class JobHandler:
             else: # got nothing
                 return got
 
-    def finish_transcode_job(self, success, job, is_allowed_codec_func):
+    def finish_transcode_job(self, success, job):
         """
         Complete a transcoding job and handle file operations.
 
@@ -568,7 +638,7 @@ class JobHandler:
 
         def elaborate_err(vid):
             """
-            Analyzes FFmpeg output using a severity scoring system to detect 
+            Analyzes FFmpeg output using a severity scoring system to detect
             severe stream corruption.
             """
             if vid.runs[-1].return_code != 0:
@@ -604,22 +674,27 @@ class JobHandler:
         ##################################
         vid = job.vid
         probe = None
-        # space_saved_gb = 0.0
+        # space_saved_gb = 0.0vid.net
         if success:
             probe = self.probe_cache.get(job.temp_file)
             if not probe:
                 success = False
                 vid.doit = 'ERR'
-                net = 0
                 elaborate_err(vid)
             else:
-                net = (vid.gb - probe.gb) / vid.gb
-                net = int(round(-net*100))
-                # space_saved_gb = vid.gb - probe.gb
-            if is_allowed_codec_func(probe) and net > -self.opts.min_shrink_pct:
-                self.probe_cache.set_anomaly(vid.filepath, 'OPT')
-                success = False
-            vid.net = f'{net}%'
+                # net is negative for shrink (e.g., -30)
+                net = (probe.gb - vid.gb) / max(vid.gb,0.001)
+                net = int(round(net * 100))
+                vid.net = f'{net}%'
+
+                # CHECK: Was the ORIGINAL file already a 'good' codec?
+                original_was_allowed = self.is_allowed_codec(self.opts, vid.probe0)
+
+                # If it was already a good codec, it MUST meet the shrink requirement
+                if original_was_allowed and net > -self.opts.min_shrink_pct:
+                    vid.ops.append(f"REJECTED: Already {vid.probe0.codec} and shrink ({net}%) not > -{self.opts.min_shrink_pct}%")
+                    self.probe_cache.set_anomaly(vid.filepath, 'OPT')
+                    success = False
 
         # Track auto mode vitals
         if self.auto_mode_enabled:
@@ -680,10 +755,12 @@ class JobHandler:
             vid.basename1 = job.temp_file
             # probe will be returned to Converter for apply_probe
         elif not success:
-            # Transcoding failed, delete the temporary file
+            # Transcoding failed or was rejected
             if os.path.exists(job.temp_file):
                 os.remove(job.temp_file)
-                print(f"FFmpeg failed. Deleted incomplete {job.temp_file}.")
+                # Ensure we log WHY it was deleted if it hasn't been logged yet
+                if not vid.ops:
+                    vid.ops.append(f"CLEANUP: Deleted {job.temp_file} - FFmpeg failed or quality check rejected file.")
             self.probe_cache.set_anomaly(vid.filepath, 'Err')
 
         # Return probe for Converter to apply

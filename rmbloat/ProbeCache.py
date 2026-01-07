@@ -17,6 +17,13 @@ from concurrent.futures import ThreadPoolExecutor # <-- NEW IMPORT
 
 _dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
 
+
+@dataclass(**_dataclass_kwargs)
+class StreamInfo:
+    """Minimal stream metadata"""
+    type: str   # 'video', 'audio', 'subtitle'
+    codec: str
+
 @dataclass(**_dataclass_kwargs)
 class Probe:
     """Video metadata probe results"""
@@ -32,6 +39,7 @@ class Probe:
     duration: float = 0.0
     fps: float = 0.0
     size_bytes: int = 0
+    streams: List[Dict[str, str]] = field(default_factory=list) # Add this
 
     # Computed fields (not stored on disk)
     bloat: int = field(default=0, init=False)
@@ -39,7 +47,8 @@ class Probe:
 
 class ProbeCache:
     """ TBD """
-    disk_fields = set('anomaly width height codec bitrate fps duration size_bytes color_spt customs pix_fmt'.split())
+    disk_fields = set(('anomaly width height codec bitrate fps'
+                      ' duration size_bytes color_spt customs pix_fmt streams').split())
 
     """ TBD """
     def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp", chooser=None):
@@ -158,6 +167,14 @@ class ProbeCache:
                 print(f"Error: ffprobe output missing critical stream/format data for '{file_path}'.")
                 return None
 
+            # Capture all streams for the JobHandler to use later
+            all_streams = []
+            for s in metadata.get('streams', []):
+                all_streams.append({
+                    'type': s.get('codec_type'),
+                    'codec': s.get('codec_name')
+                })
+
             meta = Probe(
                 width=int(video_stream.get('width', 0)),
                 height=int(video_stream.get('height', 0)),
@@ -166,6 +183,7 @@ class ProbeCache:
                 pix_fmt=video_stream.get('pix_fmt', 'unknown'),
                 bitrate=int(int(metadata["format"].get('bit_rate', '0'))/1000),
                 duration=float(metadata["format"].get('duration', 0.0)),
+                streams=all_streams,
             )
 
             # Detect unsafe subtitle streams (bitmap codecs that cause conversion failures)
