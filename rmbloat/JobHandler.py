@@ -14,7 +14,7 @@ import send2trash
 from .Models import Job, Vid
 from .ConvertUtils import bash_quote
 from . import FileOps
-from .FfmpegMon import FfmpegMon
+from .TranscodeThread import TranscodeThread
 
 def emergency_cleanup(self):
     """Call this on crash or KeyboardInterrupt"""
@@ -342,7 +342,7 @@ class JobHandler:
 
     def start_transcode_job(self, vid: Vid, retry_with_error_tolerance=False,
                             force_software=False):
-        """Start a transcoding job using the Threaded FfmpegMon."""
+        """Start a transcoding job using the Threaded TranscodeThread."""
         os.chdir(os.path.dirname(vid.filepath))
         basename = os.path.basename(vid.filepath)
         probe = vid.probe0
@@ -434,31 +434,31 @@ class JobHandler:
         if force_software and original_use_acceleration is not None:
             self.chooser.use_acceleration = original_use_acceleration
 
-        job.monitor = FfmpegMon(cmd=ffmpeg_cmd, run_info=run, job=job,
+        job.thread = TranscodeThread(cmd=ffmpeg_cmd, run_info=run, job=job,
                     progress_secs_max=self.opts.progress_secs_max, temp_file=temp_file)
-        job.monitor.start()
+        job.thread.start()
 
         return job
 
     def get_job_progress(self, job):
         """ If the thread says it's done, return the return code (the 'int') """
-        if job.monitor.is_finished:
-            return job.monitor.info.return_code
-        if not job.monitor.is_alive():
-            job.monitor.info.return_code = 999
-            return job.monitor.info.return_code
+        if job.thread.is_finished:
+            return job.thread.info.return_code
+        if not job.thread.is_alive():
+            job.thread.info.return_code = 999
+            return job.thread.info.return_code
 
         # Otherwise, just return the string the thread has prepared for us
-        return job.monitor.status_string
+        return job.thread.status_string
 
     def finish_transcode_job(self, job):
         """
-        Finalizes the job after the FfmpegMon thread completes.
+        Finalizes the job after the TranscodeThread thread completes.
         Replaces the old 'success' argument by checking the thread's return_code.
         """
         # 1. Ensure the thread is dead before we reap it
-        if job.monitor.is_alive():
-            job.monitor.join(timeout=2)
+        if job.thread.is_alive():
+            job.thread.join(timeout=2)
 
         vid = job.vid
         # The thread has already populated vid.runs[-1] with the return_code and texts.

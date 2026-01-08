@@ -659,7 +659,7 @@ class FfmpegChooser:
 
         # Calculate the actual quality value to use
         quality_val = self._get_target_quality(
-            base_crf=self.opts.crf, # Your CLI default (e.g., 28)
+            base_crf=params.crf, # Your CLI default (e.g., 28)
             acceleration=self.use_acceleration,
             height=source_height
         )

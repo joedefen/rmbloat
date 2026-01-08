@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import timedelta
 from .ProbeCache import Probe
-from .FfmpegMon import FfmpegMon
+from .TranscodeThread import TranscodeThread
 # pylint: disable=import-outside-toplevel,too-many-instance-attributes
 # pylint: disable=invalid-name,too-many-positional-arguments,too-many-arguments
 
@@ -88,7 +88,7 @@ class Job:
     """ Represents a video conversion job """
     def __init__(self, vid, orig_backup_file, temp_file, duration_secs, opts):
         self.vid = vid
-        self.opts = opts # Needed for FfmpegMon timeout logic
+        self.opts = opts # Needed for TranscodeThread timeout logic
         self.start_mono = time.monotonic()
 
         self.input_file = os.path.basename(vid.filepath)
@@ -98,9 +98,9 @@ class Job:
         self.total_duration_formatted = self.trim0(
                         str(timedelta(seconds=int(duration_secs))))
 
-        # Note: We don't initialize FfmpegMon here anymore.
-        # JobHandler will initialize it and assign it to self.monitor.
-        self.monitor: Optional[FfmpegMon] = None
+        # Note: We don't initialize TranscodeThread here anymore.
+        # JobHandler will initialize it and assign it to self.thread.
+        self.thread: Optional[TranscodeThread] = None
 
     @property
     def progress(self):
@@ -108,11 +108,11 @@ class Job:
         The UI calls this. It simply grabs the pre-baked string
         from the background thread.
         """
-        if self.monitor:
+        if self.thread:
             # If the thread is finished, it might return the int return_code
-            if self.monitor.is_finished:
-                return self.monitor.info.return_code
-            return self.monitor.status_string + self.vid.descr_str()
+            if self.thread.is_finished:
+                return self.thread.info.return_code
+            return self.thread.status_string + self.vid.descr_str()
         return "Pending..."
 
     @staticmethod
@@ -131,7 +131,7 @@ class Job:
         secs = secs % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    def stop(self):
+    def abort(self):
         """ Stop the job and kill the thread/process """
-        if self.monitor:
-            self.monitor.stop()
+        if self.thread:
+            self.thread.abort()

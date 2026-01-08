@@ -60,7 +60,7 @@ def store_cache_on_exit():
             Converter.singleton.probe_cache.store()
 
 # Data models moved to Models.py
-# FfmpegMon class moved to FfmpegMon.py
+# TranscodeThread class moved to TranscodeThread.py
 # Job class moved to Models.py
 
 class Converter:
@@ -749,7 +749,7 @@ class RmbloatScreen(Screen):
         if job:
             self.app.win.flash('Patiently wait for job to abort...')
             vid = job.vid
-            job.stop()
+            job.abort()
             job = None
             if vid:
                 vid.doit = '[X]'
@@ -958,7 +958,7 @@ class ConvertScreen(RmbloatScreen):
         app = self.app
         if app.job:
             vid = app.job.vid
-            app.job.ffsubproc.stop()
+            app.job.abort()
             app.job = None
             vid.doit = '---'
             app.probe_cache.set_anomaly(vid.filepath, '---')

@@ -13,7 +13,7 @@ from datetime import timedelta
 from typing import Optional
 
 
-class FfmpegMon(threading.Thread):
+class TranscodeThread(threading.Thread):
     """ TBD """
     def __init__(self, cmd, run_info, job, progress_secs_max, temp_file=None):
         super().__init__(daemon=True)
@@ -104,7 +104,7 @@ class FfmpegMon(threading.Thread):
             # Timeout Watchdog
             if now - self.last_activity_mono > self.progress_secs_max:
                 self.info.texts.append('PROGRESS TIMEOUT')
-                self.stop(return_code=254)
+                self.abort(return_code=254)
                 break
 
             if self.process.poll() is not None:
@@ -146,7 +146,7 @@ class FfmpegMon(threading.Thread):
             # If parsing fails (e.g. out_time is malformed), keep last status
             return self.status_string
 
-    def stop(self, return_code=255):  # TODO: rename abort
+    def abort(self, return_code=255):  # TODO: rename abort
         """ Forcefully stop FFmpeg and delete the partial temp file """
         self._stop_event.set()
         
