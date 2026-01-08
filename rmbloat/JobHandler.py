@@ -9,33 +9,22 @@ Job handling for video conversion - manages transcoding jobs and progress monito
 import os
 import re
 import time
-from datetime import timedelta
 from pathlib import Path
 import send2trash
 from .Models import Job, Vid
 from .ConvertUtils import bash_quote
 from . import FileOps
+from .FfmpegMon import FfmpegMon
 
+def emergency_cleanup(self):
+    """Call this on crash or KeyboardInterrupt"""
+    if self.temp_file:
+        if os.path.exists(self.temp_file):
+            print(f"Cleaning up orphaned temp file: {self.temp_file}")
+            os.unlink(self.temp_file)
 
 class JobHandler:
     """Handles video transcoding job execution and monitoring"""
-
-    # Regex for parsing FFmpeg progress output
-    PROGRESS_RE = re.compile(
-        # 1. Frame Section (Required, Strict Numerical Capture)
-        # Looks for 'frame=', then captures the integer (G1).
-        r"\s*frame[=\s]+(\d+)\s+"
-
-        # 2. Time Section (Optional, Strict Numerical Capture)
-        # Looks for 'time=', then attempts to capture the precise HH:MM:SS.cs format (G2-G5).
-        r"(?:.*?time[=\s]+(\d{2}):(\d{2}):(\d{2})\.(\d+))?"
-
-        # 3. Speed Section (Optional, Strict Numerical Capture)
-        # Looks for 'speed=', then captures the float (G6).
-        r"(?:.*?speed[=\s]+(\d+\.\d+)x)?",
-
-        re.IGNORECASE
-    )
 
     # Regex for validating SRT timestamp lines (HH:MM:SS,mmm --> HH:MM:SS,mmm)
     SRT_TIMESTAMP_RE = re.compile(
@@ -114,6 +103,7 @@ class JobHandler:
         self.consecutive_failures = 0
         self.ok_count = 0
         self.error_count = 0
+        self.temp_file = None # her, for easy atexit cleanup
 
     def validate_srt_file(self, filepath, min_captions=12):
         """
@@ -234,7 +224,7 @@ class JobHandler:
             return new_job, "RETRYING (Software)...", False
 
         # 3. Final Completion (No more retries)
-        success = (return_code == 0)
+        success = bool(return_code == 0)
         if success:
             status = 'OK3' if job.is_software_fallback else ('OK2' if job.is_retry else ' OK')
         else:
@@ -349,13 +339,15 @@ class JobHandler:
 
         return False
 
+
     def start_transcode_job(self, vid: Vid, retry_with_error_tolerance=False,
                             force_software=False):
-        """Start a transcoding job using FfmpegChooser."""
+        """Start a transcoding job using the Threaded FfmpegMon."""
         os.chdir(os.path.dirname(vid.filepath))
         basename = os.path.basename(vid.filepath)
         probe = vid.probe0
 
+        # ... [Subtitle and Path Logic] ...
         merged_external_subtitle = None
         if self.opts.merge_subtitles:
             subtitle_path = Path(vid.filepath).with_suffix('.en.srt')
@@ -363,333 +355,143 @@ class JobHandler:
                 merged_external_subtitle = str(subtitle_path)
                 vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
 
-        # Determine output file paths
         prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        temp_file = f"{prefix}.{vid.standard_name}"
+        self.temp_file = temp_file = f"{prefix}.{vid.standard_name}"
         orig_backup_file = f"ORIG.{basename}"
 
         if os.path.exists(temp_file):
             os.unlink(temp_file)
 
-        # Calculate duration
-        duration_secs = probe.duration
-        if self.opts.sample:
-            duration_secs = self.sample_seconds
+        duration_secs = self.sample_seconds if self.opts.sample else probe.duration
 
-        # Decide on 10-bit encoding based on input pixel format
-        use_10bit = self.should_use_10bit(probe.pix_fmt, probe.codec)
+        # 1. Initialize the Run and the Job
+        if not retry_with_error_tolerance and not force_software:
+            vid.runs = []
 
-        # Determine encoding strategy
-        # If force_software is True, override chooser's acceleration setting
+        vid.start_new_run()
+        run = vid.runs[-1]
+
+        if retry_with_error_tolerance and not force_software:
+            run.descr = 'redo w err tolerance'
+        elif force_software:
+            run.descr = 'retry w S/W convert'
+        else:
+            run.descr = 'initial run'
+
+        job = Job(vid, orig_backup_file, temp_file, duration_secs, self.opts)
+        job.is_retry = retry_with_error_tolerance
+        job.is_software_fallback = force_software
+
+        # 2. Determine encoding strategy
         original_use_acceleration = None
         if force_software:
             original_use_acceleration = self.chooser.use_acceleration
             self.chooser.use_acceleration = False
 
-
-        # Store command for logging
-        if not retry_with_error_tolerance and not force_software:
-            vid.runs = []
-        vid.start_new_run()
-        if retry_with_error_tolerance and not force_software:
-            vid.runs[-1].descr = 'redo w err tolerance'
-        elif force_software:
-            vid.runs[-1].descr = 'retry w S/W convert'
-        else:
-            vid.runs[-1].descr = 'initial run'
-
-
-        job = Job(vid, orig_backup_file, temp_file, duration_secs)
-        job.input_file = basename
-        job.is_retry = retry_with_error_tolerance
-        job.is_software_fallback = force_software
-
-        # Create namespace with defaults
+        # 3. Build FFmpeg Parameters
         params = self.chooser.make_namespace(
-            input_file=job.input_file,
-            output_file=job.temp_file,
-            use_10bit=use_10bit,
+            input_file=basename,
+            output_file=temp_file,
+            use_10bit=self.should_use_10bit(probe.pix_fmt, probe.codec),
             error_tolerant=retry_with_error_tolerance
         )
-
-        # Set quality
         params.crf = self.opts.quality
-
-        # Set priority
         params.use_nice_ionice = not self.opts.full_speed
-
-        # Set thread count
         params.thread_count = self.opts.thread_cnt
 
-        # Sampling options
         if self.opts.sample:
             params.sample_mode = True
             start_secs = max(120, job.duration_secs) * 0.20
             params.pre_input_opts = ['-ss', job.duration_spec(start_secs)]
             params.post_input_opts = ['-t', str(self.sample_seconds)]
 
-        # Scaling options
-        MAX_HEIGHT = 1080
-        if probe.height > MAX_HEIGHT:
-            width = MAX_HEIGHT * probe.width // probe.height
+        # Scaling and Color
+        if probe.height > 1080:
+            width = 1080 * probe.width // probe.height
             params.scale_opts = ['-vf', f'scale={width}:-2']
-
-        # Color options
         params.color_opts = self.make_color_opts(vid.probe0.color_spt)
 
-        # Stream mapping options
-        map_copy = '-map 0:v:0 -map 0:a? -c:a copy -map'
-
-#       # Check for external subtitle file
-#       if merged_external_subtitle:
-#           # Don't copy internal subtitles, we're replacing with external
-#           map_copy += ' -0:s -map -0:t -map -0:d'
-#       else:
-#           # Copy internal subtitles, but drop unsafe ones (bitmap codecs like dvd_subtitle)
-#           # Check if probe has custom instructions to drop specific subtitle streams
-#           if probe.customs and 'drop_subs' in probe.customs:
-#               # Map all subtitles first, then explicitly exclude the unsafe ones
-#               map_copy += ' 0:s?'
-#               for sub_idx in probe.customs['drop_subs']:
-#                   map_copy += f' -map -0:s:{sub_idx}'
-#               map_copy += ' -map -0:t -map -0:d'
-#           else:
-#               # No custom subtitle filtering needed
-#               map_copy += ' 0:s? -map -0:t -map -0:d'
-        # Expanded unsafe list for Blu-ray/DVD bitmap subs
-
-        # Initialize map_opts as a list with video and audio defaults
+        # Mapping
         map_opts = ['-map', '0:v:0', '-map', '0:a?', '-c:a', 'copy']
-
         if merged_external_subtitle:
-            # Drop all internal subs/tags to prepare for external merge
             map_opts.extend(['-map', '-0:s', '-map', '-0:t', '-map', '-0:d'])
         else:
-            # 1. Start with the 'copy all subs' request (the ? makes it optional)
             map_opts.extend(['-map', '0:s?'])
-            
-            # 2. Iterate through known streams to surgically remove "unsafe" ones
             UNSAFE_SUBS = {'dvd_subtitle', 'pgs', 'hdmv_pgs_subtitle', 'dvbsub'}
             for idx, s in enumerate(probe.streams):
                 if s.get('type') == 'subtitle' and s.get('codec') in UNSAFE_SUBS:
                     map_opts.extend(['-map', f'-0:s:{idx}'])
-            
-            # 3. Add safety nets and exclude attachments/data
             map_opts.extend(['-c:s', 'copy', '-map', '-0:t', '-map', '-0:d'])
 
-        # No need to .split() since it is already a list
         params.map_opts = map_opts
         params.external_subtitle = merged_external_subtitle
-
-        # Set subtitle codec to srt for MKV compatibility (transcodes mov_text, ass, etc.)
-        # When external subtitle is used, FfmpegChooser handles the codec internally
         params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
 
-        # For error-tolerant mode, add resolution to stabilize filter graph
-        if retry_with_error_tolerance and not force_software:
-            params.width = probe.width
-            params.height = probe.height
-
-        # Generate the command
+        # 4. Finalize Command and Launch Thread
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
-        vid.runs[-1].command = bash_quote(ffmpeg_cmd)
+        run.command = bash_quote(ffmpeg_cmd)
 
-        # Restore original acceleration setting if it was overridden
         if force_software and original_use_acceleration is not None:
             self.chooser.use_acceleration = original_use_acceleration
 
-        # Start the job
-        job.ffsubproc.start(ffmpeg_cmd, temp_file=job.temp_file)
-        self.prev_ffmpeg_out_mono = self.progress_line_mono = time.monotonic()
+        job.monitor = FfmpegMon(cmd=ffmpeg_cmd, run_info=run, job=job,
+                    progress_secs_max=self.opts.progress_secs_max, temp_file=temp_file)
+        job.monitor.start()
+
         return job
 
     def get_job_progress(self, job):
-        vid = job.vid
-        secs_max = self.opts.progress_secs_max
-        now_mono = time.monotonic()
+        """ If the thread says it's done, return the return code (the 'int') """
+        if job.monitor.is_finished:
+            return job.monitor.info.return_code
+        if not job.monitor.is_alive():
+            job.monitor.info.return_code = 999
+            return job.monitor.info.return_code
 
-        # 1. DRAIN THE BACKLOG (Prevent False Timeout)
-        while len(job.ffsubproc.output_queue) > 1:
-            discarded = job.ffsubproc.poll()
-            if isinstance(discarded, str):
-                self.prev_ffmpeg_out_mono = now_mono 
-                if not discarded.startswith("PROGRESS:"):
-                    vid.runs[-1].texts.append(discarded)
-            elif isinstance(discarded, int):
-                vid.runs[-1].return_code = discarded
-                return discarded
+        # Otherwise, just return the string the thread has prepared for us
+        return job.monitor.status_string
 
-        # 2. THE MONITORING LOOP
-        while True:
-            got = job.ffsubproc.poll()
-            now_mono = time.monotonic()
-
-            if isinstance(got, int):
-                vid.runs[-1].return_code = got
-                return got
-
-            if isinstance(got, str):
-                self.prev_ffmpeg_out_mono = now_mono 
-
-                # Fast-forward: Skip old progress updates if we're backed up
-                if len(job.ffsubproc.output_queue) > 0 and got.startswith("PROGRESS:"):
-                    continue
-
-                match = self.PROGRESS_RE.search(got)
-                
-                if not match:
-                    # If it's a real log message, save it
-                    if not got.startswith('PROGRESS:'):
-                        vid.runs[-1].texts.append(got)
-                    # If regex failed on a PROGRESS line, just wait for the next one
-                    return None 
-
-                # UI Throttle
-                if now_mono - self.progress_line_mono < 1.8:
-                    return None
-                
-                self.progress_line_mono = now_mono
-
-                # Parsing
-                groups = match.groups()
-                try:
-                    h, m, s = int(groups[1]), int(groups[2]), int(groups[3])
-                    f_str = groups[4]
-                    f_val = int(f_str) / (10 ** len(f_str))
-                    time_encoded_seconds = h * 3600 + m * 60 + s + f_val
-                except (ValueError, TypeError, IndexError):
-                    # We dumped rough_progress, so we just return None if parsing fails
-                    return None
-
-                # 3. ACCURATE SPEED CALCULATION
-                # We use the time encoded relative to the start
-                elapsed_real = now_mono - job.start_mono
-                if elapsed_real > 0.5 and time_encoded_seconds > 0:
-                    avg_speed = time_encoded_seconds / elapsed_real
-                else:
-                    avg_speed = 0.0
-                
-                # 4. REMAINING TIME
-                if job.duration_secs > 0 and avg_speed > 0:
-                    percent_complete = (time_encoded_seconds / job.duration_secs) * 100
-                    remaining_seconds = (job.duration_secs - time_encoded_seconds) / avg_speed
-                    remaining_str = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
-                else:
-                    percent_complete = 0.0
-                    remaining_str = "N/A"
-
-                # 5. FORMATTING
-                cur_time_str = job.trim0(str(timedelta(seconds=int(round(time_encoded_seconds)))))
-                elapsed_str = job.trim0(str(timedelta(seconds=int(elapsed_real))))
-                
-                return (
-                    f"{percent_complete:.1f}% "
-                    f"{elapsed_str} "
-                    f"-{remaining_str} "
-                    f"{avg_speed:.1f}x "
-                    f"At {cur_time_str}/{job.total_duration_formatted}"
-                )
-
-            elif now_mono - self.prev_ffmpeg_out_mono > secs_max:
-                vid.runs[-1].texts.append('PROGRESS TIMEOUT')
-                job.ffsubproc.stop(return_code=254)
-                self.prev_ffmpeg_out_mono = now_mono + 1_000_000
-                return 254
-            
-            else:
-                return None
-
-    def finish_transcode_job(self, success, job):
+    def finish_transcode_job(self, job):
         """
-        Complete a transcoding job and handle file operations.
-
-        Returns:
-            probe: The probe of the transcoded file (or None if failed)
+        Finalizes the job after the FfmpegMon thread completes.
+        Replaces the old 'success' argument by checking the thread's return_code.
         """
+        # 1. Ensure the thread is dead before we reap it
+        if job.monitor.is_alive():
+            job.monitor.join(timeout=2)
 
-        def elaborate_err(vid):
-            """
-            Analyzes FFmpeg output using a severity scoring system to detect
-            severe stream corruption.
-            """
-            if vid.runs[-1].return_code != 0:
-                CORRUPTION_SEVERITY = {
-                    "corrupt decoded frame": 10,
-                    "illegal mb_num": 9,
-                    "marker does not match f_code": 9,
-                    "damaged at": 8,
-                    "Error at MB:": 7,
-                    "time_increment_bits": 6,
-                    "slice end not reached": 5,
-                    "concealing": 2,  # Low weight to filter out minor issues
-                }
-
-                # Define the threshold for flagging the file as "CORRUPT"
-                # 30-50 is a good starting point to confirm systemic failure.
-                SEVERITY_THRESHOLD = 30
-                total_severity = 0
-                corruption_events = 0
-                last_score = 0
-
-                for line in vid.runs[-1].texts:
-                    this_line_signal_score = 0
-                                    # 1. Check for signals
-                    for signal, score in CORRUPTION_SEVERITY.items():
-                        if signal in line:
-                            total_severity += score
-                            corruption_events += 1
-                            this_line_signal_score = score
-                            break 
-                            
-                    # 2. Check for repeats
-                    repeat_match = re.search(r"Last message repeated (\d+) times", line)
-                    if repeat_match:
-                        multiplier = int(repeat_match.group(1))
-                        # If last_score is 0, it means the repeated message 
-                        # wasn't one of our corruption signals.
-                        total_severity += (last_score * multiplier)
-                        if last_score > 0:
-                            corruption_events += multiplier
-                        # A repeat line itself cannot be a signal for the NEXT line
-                        this_line_signal_score = 0 
-
-                    # 3. Update last_score for the NEXT iteration
-                    # If the current line was neither a signal nor a repeat, 
-                    # last_score becomes 0.
-                    last_score = this_line_signal_score
-
-
-                if total_severity >= SEVERITY_THRESHOLD:
-                    vid.runs[-1].texts.append(f"CORRUPT VIDEO: Total Severity Score {total_severity} "
-                        f"from {corruption_events} events. FFmpeg error_code={vid.return_code}")
-
-
-        ##################################
         vid = job.vid
+        # The thread has already populated vid.runs[-1] with the return_code and texts.
+        run = vid.runs[-1]
+
+        # Determine success based on FFmpeg return code
+        success = bool(run.return_code == 0)
+
+        # 2. Analyze errors if it failed (or even if it succeeded, to find corruption)
+        self.elaborate_err(vid)
+
         probe = None
-        # space_saved_gb = 0.0vid.net
         if success:
+            # Check if the file actually exists and is valid
             probe = self.probe_cache.get(job.temp_file)
             if not probe:
                 success = False
                 vid.doit = 'ERR'
-                elaborate_err(vid)
+                run.texts.append("ERROR: FFmpeg returned 0 but output file is un-probable.")
             else:
-                # net is negative for shrink (e.g., -30)
-                net = (probe.gb - vid.gb) / max(vid.gb,0.001)
-                net = int(round(net * 100))
-                vid.net = f'{net}%'
+                # Calculate shrink metrics
+                net_ratio = (probe.gb - vid.gb) / max(vid.gb, 0.001)
+                net_pct = int(round(net_ratio * 100))
+                vid.net = f'{net_pct}%'
 
-                # CHECK: Was the ORIGINAL file already a 'good' codec?
+                # Optimization Check: If already a good codec, did we save enough space?
                 original_was_allowed = self.is_allowed_codec(self.opts, vid.probe0)
-
-                # If it was already a good codec, it MUST meet the shrink requirement
-                if original_was_allowed and net > -self.opts.min_shrink_pct:
-                    vid.ops.append(f"REJECTED: Already {vid.probe0.codec} and shrink ({net}%) not > -{self.opts.min_shrink_pct}%")
+                if original_was_allowed and net_pct > -self.opts.min_shrink_pct:
+                    vid.ops.append(f"REJECTED: Already {vid.probe0.codec} and shrink ({net_pct}%) not > -{self.opts.min_shrink_pct}%")
                     self.probe_cache.set_anomaly(vid.filepath, 'OPT')
                     success = False
 
-        # Track auto mode vitals
+        # 3. Handle Vitals for Auto Mode
         if self.auto_mode_enabled:
             if success and not self.opts.sample:
                 self.ok_count += 1
@@ -698,63 +500,101 @@ class JobHandler:
                 self.error_count += 1
                 self.consecutive_failures += 1
 
+        # 4. File Swaps or Cleanup
         if success and not self.opts.sample:
-            trashes = set()
-            basename = os.path.basename(vid.filepath)
-
-            # Preserve timestamps from original file
-            timestamps = None
-            timestamps = FileOps.preserve_timestamps(basename)
-
-            try:
-                # Rename original to backup
-                if self.opts.keep_backup:
-                    os.rename(basename, job.orig_backup_file)
-                    vid.ops.append(
-                        f"rename {basename!r} {job.orig_backup_file!r}")
-                else:
-                    try:
-                        send2trash.send2trash(basename)
-                        trashes.add(basename)
-                        vid.ops.append(f"trash {basename!r}")
-                    except Exception as why:
-                        vid.ops.append(f"ERROR during send2trash of {basename!r}: {why}")
-                        vid.ops.append(f"ERROR: using os.unlink() instead")
-                        os.unlink(basename)
-                        trashes.add(basename)
-                        vid.ops.append(f"unlink {basename!r}")
-
-                # Rename temporary file to the original filename
-                os.rename(job.temp_file, vid.standard_name)
-                vid.ops.append(
-                    f"rename {job.temp_file!r} {vid.standard_name!r}")
-
-                if vid.do_rename:
-                    # Call FileOps.bulk_rename directly
-                    vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes)
-
-                # Apply preserved timestamps to the new file
-                FileOps.apply_timestamps(vid.standard_name, timestamps)
-
-                # Set basename1 for the successfully converted file
-                vid.basename1 = vid.standard_name
-                # probe will be returned to Converter for apply_probe
-
-            except OSError as e:
-                vid.ops.append(f"ERROR during swap of {vid.filepath}: {e}")
-                vid.ops.append(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
+            self._execute_file_swap(vid, job) # Moved to helper for clarity
         elif success and self.opts.sample:
-            # Set basename1 for the sample file
             vid.basename1 = job.temp_file
-            # probe will be returned to Converter for apply_probe
         elif not success:
-            # Transcoding failed or was rejected
             if os.path.exists(job.temp_file):
                 os.remove(job.temp_file)
-                # Ensure we log WHY it was deleted if it hasn't been logged yet
                 if not vid.ops:
-                    vid.ops.append(f"CLEANUP: Deleted {job.temp_file} - FFmpeg failed or quality check rejected file.")
+                    vid.ops.append(f"CLEANUP: Deleted {job.temp_file} - Job failed or rejected.")
             self.probe_cache.set_anomaly(vid.filepath, 'Err')
+        self.temp_file = None # so ataxit does not see it
 
-        # Return probe for Converter to apply
         return probe
+
+    def elaborate_err(self, vid):
+        """ Analyzes vid.runs[-1].texts for corruption signals. """
+        run = vid.runs[-1]
+        CORRUPTION_SEVERITY = {
+            "corrupt decoded frame": 10, "illegal mb_num": 9,
+            "marker does not match f_code": 9, "damaged at": 8,
+            "Error at MB:": 7, "time_increment_bits": 6,
+            "slice end not reached": 5, "concealing": 2,
+        }
+        SEVERITY_THRESHOLD = 30
+        total_severity = 0
+        corruption_events = 0
+        last_score = 0
+
+        for line in run.texts:
+            this_line_signal_score = 0
+            for signal, score in CORRUPTION_SEVERITY.items():
+                if signal in line:
+                    total_severity += score
+                    corruption_events += 1
+                    this_line_signal_score = score
+                    break
+
+            repeat_match = re.search(r"Last message repeated (\d+) times", line)
+            if repeat_match:
+                multiplier = int(repeat_match.group(1))
+                total_severity += (last_score * multiplier)
+                if last_score > 0:
+                    corruption_events += multiplier
+                this_line_signal_score = 0
+
+            last_score = this_line_signal_score
+
+        if total_severity >= SEVERITY_THRESHOLD:
+            run.texts.append(f"CORRUPT VIDEO: Severity {total_severity} ({corruption_events} events).")
+
+
+    def _execute_file_swap(self, vid: Vid, job: Job):
+        """
+        Handles the actual file system dance:
+        Original -> ORIG backup/Trash
+        TEMP -> Original Filename
+        """
+        trashes = set()
+        basename = os.path.basename(vid.filepath)
+
+        # 1. Preserve timestamps from the original file
+        timestamps = FileOps.preserve_timestamps(basename)
+
+        try:
+            # 2. Handle the Original File (Move to ORIG or Trash)
+            if self.opts.keep_backup:
+                os.rename(basename, job.orig_backup_file)
+                vid.ops.append(f"rename {basename!r} {job.orig_backup_file!r}")
+            else:
+                try:
+                    send2trash.send2trash(basename)
+                    trashes.add(basename)
+                    vid.ops.append(f"trash {basename!r}")
+                except Exception as why:
+                    vid.ops.append(f"ERROR during send2trash of {basename!r}: {why}")
+                    vid.ops.append("ERROR: using os.unlink() instead")
+                    os.unlink(basename)
+                    trashes.add(basename)
+                    vid.ops.append(f"unlink {basename!r}")
+
+            # 3. Move the Transcoded TEMP file to the final name
+            os.rename(job.temp_file, vid.standard_name)
+            vid.ops.append(f"rename {job.temp_file!r} {vid.standard_name!r}")
+
+            # 4. Handle bulk rename if needed (e.g., matching subtitle files)
+            if vid.do_rename:
+                vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes)
+
+            # 5. Restore original timestamps to the new file
+            FileOps.apply_timestamps(vid.standard_name, timestamps)
+
+            # 6. Update Vid object for UI reference
+            vid.basename1 = vid.standard_name
+
+        except OSError as e:
+            vid.ops.append(f"ERROR during swap of {vid.filepath}: {e}")
+            vid.ops.append(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")

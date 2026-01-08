@@ -262,191 +262,78 @@ class Converter:
     def _manage_queue_and_auto_mode(self):
         """Handles starting the next [X] and checking auto-mode exit"""
         while True:
+            # 1. Find the next candidate
             next_vid = next((v for v in self.visible_vids if v and v.doit == '[X]'), None)
 
             if next_vid:
                 if not os.path.isfile(next_vid.filepath):
-                    self.vids = [v for v in self.vids if v != next_vid] # Prune missing
+                    self.vids = [v for v in self.vids if v != next_vid]
                     continue
+
+                # Start the engine
                 self.job = self.job_handler.start_transcode_job(next_vid)
                 next_vid.doit = "IP "
-            elif not self.auto_mode_enabled:
-                # Re-sort and exit as you did before
-                self.job_handler = None
+                return
+
+            # 2. Queue is Empty - Handle Auto Mode Exit
+            # We only pop the screen if we are currently LOOKING at the Convert screen.
+            # If we are on History/Help, we just stop the engine but stay on the screen.
+            if not self.auto_mode_enabled:
                 self.vids.sort(key=lambda v: (v.all_ok, v.bloat), reverse=True)
-                self.stack.pop()
+
+                if self.stack.curr.num == CONVERT_ST:
+                    self.job_handler = None
+                    self.stack.pop() # Go back to Select screen
+                else:
+                    # We are on History/Help; don't pop, just let the handler stay
+                    # or set it to None if you want to freeze counters.
+                    pass
+
             return
 
     def advance_jobs(self):
-        """Process ongoing conversion jobs"""
+        """Process ongoing conversion jobs (Threaded Version)"""
+        # Safety: If we don't have a handler, we can't do work
+        if not self.job_handler:
+            return
+
         # A. Handle Active Job
-        if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
+        # if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
+        if self.job: # and self.stack.curr.num in (CONVERT_ST, HELP_ST):
+            # The handler now manages the 'is it an int? is it a retry?' logic
             next_job, report, is_done = self.job_handler.check_job_status(self.job)
 
             if not is_done:
-                # Update UI progress line
-                if isinstance(report, str):
-                    self.job.progress = f"{report}{self.job.vid.descr_str()}"
+#               # 1. Update UI progress (report is the status_string from the thread)
+#               if isinstance(report, str):
+#                   self.job.progress = f"{report}{self.job.vid.descr_str()}"
 
-                # If the handler swapped the job for a retry, update our reference
-                if next_job != self.job:
+                # 2. If the handler triggered a retry, it returned a NEW job object
+                if next_job is not None and next_job != self.job:
                     self.job = next_job
                     self.job.vid.doit = "IP "
             else:
-                # Job is finally finished (Success or Final Failure)
-                success = report.strip().startswith('OK')
+                # 3. Job is finally finished (Final Success or Final Error)
+                # 'report' here is the final status code string (e.g., ' OK', 'ERR', 'OK2')
                 vid = self.job.vid
                 vid.doit = vid.doit_auto = report
 
-                # Perform file operations (cleanup, rename, etc)
-                self.job_handler.finish_transcode_job(success, self.job)
+                # Final Reap: Clean up files, analyze logs, apply probes
+                # success is calculated inside finish_transcode_job now
+                self.job_handler.finish_transcode_job(self.job)
 
-                # Final Logging
+                # Final Logging (moved from old_advance_jobs)
                 self._log_job_final(self.job, report)
+
+                # Clear active job so the queue manager can pick the next one
                 self.job = None
 
         # B. Start New Jobs / Handle Queue
-        if not self.job and self.stack.curr.num == CONVERT_ST:
+        # Logic remains the same, but simplified to call JobHandler
+        # if not self.job and self.stack.curr.num == CONVERT_ST:
+        if not self.job and self.stack.curr.num != SELECT_ST:
             self._manage_queue_and_auto_mode()
 
-
-    def old_advance_jobs(self):
-        """Process ongoing conversion jobs"""
-        # Handle running job progress
-        if self.job and self.stack.curr.num in (CONVERT_ST, HELP_ST):
-            while True:
-                got = self.job_handler.get_job_progress(self.job)
-                if isinstance(got, str):
-                    self.job.progress = f'{got}  [{self.job.vid.descr_str()}]'
-                elif isinstance(got, int):
-                    # Check if we should retry with error tolerance (2nd attempt)
-                    should_retry_tolerant = (got != 0 and
-                            (not hasattr(self.job, 'is_retry') or not self.job.is_retry) and
-                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
-                            self.job_handler and
-                            self.job_handler._should_retry_with_error_tolerance(self.job.vid))
-
-                    # Check if we should retry with software encoding (3rd attempt)
-                    should_retry_software = (got != 0 and
-                            hasattr(self.job, 'is_retry') and self.job.is_retry and
-                            (not hasattr(self.job, 'is_software_fallback') or not self.job.is_software_fallback) and
-                            self.job_handler and
-                            self.job_handler._should_retry_with_software(self.job.vid))
-
-                    if should_retry_tolerant:
-                        # Retry with error tolerance (2nd attempt)
-                        vid = self.job.vid
-#                       lg.put('WARN', 'RETRY-WITH-ERROR-TOLERANCE',
-#                           f'Retrying {vid.filebase} with error tolerance flags\n' +
-#                           json.dumps(asdict(vid), indent=4))
-#                       # Note: Don't set anomaly here - let finish_transcode_job handle it
-                        vid.doit = '[X]'  # Reset for retry
-                        self.job = self.job_handler.start_transcode_job(vid,
-                                                     retry_with_error_tolerance=True)
-                        vid.doit = 'IP '
-                        break  # Continue with retry job
-
-                    if should_retry_software:
-                        # Retry with software encoding (3rd attempt)
-                        vid = self.job.vid
-#                       lg.put('WARN', 'RETRY-WITH-SOFTWARE',
-#                           f'Retrying {vid.filebase} with software encoding (libx265)\n' +
-#                           json.dumps(asdict(vid), indent=4))
-                        vid.doit = '[X]'  # Reset for retry
-                        self.job = self.job_handler.start_transcode_job(vid,
-                                    retry_with_error_tolerance=True, force_software=True)
-                        vid.doit = 'IP '
-                        break  # Continue with retry job
-
-                    # Job finished (either success or final failure after retry)
-                    success = bool(got == 0)
-
-                    # Clear any 'Err' anomaly if this was a successful retry
-                    if success and hasattr(self.job, 'is_retry') and self.job.is_retry:
-                        self.probe_cache.set_anomaly(self.job.vid.filepath, None)
-
-                    # Set status with retry indicator for successful retries
-                    if success:
-                        if hasattr(self.job, 'is_software_fallback') and self.job.is_software_fallback:
-                            self.job.vid.doit = 'OK3'  # Succeeded on 3rd attempt (software fallback)
-                        elif hasattr(self.job, 'is_retry') and self.job.is_retry:
-                            self.job.vid.doit = 'OK2'  # Succeeded on 2nd attempt (error-tolerant)
-                        else:
-                            self.job.vid.doit = ' OK'  # Succeeded on 1st attempt
-                    else:
-                        self.job.vid.doit = 'ERR'
-
-                    self.job.vid.doit_auto = self.job.vid.doit
-                    self.finish_transcode_job(success=success, job=self.job)
-                    dumped = asdict(self.job.vid)
-                    # asdict() automatically handles nested Probe dataclasses
-                    if got == 0:
-                        dumped['texts'] = []
-
-                    if self.opts.sample:
-                        title = 'SAMPLE'
-                    elif hasattr(self.job, 'is_software_fallback') and self.job.is_software_fallback:
-                        title = 'RE-ENCODE-TO-H265-SOFTWARE'
-                    elif hasattr(self.job, 'is_retry') and self.job.is_retry:
-                        title = 'RE-ENCODE-TO-H265-RETRY'
-                    else:
-                        title = 'RE-ENCODE-TO-H265'
-
-                    lg.put('OK' if got == 0 else 'ERR',
-                        title + ' ', json.dumps(dumped, indent=4))
-                    self.job = None
-                    break  # finished job
-                else:
-                    break  # no progress on job
-
-        # Start new jobs if on convert screen
-        if self.stack.curr.num == CONVERT_ST and not self.job:
-            gonners = []
-            for vid in self.visible_vids:
-                if not vid:
-                    continue
-                if vid.doit == '[X]':
-                    if not os.path.isfile(vid.filepath):
-                        gonners.append(vid)
-                        continue
-                    if not self.job:  # start only one job
-                        self.prev_time_encoded_secs = -1
-                        self.job = self.job_handler.start_transcode_job(vid)
-                        vid.doit = 'IP '
-            if gonners:  # any disappearing files?
-                vids = []
-                for vid in self.vids:
-                    if vid not in gonners:
-                        vids.append(vid)
-                self.vids = vids  # pruned list
-                # Convert Vid dataclass objects to dicts for JSON serialization
-                gonners_data = [asdict(v) for v in gonners]
-                lg.err('videos disappeared before conversion:\n'
-                    + json.dumps(gonners_data, indent=4))
-
-            if not self.job:
-                # Check auto mode exit conditions
-                if self.auto_mode_enabled:
-                    # Calculate current stats for vitals report
-                    _, stats, _ = self.make_lines()
-
-                    # Check exit conditions
-                    time_exceeded = False
-                    if self.job_handler.auto_mode_start_time and self.auto_mode_hrs_limit:
-                        runtime_hrs = (time.monotonic() - self.job_handler.auto_mode_start_time) / 3600
-                        time_exceeded = runtime_hrs >= self.auto_mode_hrs_limit
-
-                    no_more_todo = (stats.total - stats.done) == 0
-                    too_many_failures = self.job_handler.consecutive_failures >= 10
-
-                    if time_exceeded or no_more_todo or too_many_failures:
-                        self.print_auto_mode_vitals(stats)
-                        # print_auto_mode_vitals exits, so we never reach here
-
-                # Destroy JobHandler when leaving convert screen (resets counters)
-                self.job_handler = None
-                self.vids.sort(key=lambda vid: (vid.all_ok, vid.bloat), reverse=True)
-                self.stack.pop()  # Return to select screen
 
     def apply_probe(self, vid, probe):
         """ TBD """
@@ -502,9 +389,9 @@ class Converter:
                 vid.doit = '[X]'
         vid.doit_auto = vid.doit # auto value of doit saved for ease of re-init
 
-    def finish_transcode_job(self, success, job):
+    def finish_transcode_job(self, job):
         """Delegate to JobHandler and apply probe if returned"""
-        probe = self.job_handler.finish_transcode_job(success, job)
+        probe = self.job_handler.finish_transcode_job(job)
         # Apply probe if one was returned
         if probe:
             job.vid.probe1 = self.apply_probe(job.vid, probe)

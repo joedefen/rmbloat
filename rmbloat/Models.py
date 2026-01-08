@@ -12,6 +12,7 @@ from datetime import timedelta
 from .ProbeCache import Probe
 from .FfmpegMon import FfmpegMon
 # pylint: disable=import-outside-toplevel,too-many-instance-attributes
+# pylint: disable=invalid-name,too-many-positional-arguments,too-many-arguments
 
 # Dataclass configuration for Python 3.10+ slots support
 _dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
@@ -85,18 +86,11 @@ class Vid:
 
 class Job:
     """ Represents a video conversion job """
-    def __init__(self, vid, orig_backup_file, temp_file, duration_secs):
-        """
-        Args:
-            vid: Vid object
-            orig_backup_file: Path to backup of original file
-            temp_file: Path to temporary output file
-            duration_secs: Video duration in seconds
-        """
+    def __init__(self, vid, orig_backup_file, temp_file, duration_secs, opts):
         self.vid = vid
+        self.opts = opts # Needed for FfmpegMon timeout logic
         self.start_mono = time.monotonic()
 
-        self.progress = f'Started  [{vid.descr_str()}]'
         self.input_file = os.path.basename(vid.filepath)
         self.orig_backup_file = orig_backup_file
         self.temp_file = temp_file
@@ -104,8 +98,22 @@ class Job:
         self.total_duration_formatted = self.trim0(
                         str(timedelta(seconds=int(duration_secs))))
 
-        self.ffsubproc = FfmpegMon()
-        self.return_code = None
+        # Note: We don't initialize FfmpegMon here anymore.
+        # JobHandler will initialize it and assign it to self.monitor.
+        self.monitor: Optional[FfmpegMon] = None
+
+    @property
+    def progress(self):
+        """
+        The UI calls this. It simply grabs the pre-baked string
+        from the background thread.
+        """
+        if self.monitor:
+            # If the thread is finished, it might return the int return_code
+            if self.monitor.is_finished:
+                return self.monitor.info.return_code
+            return self.monitor.status_string + self.vid.descr_str()
+        return "Pending..."
 
     @staticmethod
     def trim0(string):
@@ -124,6 +132,6 @@ class Job:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
     def stop(self):
-        """ stop the job """
-        if self.ffsubproc:
-            self.ffsubproc.stop()
+        """ Stop the job and kill the thread/process """
+        if self.monitor:
+            self.monitor.stop()

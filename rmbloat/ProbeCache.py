@@ -439,7 +439,7 @@ class ProbeCache:
                 if anomaly != '---':
                     self.store()
         return meta
-        
+
     def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[Probe]]:
         """
         Batch process a list of file paths. Checks cache first, then runs ffprobe
@@ -469,7 +469,7 @@ class ProbeCache:
 
         # Dictionary to hold all futures for easy cancellation later
         future_to_path: Dict[Future, str] = {}
-        
+
         # Use ThreadPoolExecutor to run probes concurrently
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all probes to the executor
@@ -479,18 +479,18 @@ class ProbeCache:
                 # Iterate over the completed futures (as they complete)
                 for future in future_to_path:
                     filepath = future_to_path[future]
-                    
+
                     try:
                         # Blocks until the result is ready or an exception occurs
-                        meta = future.result() 
-                        
+                        meta = future.result()
+
                         # --- CRITICAL: Cache Update and Progress ---
                         with self._cache_lock:
                             probe_cnt += 1
                             self._set_cache(filepath, meta)
                             self._compute_fields(meta)
                             results[filepath] = meta
-                            
+
                             # Store frequently to minimize lost work on crash/interrupt
                             if self._dirty_count >= 100:
                                 self.store()
@@ -502,38 +502,38 @@ class ProbeCache:
                     except KeyboardInterrupt:
                         # If an interrupt hits during a result fetch, stop all work.
                         print("\n🛑 Received interrupt. Shutting down worker threads...")
-                        
+
                         # Cancel all futures that have not started or completed yet
                         for pending_future in future_to_path:
                             if not pending_future.done():
                                 pending_future.cancel()
-                        
+
                         # Re-raise the interrupt to jump to the 'finally' block for the final save
-                        raise 
+                        raise
 
                     except Exception:
                         # Handle other exceptions from the probe (e.g., ffprobe timeout, corrupt file)
                         with self._cache_lock:
                             probe_cnt += 1
                         # results[filepath] is implicitly None/missing, or you can set it explicitly:
-                        # results[filepath] = None 
-                        
+                        # results[filepath] = None
+
             except KeyboardInterrupt:
                 # Catches the re-raised interrupt and passes control to 'finally'
                 exit_please = True
 
             finally:
                 # 3. Final Step: Graceful Shutdown and Final Cache Save
-                
+
                 # Ensure the executor is cleanly shut down and futures are cancelled
                 executor.shutdown(wait=False, cancel_futures=True)
 
-                for future in future_to_path: 
+                for future in future_to_path:
                     # Check if the Future object is done and not cancelled
                     if future.done() and not future.cancelled():
-                        
+
                         filepath = future_to_path[future] # Get the filepath (string) from the Future (key)
-                        
+
                         try:
                             meta = future.result()
                             with self._cache_lock:

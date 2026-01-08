@@ -6,17 +6,17 @@ from typing import Tuple, Deque, List
 class CpuStatus:
     """
     Monitors CPU utilization on a Linux system using /proc/stat and /proc/cpuinfo.
-    
+
     The utilization is calculated as a smoothed percentage over a defined time window.
     """
 
     def __init__(self, window_duration: float = 3.0):
         """Initializes the core count and the history tracking."""
-        
+
         # Core & Capacity setup
         self.core_count = self._get_core_count()
         self.max_capacity = self.core_count * 100
-        
+
         # History setup
         self._history: Deque[Tuple[int, int, float]] = collections.deque()
         self.window_duration = window_duration
@@ -24,7 +24,7 @@ class CpuStatus:
         # Store the initial reading to populate the history
         self._add_current_reading()
         # Initial usage is 0 until the first calculation
-        self._current_usage = 0 
+        self._current_usage = 0
 
     # --- Private/Internal Methods ---
 
@@ -51,7 +51,7 @@ class CpuStatus:
                 # Work Jiffies = user + nice + system + irq + softirq + steal
                 work_jiffies_fields = [1, 2, 3, 6, 7, 8]
                 work_jiffies = sum(int(line[i]) for i in work_jiffies_fields if i < len(line))
-                
+
                 # Total Jiffies = sum of all fields (from index 1 onwards)
                 total_jiffies = sum(int(line[i]) for i in range(1, len(line)))
 
@@ -93,13 +93,13 @@ class CpuStatus:
 
         delta_total = total_jiffies_new - total_jiffies_old
         delta_work = work_jiffies_new - work_jiffies_old
-        
+
         if delta_total == 0:
             return self._current_usage
 
         # Formula: (change_in_work / change_in_total) * 100 * core_count
         raw_usage = (delta_work / delta_total) * 100 * self.core_count
-        
+
         self._current_usage = min(round(raw_usage), self.max_capacity)
         return self._current_usage
 
@@ -109,7 +109,7 @@ class CpuStatus:
     def usage_percent(self) -> int:
         """
         Returns the last calculated usage percentage (0-MaxCapacity).
-        
+
         **Calls the internal update method to ensure the data is fresh.**
         """
         # Trigger the calculation every time this property is accessed
@@ -119,7 +119,7 @@ class CpuStatus:
     def get_status_string(self) -> str:
         """
         Returns the CPU status in the desired 'CPU=Used/Max%' format.
-        
+
         **Calls usage_percent to ensure a fresh calculation.**
         """
         # Accessing the property calls _update_stats internally
@@ -137,7 +137,7 @@ class CpuStatus:
 
 if __name__ == "__main__":
     # Define the averaging window externally
-    WINDOW = 3.0 
+    WINDOW = 3.0
     # Define the refresh rate for the caller
     REFRESH_RATE = 0.5
 
@@ -153,7 +153,7 @@ if __name__ == "__main__":
     for i in range(1, 11):
         # The caller is responsible for the time interval between checks
         time.sleep(REFRESH_RATE)
-        
+
         # Accessing get_status_string() automatically triggers the update
         status = cpu_monitor.get_status_string()
         print(f"Sample {i}: {status}")

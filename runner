@@ -7,7 +7,7 @@ import sys
 
 # Ensure the package's top directory is on the path so 'rmbloat' can be found.
 # This is usually necessary for debuggers to work correctly.
-# sys.path.insert(0, '.') 
+# sys.path.insert(0, '.')
 
 # Execute the main module of your package.
 # This mimics the behavior of the 'python -m rmbloat.rmbloat' command.

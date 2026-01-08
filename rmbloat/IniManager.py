@@ -15,7 +15,7 @@ class IniManager:
     The constructor handles initial setup:
     1. Determines the file path (~/app_name/config.ini).
     2. Creates the directory if it doesn't exist.
-    3. Populates object attributes (self.vals) using either existing INI values 
+    3. Populates object attributes (self.vals) using either existing INI values
        (if file exists and fields are present) or the provided constructor defaults.
     4. Ensures the config.ini file is written/updated to reflect the final state.
     """
@@ -37,7 +37,7 @@ class IniManager:
         self._default_values = kwargs
         self.config_file_path = self._determine_config_path()
         self._ensure_directory_exists()
-        
+
         # New: Initialize SimpleNamespace to hold all configuration values
         self.vals = types.SimpleNamespace()
 
@@ -100,7 +100,7 @@ class IniManager:
                     try:
                         # Attempt to cast back based on the type of the default value.
                         default_type = type(self._default_values[key])
-                        
+
                         value_to_set = config[self.SECTION][key]
 
                         if default_type is int:

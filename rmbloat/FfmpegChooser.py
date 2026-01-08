@@ -28,11 +28,11 @@ class FfmpegChooser:
                  prefer_strategy='auto', quiet=False):
         """
         Initialize and detect the best FFmpeg configuration.
-        
+
         Args:
             force_pull: Force pull the Docker image even if it exists locally
             image: Docker image to use (default: joedefen/ffmpeg-vaapi-docker:latest)
-            prefer_strategy: Strategy preference - 'auto', 'docker_accel', 'docker_cpu', 
+            prefer_strategy: Strategy preference - 'auto', 'docker_accel', 'docker_cpu',
                            'system_cpu', or 'system_accel' (default: 'auto')
             quiet: Suppress detection output (default: False)
         """
@@ -48,27 +48,27 @@ class FfmpegChooser:
         self.prefer_strategy = prefer_strategy
         self.quiet = quiet
         self.strategy = None  # Will be set to the chosen strategy
-        
+
         if not quiet:
             print("Detecting FFmpeg configuration...")
-        
+
         # Check system ffmpeg first
         self._detect_system_ffmpeg()
-        
+
         # Detect container runtime
         self._detect_runtime()
-        
+
         # If we have a runtime, ensure image and test acceleration
         if self.runtime:
             self._ensure_image(force_pull)
             self._test_docker_acceleration()
-        
+
         # Decide final strategy
         self._decide_strategy()
 
         # Print summary (handles quiet mode internally)
         self._print_summary()
-    
+
     def _detect_system_ffmpeg(self):
         """Detect if system ffmpeg exists and test hardware acceleration."""
         self.system_ffmpeg_path = shutil.which('ffmpeg')
@@ -92,18 +92,18 @@ class FfmpegChooser:
         # Detect 10-bit VAAPI support (only if acceleration is available)
         if self.has_system_acceleration:
             self.vaapi_supports_10bit = self._detect_vaapi_10bit_support()
-    
+
     def _test_system_acceleration(self):
         """Test if system ffmpeg can use hardware acceleration."""
         # First check if /dev/dri exists
         if not Path("/dev/dri").exists():
             return False
-        
+
         # Find render device
         render_device = self._find_render_device()
         if not render_device:
             return False
-        
+
         # Test HEVC encoding with hardware acceleration
         test_cmd = [
             'ffmpeg',
@@ -116,7 +116,7 @@ class FfmpegChooser:
             '-frames:v', '1',
             '-f', 'null', '-'
         ]
-        
+
         try:
             result = subprocess.run(
                 test_cmd,
@@ -129,7 +129,7 @@ class FfmpegChooser:
                 return True
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
-        
+
         return False
 
     def _detect_vaapi_10bit_support(self):
@@ -241,15 +241,15 @@ class FfmpegChooser:
         if not self.quiet:
             print("  ✗ Neither Docker nor Podman found")
         self.runtime = None
-    
+
     def _ensure_image(self, force_pull):
         """Ensure the Docker/Podman image is available locally."""
         if not self.runtime:
             return
-        
+
         # Check if image exists locally
         check_cmd = [self.runtime, 'image', 'inspect', self.image]
-        
+
         try:
             result = subprocess.run(
                 check_cmd,
@@ -260,7 +260,7 @@ class FfmpegChooser:
             image_exists = result.returncode == 0
         except subprocess.TimeoutExpired:
             image_exists = False
-        
+
         # Pull if needed or forced
         if force_pull or not image_exists:
             if not self.quiet:
@@ -286,19 +286,19 @@ class FfmpegChooser:
         else:
             if not self.quiet:
                 print(f"  ✓ Image {self.image} already available locally")
-    
+
     def _find_render_device(self):
         """Find the first available render device."""
         dri_path = Path("/dev/dri")
         if not dri_path.exists():
             return None
-        
+
         # Look for renderD128, renderD129, etc.
         for device in sorted(dri_path.glob("renderD*")):
             return str(device)
-        
+
         return None
-    
+
     def _test_docker_acceleration(self):
         """Test if Docker/Podman can use hardware acceleration."""
         if not self.runtime:
@@ -354,10 +354,10 @@ class FfmpegChooser:
         except subprocess.TimeoutExpired:
             if not self.quiet:
                 print(f"  ✗ Hardware acceleration test timed out")
-    
+
     def _decide_strategy(self):
         """Decide which FFmpeg to use based on available options and preference."""
-        
+
         # If user specified a preference, try to honor it
         if self.prefer_strategy != 'auto':
             if self._try_strategy(self.prefer_strategy):
@@ -366,35 +366,35 @@ class FfmpegChooser:
             # If preferred strategy not available, fall through to auto
             # Always warn about this, even in quiet mode
             print(f"WARNING: Preferred strategy '{self.prefer_strategy}' not available, falling back to auto selection")
-        
+
         # Auto priority (based on real-world performance)
         # Priority 1: System with acceleration (fastest - no container overhead)
         if self._try_strategy('system_accel'):
             return
-        
+
         # Priority 2: Docker with acceleration (very fast, most reliable)
         if self._try_strategy('docker_accel'):
             return
-        
+
         # Priority 3: System without acceleration (slower but works)
         if self._try_strategy('system_cpu'):
             return
-        
+
         # Priority 4: Docker without acceleration (slowest - container + CPU)
         if self._try_strategy('docker_cpu'):
             return
-        
+
         # No viable option
         raise RuntimeError(
             "No usable FFmpeg found. Please install either:\n"
             "  - Docker/Podman with ffmpeg-vaapi-docker image, or\n"
             "  - System ffmpeg package"
         )
-    
+
     def _try_strategy(self, strategy):
         """
         Try to enable a specific strategy.
-        
+
         Returns True if successful, False if not available.
         """
         if strategy == 'docker_accel':
@@ -403,30 +403,30 @@ class FfmpegChooser:
                 self.use_acceleration = True
                 self.strategy = 'docker_accel'
                 return True
-        
+
         elif strategy == 'docker_cpu':
             if self.runtime:
                 self.use_docker = True
                 self.use_acceleration = False
                 self.strategy = 'docker_cpu'
                 return True
-        
+
         elif strategy == 'system_cpu':
             if self.system_ffmpeg_path:
                 self.use_docker = False
                 self.use_acceleration = False
                 self.strategy = 'system_cpu'
                 return True
-        
+
         elif strategy == 'system_accel':
             if self.has_system_acceleration:
                 self.use_docker = False
                 self.use_acceleration = True
                 self.strategy = 'system_accel'
                 return True
-        
+
         return False
-    
+
     def _print_summary(self):
         """Print a summary of the chosen configuration."""
         # Quiet mode: show minimal or no output
@@ -531,25 +531,25 @@ class FfmpegChooser:
             # Error handling
             error_tolerant=False,
         )
-        
+
         # Apply overrides
         for key, value in overrides.items():
             if not hasattr(defaults, key):
                 raise ValueError(f"Unknown parameter: {key}")
             setattr(defaults, key, value)
-        
+
         # Validate required fields
         if defaults.input_file is None:
             raise ValueError("input_file is required")
         if defaults.output_file is None:
             raise ValueError("output_file is required")
-        
+
         return defaults
-    
+
     def _crf_to_qp(self, crf):
         """
         Map CRF (software encoding) to QP (hardware encoding).
-        
+
         CRF is used by x264/x265, QP is used by hardware encoders.
         This provides a reasonable quality mapping between the two.
         """
@@ -560,40 +560,70 @@ class FfmpegChooser:
             33: 35, 34: 36, 35: 37, 36: 38, 37: 39,
             38: 40, 39: 41, 40: 42,
         }
-        
+
         if crf in CRF_TO_QP:
             return CRF_TO_QP[crf]
         # Fallback for values outside table
         return min(51, max(0, crf + 2))
-    
+
+    def _get_target_quality(self, base_crf, acceleration=True, height=None):
+        """
+        Transforms a base CRF value into a target Quality (QP or CRF) 
+        based on resolution and encoding method.
+        """
+        target = base_crf
+
+        # 1. Resolution Adjustment (The "Low-Res Tax")
+        # If the video is SD or lower, we need to boost quality (lower numbers)
+        if height:
+            if height < 480:     # 352p etc
+                target -= 4
+            elif height < 720:   # 480p/576p
+                target -= 2
+
+        # 2. Hardware Mapping (The "VA-API Tax")
+        # QP 30 != CRF 28. Hardware needs a lower QP to match software quality.
+        if acceleration:
+            # Using your existing logic but shifting based on our new target
+            mapping = {
+                14: 16, 15: 17, 16: 18, 17: 19, 18: 20, 
+                19: 21, 20: 22, 21: 23, 22: 24, 23: 25, 
+                24: 26, 25: 27, 26: 28, 27: 29, 28: 30, 
+                29: 31, 30: 32, 31: 33, 32: 34
+            }
+            # Get mapped value or fallback to +2 offset
+            target = mapping.get(target, target + 2)
+
+        return min(51, max(0, target))
+
     def _map_preset(self, preset, for_hardware):
         """
         Map preset names between software and hardware encoders.
-        
+
         Hardware encoders don't support ultrafast, superfast, or placebo.
         """
         if not for_hardware:
             return preset
-        
+
         # Map unsupported presets to nearest supported one
         preset_map = {
             'ultrafast': 'veryfast',
             'superfast': 'veryfast',
             'placebo': 'veryslow',
         }
-        
+
         return preset_map.get(preset, preset)
-    
+
     def make_ffmpeg_cmd(self, params):
         """
         Build an ffmpeg command from the provided parameters.
-        
+
         Args:
             params: SimpleNamespace from make_namespace()
-        
+
         Returns:
             List of command arguments ready for subprocess
-        
+
         Example:
             params = chooser.make_namespace(
                 input_file='input.mp4',
@@ -603,16 +633,16 @@ class FfmpegChooser:
             subprocess.run(cmd)
         """
         cmd = []
-        
+
         # Add nice/ionice at the very beginning (affects entire process)
         if params.use_nice_ionice and not self.use_docker:
             cmd.extend(['ionice', '-c3', 'nice', '-n20'])
-        
+
         # Determine working directory (absolute path of input file's directory)
         input_path = Path(params.input_file).resolve()
         workdir = str(input_path.parent)
         input_basename = input_path.name
-        
+
         # Handle external subtitle if provided
         subtitle_basename = None
         if params.external_subtitle:
@@ -624,6 +654,16 @@ class FfmpegChooser:
                     print(f"Warning: Subtitle file must be in same directory as input for Docker. Ignoring subtitle.")
                     subtitle_basename = None
         
+        # Determine height for the transformer
+        source_height = getattr(params, 'height', None)
+
+        # Calculate the actual quality value to use
+        quality_val = self._get_target_quality(
+            base_crf=self.opts.crf, # Your CLI default (e.g., 28)
+            acceleration=self.use_acceleration,
+            height=source_height
+        )
+
         # Build base command (docker/podman vs system)
 #       if self.use_docker:
 #           cmd.extend([
@@ -640,15 +680,15 @@ class FfmpegChooser:
                 '-v', f'{workdir}:{workdir}',
                 '-w', workdir,
             ])
-            
+
             # Add device passthrough if using acceleration
             if self.use_acceleration:
                 cmd.extend(['--device=/dev/dri:/dev/dri'])
-            
+
             cmd.append(self.image)
             if params.use_nice_ionice:
                 cmd.extend(['ionice', '-c3', 'nice', '-n20'])
-        
+
         # FFmpeg arguments start here
         # (Docker image already has ffmpeg as entrypoint, don't add it again)
         if not self.use_docker:
@@ -670,24 +710,24 @@ class FfmpegChooser:
         # Pre-input options (e.g., -ss for seeking)
         if params.pre_input_opts:
             cmd.extend(params.pre_input_opts)
-        
+
         # Input file
         cmd.extend(['-i', input_basename if self.use_docker else params.input_file])
-        
+
         # Add external subtitle as additional input if provided
         subtitle_input_index = None
         if subtitle_basename:
             cmd.extend(['-i', subtitle_basename if self.use_docker else params.external_subtitle])
             subtitle_input_index = 1  # Subtitle is the second input (index 1)
-        
+
         # Post-input options (e.g., -t for duration)
         if params.post_input_opts:
             cmd.extend(params.post_input_opts)
-        
+
         # Scaling options
         if params.scale_opts:
             cmd.extend(params.scale_opts)
-        
+
         # Determine encoder and quality settings
         if self.use_acceleration:
             # Hardware encoding
@@ -697,11 +737,10 @@ class FfmpegChooser:
                 codec = 'h264_vaapi'
             else:
                 codec = f'{params.codec}_vaapi'
-            
+
             # Quality: use QP for hardware
-            qp = self._crf_to_qp(params.crf)
-            cmd.extend(['-qp', str(qp)])
-            
+            cmd.extend(['-qp', str(quality_val)])
+
             # Pixel format and profile
             # Only use 10-bit if both requested AND hardware supports it
             use_10bit_encoding = params.use_10bit and self.vaapi_supports_10bit
@@ -721,7 +760,7 @@ class FfmpegChooser:
                 filter_chain = f'format={filter_pix_fmt},hwupload'
 
             cmd.extend(['-vf', filter_chain])
-            
+
         else:
             # Software encoding
             if params.codec == 'hevc':
@@ -732,7 +771,7 @@ class FfmpegChooser:
                 codec = f'lib{params.codec}'
 
             # Quality: use CRF for software
-            cmd.extend(['-crf', str(params.crf)])
+            cmd.extend(['-crf', str(quality_val)])
 
             # Pixel format
             if params.use_10bit:
@@ -756,15 +795,15 @@ class FfmpegChooser:
         # For software encoding, explicitly set the pixel format
         if not self.use_acceleration:
             cmd.extend(['-pix_fmt', output_pix_fmt])
-        
+
         # Color options
         if params.color_opts:
             cmd.extend(params.color_opts)
-        
+
         # Stream mapping
         if params.map_opts:
             cmd.extend(params.map_opts)
-        
+
         # If we have an external subtitle, map it and set metadata
         if subtitle_input_index is not None:
             cmd.extend(['-map', f'{subtitle_input_index}:s:0'])  # Map first subtitle stream from subtitle input
@@ -777,22 +816,22 @@ class FfmpegChooser:
             cmd.extend(['-c:v', codec, '-c:a', 'copy'])
         else:
             cmd.extend(['-c:v', codec, '-c:a', 'copy', '-c:s', params.subtitle_codec])
-        
+
         # Output file
         output_basename = Path(params.output_file).name if self.use_docker else params.output_file
         cmd.append(output_basename)
-        
+
         return cmd
-    
+
     def real_world_tests(self, video_file, duration=30, output_dir=None):
         """
         Test all viable encoding strategies with a real video file.
-        
+
         Args:
             video_file: Path to test video file
             duration: Seconds to encode (default: 30)
             output_dir: Directory for test outputs (default: temp directory)
-        
+
         Returns:
             dict: Results for each strategy tested
                 {
@@ -804,19 +843,19 @@ class FfmpegChooser:
         """
         import tempfile
         import time
-        
+
         if output_dir is None:
             output_dir = tempfile.mkdtemp(prefix='ffmpeg_test_')
         else:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
+
         video_path = Path(video_file).resolve()
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_file}")
-        
+
         results = {}
         strategies_to_test = []
-        
+
         # Determine which strategies are viable
         if self.runtime and self.has_docker_acceleration:
             strategies_to_test.append('docker_accel')
@@ -826,20 +865,20 @@ class FfmpegChooser:
             strategies_to_test.append('system_cpu')
         if self.has_system_acceleration:
             strategies_to_test.append('system_accel')
-        
+
         print(f"\nTesting {len(strategies_to_test)} strategies with {video_file} ({duration}s)...")
         print("="*60)
-        
+
         for strategy in strategies_to_test:
             print(f"\nTesting {strategy}...")
-            
+
             # Create temporary chooser with this strategy
             temp_chooser = FfmpegChooser(
                 image=self.image,
                 prefer_strategy=strategy,
                 quiet=True
             )
-            
+
             # Build output filename
             # For Docker, output must be in the same dir as input (mounted workdir)
             # For system, can use output_dir
@@ -847,10 +886,10 @@ class FfmpegChooser:
                 output_file = video_path.parent / f"test_{strategy}.mkv"
             else:
                 output_file = Path(output_dir) / f"test_{strategy}.mkv"
-            
+
             if output_file.exists():
                 output_file.unlink()
-            
+
             # Create encoding parameters
             try:
                 params = temp_chooser.make_namespace(
@@ -859,13 +898,13 @@ class FfmpegChooser:
                     post_input_opts=['-t', str(duration)],
                     use_nice_ionice=False,  # Don't use nice for tests
                 )
-                
+
                 cmd = temp_chooser.make_ffmpeg_cmd(params)
-                
+
                 # Print the command being run (helpful for debugging)
                 cmd_str = ' '.join(f"'{arg}'" if ' ' in str(arg) else str(arg) for arg in cmd)
                 print(f"  → {cmd_str}")
-                
+
                 # Run the encoding
                 start_time = time.time()
                 result = subprocess.run(
@@ -875,7 +914,7 @@ class FfmpegChooser:
                     timeout=duration * 5  # Generous timeout
                 )
                 elapsed = time.time() - start_time
-                
+
                 if result.returncode == 0 and output_file.exists():
                     file_size = output_file.stat().st_size
                     results[strategy] = {
@@ -894,11 +933,11 @@ class FfmpegChooser:
                         'error': error_msg
                     }
                     print(f"  ✗ Failed: {error_msg[:100]}...")
-                
+
                 # Clean up output file
                 if output_file.exists():
                     output_file.unlink()
-                    
+
             except subprocess.TimeoutExpired:
                 results[strategy] = {
                     'success': False,
@@ -915,12 +954,12 @@ class FfmpegChooser:
                     'error': str(e)
                 }
                 print(f"  ✗ Error: {e}")
-        
+
         # Print summary
         print("\n" + "="*60)
         print("Test Results Summary")
         print("="*60)
-        
+
         for strategy in strategies_to_test:
             result = results[strategy]
             if result['success']:
@@ -930,11 +969,11 @@ class FfmpegChooser:
                 print(f"{status} {strategy:15s} {time_str:>8s}  {size_str:>8s}")
             else:
                 print(f"✗ {strategy:15s} FAILED")
-        
+
         # Show recommended strategy
         print("\n" + "="*60)
         print(f"Current auto strategy: {self.strategy}")
-        
+
         # Recommend based on what succeeded
         if 'system_accel' in results and results['system_accel']['success']:
             print("Recommended: system_accel (best performance)")
@@ -942,7 +981,7 @@ class FfmpegChooser:
             print("Recommended: docker_accel (great performance + reliability)")
         elif 'system_cpu' in results and results['system_cpu']['success']:
             print("Recommended: system_cpu (CPU fallback)")
-        
+
         print("="*60 + "\n")
 
         return results
@@ -950,25 +989,25 @@ class FfmpegChooser:
     def make_ffprobe_cmd(self, input_file, *extra_args):
         """
         Build an ffprobe command.
-        
+
         Args:
             input_file: Path to input file
             *extra_args: Additional ffprobe arguments
-        
+
         Returns:
             List of command arguments ready for subprocess
-        
+
         Example:
             cmd = chooser.make_ffprobe_cmd('input.mp4', '-show_format', '-show_streams')
             result = subprocess.run(cmd, capture_output=True, text=True)
         """
         cmd = []
-        
+
         # Determine working directory
         input_path = Path(input_file).resolve()
         workdir = str(input_path.parent)
         input_basename = input_path.name
-        
+
         # Build base command (docker/podman vs system)
         if self.use_docker:
             cmd.extend([
@@ -982,11 +1021,11 @@ class FfmpegChooser:
         else:
             cmd.append('ffprobe')
             cmd.append(input_file)
-        
+
         # Add extra arguments
         if extra_args:
             cmd.extend(extra_args)
-        
+
         return cmd
 
 

@@ -19,10 +19,10 @@ is_pane_running_daemon() {
     if ! tmux has-session -t ${SESSION_NAME} 2>/dev/null; then
         return 1
     fi
-    
+
     # 1. Get the TTY (pseudo-terminal) associated with the target pane
     PANE_TTY=$(tmux display-message -p -t ${PANE_TARGET} '#{pane_tty}' 2>/dev/null)
-    
+
     if [ -z "$PANE_TTY" ]; then
         return 1
     fi
