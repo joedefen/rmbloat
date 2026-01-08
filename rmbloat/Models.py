@@ -78,6 +78,11 @@ class Vid:
         """ Creates place for new run to be stored """
         self.runs.append(FfmpegRun(command=command))
 
+    def descr_str(self):
+        """ return the descr string for adorning progress """
+        descr = self.runs[-1].descr
+        return '' if 'initial' in descr else f'  [{descr}]'
+
 class Job:
     """ Represents a video conversion job """
     def __init__(self, vid, orig_backup_file, temp_file, duration_secs):
@@ -91,7 +96,7 @@ class Job:
         self.vid = vid
         self.start_mono = time.monotonic()
 
-        self.progress = f'Started  [{vid.runs[-1].descr}]'
+        self.progress = f'Started  [{vid.descr_str()}]'
         self.input_file = os.path.basename(vid.filepath)
         self.orig_backup_file = orig_backup_file
         self.temp_file = temp_file
@@ -117,7 +122,7 @@ class Job:
         minutes = math.floor((secs % 3600) / 60)
         secs = secs % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    
+
     def stop(self):
         """ stop the job """
         if self.ffsubproc:

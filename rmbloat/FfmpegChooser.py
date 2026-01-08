@@ -654,7 +654,7 @@ class FfmpegChooser:
         if not self.use_docker:
             cmd.append('ffmpeg')
 
-        cmd.append('-y')
+        cmd.extend('-y -progress pipe:2'.split())
 
         # Initialize hardware device (must be before inputs for modern ffmpeg)
         if self.use_acceleration:

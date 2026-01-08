@@ -285,9 +285,8 @@ class Converter:
 
             if not is_done:
                 # Update UI progress line
-                descr = self.job.vid.runs[-1].descr
                 if isinstance(report, str):
-                    self.job.progress = f"{report} [{descr}]"
+                    self.job.progress = f"{report}{self.job.vid.descr_str()}"
 
                 # If the handler swapped the job for a retry, update our reference
                 if next_job != self.job:
@@ -318,7 +317,7 @@ class Converter:
             while True:
                 got = self.job_handler.get_job_progress(self.job)
                 if isinstance(got, str):
-                    self.job.progress = f'{got}  [{self.job.vid.runs[-1].descr}]'
+                    self.job.progress = f'{got}  [{self.job.vid.descr_str()}]'
                 elif isinstance(got, int):
                     # Check if we should retry with error tolerance (2nd attempt)
                     should_retry_tolerant = (got != 0 and
@@ -1304,8 +1303,9 @@ class HistoryScreen(RmbloatScreen):
                     for line in display_lines:
                         if app.spins.mangle:
                             line = self.get_mangled_text(line)
+                        sz = len(line) - len(line.lstrip())
                         wraps = textwrap.wrap(line, width=win.cols-3,
-                                      subsequent_indent='     ', max_lines=3)
+                                      subsequent_indent=' '*(sz+3), max_lines=3)
                         for wrap in wraps:
                             win.add_body(f"  {wrap}", context=
                                          Context("body", timestamp=timestamp))

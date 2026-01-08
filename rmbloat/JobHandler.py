@@ -28,7 +28,7 @@ class JobHandler:
 
         # 2. Time Section (Optional, Strict Numerical Capture)
         # Looks for 'time=', then attempts to capture the precise HH:MM:SS.cs format (G2-G5).
-        r"(?:.*?time[=\s]+(\d{2}):(\d{2}):(\d{2})\.(\d{2}))?"
+        r"(?:.*?time[=\s]+(\d{2}):(\d{2}):(\d{2})\.(\d+))?"
 
         # 3. Speed Section (Optional, Strict Numerical Capture)
         # Looks for 'speed=', then captures the float (G6).
@@ -504,129 +504,100 @@ class JobHandler:
         return job
 
     def get_job_progress(self, job):
-        """ Get current progress of a job """
-        def rough_progress(frame_number):
-            nonlocal job, vid
-            total_frames = int(round(vid.probe0.fps * vid.probe0.duration))
-            frame_number = int(frame_number)
-
-            elapsed_time_sec = int(time.monotonic() - job.start_mono)
-
-            if elapsed_time_sec < 5 or total_frames == 0:
-                # Too early for a reliable estimate or total frames unknown
-                return f"Frame {frame_number}: MAKING PROGRESS..."
-
-            # 1. Calculate Estimated Total Time (based on elapsed time and frames done)
-            # T_est = (Elapsed Time / Frames Done) * Total Frames
-            # Avoid division by zero:
-            if frame_number == 0:
-                return f"Frame {frame_number}: MAKING PROGRESS..."
-            estimated_total_time = (elapsed_time_sec / frame_number) * total_frames
-            # 2. Calculate Remaining Time
-            remaining_seconds = estimated_total_time - elapsed_time_sec
-            # 3. Calculate Current FPS (Virtual Speed)
-            current_fps, speed = frame_number / elapsed_time_sec, 'UNKx'
-            if vid.probe0.fps > 0:
-                speed = f'{round(current_fps / vid.probe0.fps, 1)}x'
-
-            # --- Format the output line using the estimated values ---
-            percent_complete = (frame_number / total_frames) * 100
-            remaining_time_formatted = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
-            elapsed_time_formatted = job.trim0(str(timedelta(seconds=elapsed_time_sec)))
-            if job.duration_secs > 0:
-                at_seconds = (frame_number / total_frames) * job.duration_secs
-                at_seconds_formatted = job.trim0(str(timedelta(seconds=int(at_seconds))))
-                at_formatted = f'At ~{at_seconds_formatted}/{job.total_duration_formatted}'
-            else:
-                at_formatted = f"Frame {frame_number}/{total_frames}"
-
-            # Use the estimated FPS for the speed report
-            progress_line = (
-                f"{percent_complete:.1f}% "
-                f"{elapsed_time_formatted} "
-                f"-{remaining_time_formatted} "
-                f"~{speed} | "  # Report FPS clearly as Estimated
-                + f'{at_formatted}'
-            )
-            return progress_line
-
         vid = job.vid
         secs_max = self.opts.progress_secs_max
+        now_mono = time.monotonic()
 
+        # 1. DRAIN THE BACKLOG (Prevent False Timeout)
+        while len(job.ffsubproc.output_queue) > 1:
+            discarded = job.ffsubproc.poll()
+            if isinstance(discarded, str):
+                self.prev_ffmpeg_out_mono = now_mono 
+                if not discarded.startswith("PROGRESS:"):
+                    vid.runs[-1].texts.append(discarded)
+            elif isinstance(discarded, int):
+                vid.runs[-1].return_code = discarded
+                return discarded
+
+        # 2. THE MONITORING LOOP
         while True:
             got = job.ffsubproc.poll()
             now_mono = time.monotonic()
 
-            if isinstance(got, str):
-                line = got
-                self.prev_ffmpeg_out_mono = now_mono
-                match = self.PROGRESS_RE.search(line)
-                if not match:
-                    vid.runs[-1].texts.append(line)
-                    continue
-
-                if now_mono - self.progress_line_mono < 3:
-                    continue  # don't update progress crazy often
-                self.progress_line_mono = time.monotonic()
-
-                # 1. Extract values from the regex match
-                groups = match.groups()
-                try:
-
-                    # The first two parts (H and M) are integers. The third part (S.ms) is the float.
-                    h = int(groups[1])
-                    m = int(groups[2])
-                    s = int(groups[3])
-                    ms = int(groups[4])
-                    time_encoded_seconds = h * 3600 + m * 60 + s + ms / 100
-                    time_encoded_seconds = round(int(time_encoded_seconds))
-                    speed = float(match.group(6))
-                except Exception:
-                    # return f"Frame {groups[0]}:  MAKING PROGRESS..."
-                    return rough_progress(groups[0])
-
-                elapsed_time_sec = int(time.monotonic() - job.start_mono)
-
-                # 2. Calculate remaining time
-                if job.duration_secs > 0:
-                    percent_complete = (time_encoded_seconds / job.duration_secs) * 100
-                    
-                    # MINIMAL FIX: Calculate average speed based on real time passed
-                    elapsed_real = now_mono - job.start_mono
-                    avg_speed = time_encoded_seconds / elapsed_real if elapsed_real > 0 else 0
-                    
-                    if percent_complete > 0 and avg_speed > 0:
-                        # Use avg_speed instead of the instantaneous 'speed' from the regex
-                        remaining_seconds = (job.duration_secs - time_encoded_seconds) / avg_speed
-                        remaining_time_formatted = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
-                    else:
-                        remaining_time_formatted = "N/A"
-                else:
-                    percent_complete = 0.0
-                    remaining_time_formatted = "N/A"
-
-                # 3. Format the output line
-                # \r at the start makes the console cursor go back to the beginning of the line
-                cur_time_formatted = job.trim0(str(timedelta(seconds=time_encoded_seconds)))
-                progress_line = (
-                    f"{percent_complete:.1f}% "
-                    f"{job.trim0(str(timedelta(seconds=elapsed_time_sec)))} "
-                    f"-{remaining_time_formatted} "
-                    f"{avg_speed:.1f}x "
-                    f"At {cur_time_formatted}/{job.total_duration_formatted}"
-                )
-                return progress_line
-            elif isinstance(got, int):
+            if isinstance(got, int):
                 vid.runs[-1].return_code = got
                 return got
-                # print(f'\r{delta=} {got=}')
+
+            if isinstance(got, str):
+                self.prev_ffmpeg_out_mono = now_mono 
+
+                # Fast-forward: Skip old progress updates if we're backed up
+                if len(job.ffsubproc.output_queue) > 0 and got.startswith("PROGRESS:"):
+                    continue
+
+                match = self.PROGRESS_RE.search(got)
+                
+                if not match:
+                    # If it's a real log message, save it
+                    if not got.startswith('PROGRESS:'):
+                        vid.runs[-1].texts.append(got)
+                    # If regex failed on a PROGRESS line, just wait for the next one
+                    return None 
+
+                # UI Throttle
+                if now_mono - self.progress_line_mono < 1.8:
+                    return None
+                
+                self.progress_line_mono = now_mono
+
+                # Parsing
+                groups = match.groups()
+                try:
+                    h, m, s = int(groups[1]), int(groups[2]), int(groups[3])
+                    f_str = groups[4]
+                    f_val = int(f_str) / (10 ** len(f_str))
+                    time_encoded_seconds = h * 3600 + m * 60 + s + f_val
+                except (ValueError, TypeError, IndexError):
+                    # We dumped rough_progress, so we just return None if parsing fails
+                    return None
+
+                # 3. ACCURATE SPEED CALCULATION
+                # We use the time encoded relative to the start
+                elapsed_real = now_mono - job.start_mono
+                if elapsed_real > 0.5 and time_encoded_seconds > 0:
+                    avg_speed = time_encoded_seconds / elapsed_real
+                else:
+                    avg_speed = 0.0
+                
+                # 4. REMAINING TIME
+                if job.duration_secs > 0 and avg_speed > 0:
+                    percent_complete = (time_encoded_seconds / job.duration_secs) * 100
+                    remaining_seconds = (job.duration_secs - time_encoded_seconds) / avg_speed
+                    remaining_str = job.trim0(str(timedelta(seconds=int(remaining_seconds))))
+                else:
+                    percent_complete = 0.0
+                    remaining_str = "N/A"
+
+                # 5. FORMATTING
+                cur_time_str = job.trim0(str(timedelta(seconds=int(round(time_encoded_seconds)))))
+                elapsed_str = job.trim0(str(timedelta(seconds=int(elapsed_real))))
+                
+                return (
+                    f"{percent_complete:.1f}% "
+                    f"{elapsed_str} "
+                    f"-{remaining_str} "
+                    f"{avg_speed:.1f}x "
+                    f"At {cur_time_str}/{job.total_duration_formatted}"
+                )
+
             elif now_mono - self.prev_ffmpeg_out_mono > secs_max:
-                 # got nothing  and timeout
                 vid.runs[-1].texts.append('PROGRESS TIMEOUT')
                 job.ffsubproc.stop(return_code=254)
-                self.prev_ffmpeg_out_mono = now_mono + 1000000000
-            else: # got nothing
-                return got
+                self.prev_ffmpeg_out_mono = now_mono + 1_000_000
+                return 254
+            
+            else:
+                return None
 
     def finish_transcode_job(self, success, job):
         """
@@ -658,13 +629,35 @@ class JobHandler:
                 SEVERITY_THRESHOLD = 30
                 total_severity = 0
                 corruption_events = 0
+                last_score = 0
 
                 for line in vid.runs[-1].texts:
+                    this_line_signal_score = 0
+                                    # 1. Check for signals
                     for signal, score in CORRUPTION_SEVERITY.items():
                         if signal in line:
                             total_severity += score
                             corruption_events += 1
-                            # Stop checking other signals for this line once one is found (prevents double-counting)
+                            this_line_signal_score = score
+                            break 
+                            
+                    # 2. Check for repeats
+                    repeat_match = re.search(r"Last message repeated (\d+) times", line)
+                    if repeat_match:
+                        multiplier = int(repeat_match.group(1))
+                        # If last_score is 0, it means the repeated message 
+                        # wasn't one of our corruption signals.
+                        total_severity += (last_score * multiplier)
+                        if last_score > 0:
+                            corruption_events += multiplier
+                        # A repeat line itself cannot be a signal for the NEXT line
+                        this_line_signal_score = 0 
+
+                    # 3. Update last_score for the NEXT iteration
+                    # If the current line was neither a signal nor a repeat, 
+                    # last_score becomes 0.
+                    last_score = this_line_signal_score
+
 
                 if total_severity >= SEVERITY_THRESHOLD:
                     vid.runs[-1].texts.append(f"CORRUPT VIDEO: Total Severity Score {total_severity} "
