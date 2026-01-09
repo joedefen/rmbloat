@@ -160,7 +160,7 @@ class Converter:
             if vid.doit != 'IP ' and filter_mode:
                 doit = vid.doit if is_convert else vid.doit_auto
                 is_err = bool(doit in ('ERR',) or doit.startswith('Er'))
-                is_dun = bool(doit == 'DUN')
+                is_dun = bool(doit == 'DUN' or doit.startswith('OK'))
                 is_unchk = vid.doit_auto == '[ ]'
 
                 if filter_mode == '-DUN' and is_dun:
@@ -320,7 +320,9 @@ class Converter:
 
                 # Final Reap: Clean up files, analyze logs, apply probes
                 # success is calculated inside finish_transcode_job now
-                self.job_handler.finish_transcode_job(self.job)
+                probe = self.job_handler.finish_transcode_job(self.job)
+                if probe:
+                    self.job.vid.probe1 = self.apply_probe(self.job.vid, probe)
 
                 # Final Logging (moved from old_advance_jobs)
                 self._log_job_final(self.job, report)
@@ -388,13 +390,6 @@ class Converter:
             else:
                 vid.doit = '[X]'
         vid.doit_auto = vid.doit # auto value of doit saved for ease of re-init
-
-    def finish_transcode_job(self, job):
-        """Delegate to JobHandler and apply probe if returned"""
-        probe = self.job_handler.finish_transcode_job(job)
-        # Apply probe if one was returned
-        if probe:
-            job.vid.probe1 = self.apply_probe(job.vid, probe)
 
     # Utility methods delegated to ConvertUtils
     human_readable_size = staticmethod(ConvertUtils.human_readable_size)
@@ -756,6 +751,22 @@ class RmbloatScreen(Screen):
             self.app.job_handler = None
             self.app.job = None
 
+    def get_color_pair(self, line):
+        """  TBD  """
+        wds = line.lstrip().split(maxsplit=1)
+        word0 = wds[0]
+        if word0.startswith('OK') or word0 == 'DUN':
+            return curses.color_pair(Theme.OLD_SUCCESS)
+        if word0 == 'IP':
+            return curses.color_pair(Theme.HOTSWAP)
+        if word0.startswith('Er') or word0 == 'ERR':
+            return curses.color_pair(Theme.ERROR)
+        if word0 == '[X]':
+            return curses.color_pair(Theme.INFO)
+        if word0 == '---':
+            return curses.color_pair(Theme.PROGRESS)
+        return None
+
 
 class SelectScreen(RmbloatScreen):
     """Video selection screen - choose which videos to convert"""
@@ -827,7 +838,7 @@ class SelectScreen(RmbloatScreen):
 
         # Video list
         for line in lines:
-            win.add_body(line)
+            win.add_body(line, attr=self.get_color_pair(line))
 
     def reset_all_ACTION(self):
         """'r' key - Reset all checkboxes"""
@@ -951,7 +962,7 @@ class ConvertScreen(RmbloatScreen):
 
         # Video list
         for line in lines:
-            win.add_body(line)
+            win.add_body(line, attr=self.get_color_pair(line))
 
     def skip_ACTION(self):
         """'s' key - Skip current conversion job"""

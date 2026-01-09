@@ -558,6 +558,40 @@ class JobHandler:
         Original -> ORIG backup/Trash
         TEMP -> Original Filename
         """
+        def finalize_standard_name(vid, job):
+            """
+            Surgically updates the filename based on the final command used.
+            Replaces .cmfXX. with .qpYY. or .crfZZ.
+            """
+            run = vid.runs[-1]
+            cmd = run.command or ""
+
+            # 1. Identify what was actually used in the command
+            # We look for the 'value' following the quality flag
+            actual_val = ""
+            new_tag = ""
+
+            if "-qp " in cmd:
+                match = re.search(r"-qp\s+(\d+)", cmd)
+                if match:
+                    actual_val = match.group(1)
+                    new_tag = f".qp{actual_val}."
+            elif "-crf " in cmd:
+                match = re.search(r"-crf\s+(\d+)", cmd)
+                if match:
+                    actual_val = match.group(1)
+                    new_tag = f".crf{actual_val}."
+
+            if not new_tag: # If we couldn't find it in the command, use a safe fallback
+                prefix = "ql" if job.is_software_fallback else "cmf"
+                new_tag = f".{prefix}{self.opts.quality}."
+
+            placeholder = f".cmf{self.opts.quality}." # surgical replacement
+            if placeholder in vid.standard_name:
+                vid.standard_name = vid.standard_name.replace(placeholder, new_tag)
+
+        #######################
+
         trashes = set()
         basename = os.path.basename(vid.filepath)
 
@@ -581,6 +615,8 @@ class JobHandler:
                     trashes.add(basename)
                     vid.ops.append(f"unlink {basename!r}")
 
+            # finalize the standard name
+            finalize_standard_name(vid, job)
             # 3. Move the Transcoded TEMP file to the final name
             os.rename(job.temp_file, vid.standard_name)
             vid.ops.append(f"rename {job.temp_file!r} {vid.standard_name!r}")

@@ -245,24 +245,24 @@ After scanning/probing the file and folder arguments, the selection screen will 
 * To start converting the selected videos, hit "go" (i.e., the `g` key), and the Conversion Screen replaces this Selection screen.
   * Some key option choices are summarized after "VIDEO --"; before hitting `z`, reviewing those options is suggested.
 ### Conversion Screen
-The Conversion screen only shows the videos selected for conversion on the Selection screen. There is little that can be done other than monitor progress and abort the conversions (with 'q' key).
+The Conversion screen only shows the videos selected for conversion on the Selection screen. There is little that can be done other than monitor progress and abort the conversions (with 'q' key) or skip one (with the 's' key).
 ```
- ?=help q[uit] /kcjzd     ToDo=16/17  GB=15.9(-1.3)  CPU=630/800%
-CVT  NET BLOAT    RES  CODEC  MINS     GB   VIDEO -- Q=28 Shr>=10 MrgSrt
-─────────────────────────────────────────────────────────────────────────────────────
- OK -80%   541   672p   hevc    89  0.311   Jds.Kcjzd.2015.672p.x265.cmf28.recode.sb.
-IP   ---  2070^ 1080p   h264^   46  0.960   Q.Wcuzbisnl.bx.Kcjzdsu.S03E04.1080p.HBO.W
------> 7.1% | 01:26 | -18:18 | 2.3x | At 03:15/46:05
-[X]  ---  2053^ 1080p   h264^   45  0.936   Q.Wcuzbisnl.bx.Kcjzdsu.S03E06.1080p.HBO.W
-[X]  ---  2052^ 1080p   h264^   46  0.953   Q.Wcuzbisnl.bx.Kcjzdsu.S03E05.1080p.HBO.W
-[X]  ---  2045^ 1080p   h264^   47  0.963   Q.Wcuzbisnl.bx.Kcjzdsu.S03E03.1080p.HBO.W
-[X]  ---  2014^ 1080p   h264^   46  0.923   Q.Wcuzbisnl.bx.Kcjzdsu.S03E07.1080p.HBO.W
-[X]  ---  1735^ 1080p   hevc    51  0.894   Jds.Kcjzdsn.S04E08.1080p.HEVC.x265-MeGust
+CONVERT skip filt=  hist theme ?=help quit     ToDo=164/166  GB=43.7(-0.5)  CPU=441/800%
+CVT  NET BLOAT    RES  CODEC  MINS     MB   VIDEO -- Q=28 Shr>=10
+─────────────────────────────────────────────────────────────────────────────────────────
+ OK -75%   632   352p   hevc    40     86   Avms.Avbbwu.s02e10.352p.x265.qp30.recode.mkv
+ OK -77%   589   352p   hevc    41     80   Avms.Avbbwu.s02e15.352p.x265.qp30.recode.mkv
+IP    -   2548^  352p  mpeg4^   41    348   Avms Avbbwu - 2x06 - Black and Blue.avi
+-----> 45.1% 00:30 -00:37 36.0x At 18:22/40:44
+[X]   -   2511^  352p  mpeg4^   41    348   Avms Avbbwu - 2x19 - Some Kind of Hero.avi
+[X]   -   2501^  352p  mpeg4^   42    348   Avms Avbbwu - 2x20 - Working Girls.avi
+[X]   -   2492^  352p  mpeg4^   42    348   Avms Avbbwu - 2x03 - Critical Condition.avi
+[
  ...
 ```
 **Notes**: You can see:
-* the net change in size, `(-1.3)` GB, and the current size, `15.9` GB.
-* the CPU consumption which is sometimes rathe. high as in this example depending on the effectiveness of hardware acceleration, etc.
+* the net change in size, `(-0.5)` GB, and the current size, `43.7` GB.
+* the CPU consumption which is sometimes rather high as in this example depending on the effectiveness of hardware acceleration, etc.
 * the progress of the In Progress (IP) conversion including percent complete, time elapsed, time remaining, conversion speed vs viewing speed (2.3x), and the position in the video file.
 * for completed conversions, the reduction in size, the new size, and the new file name of the converted video.
 * typing `q` will abandon any IP conversion and return to the selection screen.
@@ -417,6 +417,13 @@ Files are renamed in one of these forms if they are successfully "parsed":
 * `{tv-series}.{year}.sXXeXX.{encoding-info}.mkv`
 * `{movie-title}.{year}.{encoding-info}.mkv`
 
+The {encoding-info} (e.g., ".qp30.") is not fixed at the start; instead, it "crystallizes" on completion to reflect the encoder and quality used.
+
+* **Hardware:** Show.S01E01.1080p.x265.qp28.recode.mkv (Uses .qp or .cmf)
+* **Software Fallback:** Show.S01E01.1080p.x265.crf22.recode.mkv (Uses .crf or .ql)
+
+So, the metadata is technically accurate per the encoding strategy.
+
 For those video files for which the needed components cannot be determined, it changes resolution or codec if those parts are both found and are now wrong.
 
 Companion files, like .srt files, and folders who share the same basename w/o the extension(s), will be renamed also if the video file was renamed.
@@ -426,6 +433,7 @@ When a conversion completes successfully or not, details are logged into files i
 
 ### Performance and Server Impact
 By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering its priority. This will (in our experience) allow the server to run rather well.  But, your experience may vary.
+* **Decoupled Processing:** We do conversions in a dedicated background thread. This keeps the TUI (Terminal User Interface) smooth, allowing you to browse logs, check history, or adjust settings without interrupting the active (or even next) transcode.  When using hardware accelerated encoding, the dedicated thread prevents blocking the hardware transcode (e.g., to consume status) actually reducing CPU.
 
 ### Hardware Acceleration
 `rmbloat` automatically detects and uses hardware acceleration (VA-API) when available, providing significant performance improvements. The `FfmpegChooser` component:
@@ -438,8 +446,15 @@ To test your hardware acceleration support:
 ```bash
 rmbloat --chooser-tests /path/to/test/video.mp4
 ```
+This will run 120-second encoding tests with different strategies and report which work best on your system. **If you newly downloaded a docker container, repeat or it will apply the download against the results.**
 
-This will run 120-second encoding tests with different strategies and report which work best on your system.
+## Intelligent Resilience (The Retry Ladder)
+
+rmbloat doesn't give up on the first error. If a hardware-accelerated conversion fails (often due to specific driver quirks or non-standard source frames), the engine automatically:
+
+*  Logs the failure.
+*  Adjusts parameters (e.g., falling back from Hardware to Software encoding).
+*  Retries the job automatically. This "ladder" approach ensures that even "difficult" files get converted without requiring manual intervention.
 
 ### Subtitle Handling
 `rmbloat` intelligently handles subtitle streams to prevent conversion failures:

@@ -2,8 +2,10 @@
 """ TBD """
 # pylint: disable=invalid-name,broad-exception-caught,multiple-statements
 # pylint: disable=too-many-nested-blocks,too-many-instance-attributes
-# pylint: disable=too-many-locals,consider-using-with
+# pylint: disable=too-many-locals,consider-using-with,too-many-branches
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 import os
+import re
 import fcntl
 import subprocess
 import threading
@@ -39,11 +41,12 @@ class TranscodeThread(threading.Thread):
             self.run_ffmpeg()
         except Exception as e:
             self.info.return_code = 127
-            self.status_string = f'JobERR: str(e)'
+            self.status_string = f'JobERR: str({e})'
         finally:
             self.is_finished = True
 
     def run_ffmpeg(self):
+        """ thread main loop """
         try:
             self.process = subprocess.Popen(
                 self.cmd,
@@ -62,8 +65,10 @@ class TranscodeThread(threading.Thread):
             self.is_finished = True
             return
 
+        # Added 'total_size' and 'out_time_ms' to filter out more bloat
         PROGRESS_KEYS = {
-            b"frame", b"fps", b"bitrate", b"out_time", b"speed", b"progress"
+            b"frame", b"fps", b"bitrate", b"out_time", b"progress",
+            b"speed", b"total_size", b"out_time_ms", b"out_time_us"
         }
 
         partial_line = b""
@@ -78,28 +83,37 @@ class TranscodeThread(threading.Thread):
             if chunk:
                 self.last_activity_mono = now
                 data = partial_line + chunk
-                fragments = data.split(b'\n')
+
+                # Robust split: FFmpeg uses \r for progress and \n for logs.
+                # Regex [ \r\n]+ handles any combination or repetition.
+                fragments = re.split(b'[\r\n]+', data)
                 partial_line = fragments[-1]
 
                 for line_bytes in fragments[:-1]:
-                    if not line_bytes: continue
+                    if not line_bytes:
+                        continue
 
                     if b'=' in line_bytes:
                         parts = line_bytes.split(b'=', 1)
                         key_b = parts[0].strip()
-                        if key_b in PROGRESS_KEYS:
-                            key_str = key_b.decode('utf-8')
+
+                        # Process progress keys
+                        if len(parts) == 2 and b' ' not in key_b:
+                            key_str = key_b.decode('utf-8', errors='ignore')
                             val_str = parts[1].strip().decode('utf-8', errors='ignore')
                             self.progress_buffer[key_str] = val_str
 
                             if key_str == "progress":
-                                # Pass the dict as a Namespace for clean attribute access
                                 ns = SimpleNamespace(**self.progress_buffer)
                                 self.status_string = self._generate_display_string(ns)
                                 self.progress_buffer = {}
-                            continue
 
-                    self.info.texts.append(line_bytes.decode('utf-8', errors='ignore').strip())
+                            continue # swallow anything key=value
+
+                    # Real messages (headers, mappings, errors)
+                    msg = line_bytes.decode('utf-8', errors='ignore').strip()
+                    if msg:
+                        self.info.texts.append(msg)
 
             # Timeout Watchdog
             if now - self.last_activity_mono > self.progress_secs_max:
@@ -111,7 +125,8 @@ class TranscodeThread(threading.Thread):
                 self.info.return_code = self.process.returncode
                 break
 
-            if not chunk: time.sleep(0.10)
+            if not chunk:
+                time.sleep(0.10)
 
         self.is_finished = True
 
@@ -146,10 +161,10 @@ class TranscodeThread(threading.Thread):
             # If parsing fails (e.g. out_time is malformed), keep last status
             return self.status_string
 
-    def abort(self, return_code=255):  # TODO: rename abort
+    def abort(self, return_code=255):
         """ Forcefully stop FFmpeg and delete the partial temp file """
         self._stop_event.set()
-        
+
         if self.process and self.process.poll() is None:
             try:
                 # Send SIGTERM
@@ -163,7 +178,7 @@ class TranscodeThread(threading.Thread):
                 pass
 
         # Now that the process is dead and the handle is released:
-        self.cleanup() 
+        self.cleanup()
         self.info.return_code = return_code
 
     def cleanup(self):
@@ -173,4 +188,4 @@ class TranscodeThread(threading.Thread):
                 os.unlink(self.temp_file)
             except OSError:
                 pass
-        self.temp_file = None 
+        self.temp_file = None

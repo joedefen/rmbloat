@@ -568,7 +568,7 @@ class FfmpegChooser:
 
     def _get_target_quality(self, base_crf, acceleration=True, height=None):
         """
-        Transforms a base CRF value into a target Quality (QP or CRF) 
+        Transforms a base CRF value into a target Quality (QP or CRF)
         based on resolution and encoding method.
         """
         target = base_crf
@@ -586,9 +586,9 @@ class FfmpegChooser:
         if acceleration:
             # Using your existing logic but shifting based on our new target
             mapping = {
-                14: 16, 15: 17, 16: 18, 17: 19, 18: 20, 
-                19: 21, 20: 22, 21: 23, 22: 24, 23: 25, 
-                24: 26, 25: 27, 26: 28, 27: 29, 28: 30, 
+                14: 16, 15: 17, 16: 18, 17: 19, 18: 20,
+                19: 21, 20: 22, 21: 23, 22: 24, 23: 25,
+                24: 26, 25: 27, 26: 28, 27: 29, 28: 30,
                 29: 31, 30: 32, 31: 33, 32: 34
             }
             # Get mapped value or fallback to +2 offset
@@ -653,7 +653,7 @@ class FfmpegChooser:
                 if subtitle_path.parent != input_path.parent:
                     print(f"Warning: Subtitle file must be in same directory as input for Docker. Ignoring subtitle.")
                     subtitle_basename = None
-        
+
         # Determine height for the transformer
         source_height = getattr(params, 'height', None)
 

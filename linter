@@ -1,0 +1,5 @@
+#!/bin/bash
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+PROJECT_A_PATH="$SCRIPT_DIR/../console_window"
+
+pylint --init-hook="import sys; sys.path.insert(0, '$PROJECT_A_PATH')" $1
