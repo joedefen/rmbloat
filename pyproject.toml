@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "rmbloat"
-version = "1.0.1"
+version = "0.8.1"
 readme = "README.md"
 description = "An intelligent FFmpeg utility for prioritizing and converting inefficient video files (BLOAT score)."
 authors = [
@@ -12,7 +12,7 @@ authors = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "console-window==1.3.3",
+    "console-window==1.3.4",
     "ruamel.yaml>=0.18.16",
     "ruamel.yaml.clib>=0.2.15",
     "Send2Trash>=1.8.3",

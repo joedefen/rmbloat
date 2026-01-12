@@ -26,9 +26,9 @@ So I wrote `rmbloat`. I can fire this up for 10,000 files, park it in tmux, and 
 
 **And why not? Beta Status & Limitations**
 
-I'm calling this Beta because while it’s been rock-solid for my library, I’ve mostly tuned it for Intel VA-API/QuickSync. I don't have an NVIDIA rig to test, so I'm not making any big claims there — though it has a CPU fallback.
-
-And, although there are lots of options, it is very opinionated.
+* I call this Beta because while it’s been rock-solid for my collection, it is tuned for Intel VA-API/QuickSync. I don't have an NVIDIA rig to test, so no claims (though it has a CPU fallback).
+* Startup requires scanning all the target directories and refreshing its probe cache; this is potentially too tiresome on NAS.
+* And, although there are lots of options, it is very opinionated.
 
 
 Demo GIF: [rmbloat-demo](https://raw.githubusercontent.com/joedefen/rmbloat/main/image/rmbloat-2026-01-09-13-30.gif)

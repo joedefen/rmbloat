@@ -2,6 +2,10 @@
 
 `rmbloat` is an intelligent, interactive video converter designed specifically for media server owners to reclaim massive amounts of disk space effortlessly, while maintaining high visual quality. It identifies the most inefficient videos in your collection and lets you convert them in prioritized, low-impact background batches.
 
+![rmbloat-demo](https://raw.githubusercontent.com/joedefen/rmbloat/main/images/rmbloat-2026-01-09-13-30.gif)
+
+                                                                       
+
 ### The Compelling Problem (and the `rmbloat` Solution)
 
 Your video library is likely filled with bloat: older H.264 (AVC), MPEG-4, or high-bitrate H.265 files that waste valuable storage and sometimes create playback challenges.
@@ -16,7 +20,7 @@ To install `rmbloat`, use `pipx rmbloat`. If explanation is needed, see [Install
 
 So installing `rmbloat` is simple. And if your system has `ffmpeg` installed with HEVC (H.265) encoding support, you are ready to go, however with agonizingly slow software encoding. The bigger your video collection, the less acceptable software encoding will be.
 
-Anyhow, you have three options described below. These instructions are for Ubuntu and other Debian derived distros. For other distros, you must adjust the procedures accordingly.
+Anyhow, you have three options for running `ffmpeg` described below. These instructions are for Ubuntu and other Debian derived distros. For other distros, you must adjust the procedures accordingly.
 
 > **System Requirements**. To ensure smooth video transcoding and a responsive experience when navigating large logs in the History Screen, the following hardware is recommended:
 >
@@ -194,7 +198,7 @@ options:
   ```
   You can (and should) customize the defaults by setting the desired options and adding the `--save-defaults` option to write the current choices to its .ini file.
   * Setting the default for `--prefer-strategy` will speed startup once you have tested and found the best strategy.
-  * This includes saving your video collection root paths, so you don't need to specify them every time you run `rmbloat`. File paths are automatically sanitized: converted to absolute paths, non-existing paths removed, and redundant paths (subdirectories of other saved paths) eliminated. Non-video files in the given files and directories are simply ignored.
+  * `--save-defaults` includes saving your video collection root paths, so you don't need to specify them every time you run `rmbloat`. File paths are automatically sanitized: converted to absolute paths, non-existing paths removed, and redundant paths (subdirectories of other saved paths) eliminated. Non-video files in the given files and directories are simply ignored.
 
   Candidate video files are probed (with `ffprobe`). If the probe fails, then the candidate is simply ignored. Probing many files can be time consuming, but `rmbloat` keeps a cache of probes so start-up can be fast if most of the candidates have been successfully probed.
 
@@ -257,8 +261,7 @@ IP    -   2548^  352p  mpeg4^   41    348   Avms Avbbwu - 2x06 - Black and Blue.
 [X]   -   2511^  352p  mpeg4^   41    348   Avms Avbbwu - 2x19 - Some Kind of Hero.avi
 [X]   -   2501^  352p  mpeg4^   42    348   Avms Avbbwu - 2x20 - Working Girls.avi
 [X]   -   2492^  352p  mpeg4^   42    348   Avms Avbbwu - 2x03 - Critical Condition.avi
-[
- ...
+     ...
 ```
 **Notes**: You can see:
 * the net change in size, `(-0.5)` GB, and the current size, `43.7` GB.
