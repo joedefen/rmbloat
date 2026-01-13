@@ -672,14 +672,16 @@ class FfmpegChooser:
         else:
             # Internal cleanup: map all, then negative-map the unsafe ones
             cmd.extend(['-map', '0:s?'])
-            for idx, s in enumerate(params.streams):
+            subtitle_idx = 0
+            for s in params.streams:
                 if s.get('type') == 'subtitle':
                     codec = s.get('codec', '').lower()
                     if codec not in self.SAFE_SUBTITLE_CODECS:
-                        cmd.extend(['-map', f'-0:s:{idx}'])
-            
-            # Standardize remaining subs to srt
-            cmd.extend(['-c:s', 'srt'])
+                        cmd.extend(['-map', f'-0:s:{subtitle_idx}'])
+                    subtitle_idx += 1
+
+            # Copy remaining safe subs (don't convert to avoid conversion failures)
+            cmd.extend(['-c:s', 'copy'])
 
         # Drop "bloat" (attachments/data)
         cmd.extend(['-map', '-0:t', '-map', '-0:d'])
