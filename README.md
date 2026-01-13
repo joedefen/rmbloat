@@ -4,7 +4,25 @@
 
 ![rmbloat-demo](https://raw.githubusercontent.com/joedefen/rmbloat/main/images/rmbloat-2026-01-09-13-30.gif)
 
-                                                                       
+## Quick Start
+
+Want to get started immediately? Here's the fastest path:
+
+```bash
+# Install rmbloat
+pipx install rmbloat
+
+# Install ffmpeg (Ubuntu/Debian)
+sudo apt update && sudo apt install ffmpeg
+
+# Test your setup
+rmbloat --chooser-tests
+
+# Scan your video collection and start converting
+rmbloat /path/to/videos
+```
+
+After the scan completes, the interactive interface will open. Press `g` to start converting the selected videos. For detailed setup with hardware acceleration (recommended for large collections), see [Installation and System Preparation](#installation-and-system-preparation) below.
 
 ### The Compelling Problem (and the `rmbloat` Solution)
 
@@ -141,11 +159,28 @@ rmbloat --chooser-tests /path/to/sample/video.mp4
 The output will show which strategies work and recommend the best one. `rmbloat` automatically selects the best available option at runtime.
 
 ### Bloat Metric
-`rmbloat` defines
+`rmbloat` uses a resolution-normalized bitrate metric to identify inefficient video files:
 ```
         bloat = 1000 * bitrate / sqrt(height*width)
 ```
-A bloat value of 1000 is roughly that of an aggressively compressed h265 file. It is common to see bloats of 4000 or more in typical collections; very bloated files can typically be reduced in size by a factor of 4 or more w/o too much loss of watchability (IMHO ... others may be more sensitive/caring).
+
+**Understanding Bloat Values:**
+
+| Bloat Range | Description | Typical Source | Compression Potential |
+|-------------|-------------|----------------|----------------------|
+| 800-1200 | Efficiently compressed | Modern H.265/HEVC | Minimal (already optimized) |
+| 1200-2000 | Moderate compression | Good H.264 or older H.265 | ~20-40% reduction possible |
+| 2000-3000 | Poor compression | Older H.264, high bitrate | ~40-60% reduction possible |
+| 3000-5000 | Very bloated | Blu-ray rips, older codecs | ~60-75% reduction possible |
+| 5000+ | Extremely bloated | Old MPEG-4, uncompressed | ~75-85% reduction possible |
+
+**Examples:**
+- **Bloat 1000**: Aggressively compressed H.265 - minimal gains from re-encoding
+- **Bloat 2500**: Typical streaming H.264 - good candidate for conversion, ~50% reduction
+- **Bloat 4000**: Old Blu-ray rip or DVD encode - excellent candidate, ~4x size reduction likely
+- **Bloat 8000**: Ancient MPEG-4 or AVI - huge savings possible, often 6-8x reduction
+
+**Default threshold**: `rmbloat` uses 1600 as the default bloat threshold. Files above this are automatically selected for conversion. Adjust with `-b/--bloat-thresh` based on your storage constraints and quality requirements.
 
 ## Using `rmbloat`
 ### Starting `rmbloat` from the CLI
@@ -180,8 +215,8 @@ options:
   -m MIN_SHRINK_PCT, --min-shrink-pct MIN_SHRINK_PCT
                         minimum conversion reduction percent for
                         replacement [dflt=10]
-  -p {auto,system_accel,docker_accel,system_cpu,docker_cpu},
-      --prefer-strategy {auto,system_accel,docker_accel,system_cpu,docker_cpu}
+  -p {auto,system_accel,system_cpu,docker_accel,docker_cpu},
+      --prefer-strategy {auto,system_accel,system_cpu,docker_accel,docker_cpu}
                         FFmpeg strategy preference [dflt=auto]
   -q QUALITY, --quality QUALITY
                         output quality (CRF) [dflt=28]
@@ -413,6 +448,242 @@ sudo systemctl enable rmbloat-maintenance.timer
 sudo systemctl start rmbloat-maintenance.timer
 ```
 
+## Troubleshooting
+
+### Hardware Acceleration Not Detected
+
+**Symptoms**: `rmbloat --chooser-tests` shows "Hardware acceleration not available"
+
+**Solutions**:
+```bash
+# Verify /dev/dri exists and has render devices
+ls -l /dev/dri/
+# Should show renderD128 or similar
+
+# Check your user is in the right groups
+groups
+# Should include 'video' and 'render'
+
+# If not, add yourself to the groups
+sudo usermod -aG video $USER
+sudo usermod -aG render $USER
+# Log out and back in, then test again
+
+# Verify VA-API is working
+vainfo
+# Should show VAEntrypointEncSlice for H265/HEVC
+
+# Test with a specific device if multiple GPUs
+rmbloat --chooser-tests --prefer-strategy system_accel
+```
+
+### Permission Issues with /dev/dri
+
+**Symptoms**: "Permission denied" errors when trying to use hardware acceleration
+
+**Solutions**:
+```bash
+# Check permissions on render device
+ls -l /dev/dri/renderD128
+
+# Temporarily test with relaxed permissions (not for production)
+sudo chmod 666 /dev/dri/renderD128
+
+# Permanent fix: ensure correct group membership
+sudo usermod -aG render $USER
+sudo usermod -aG video $USER
+# Log out and log back in
+
+# Verify group membership took effect
+id -nG
+```
+
+### Docker Not Pulling Image
+
+**Symptoms**: Docker fails to pull `joedefen/ffmpeg-vaapi-docker:latest`
+
+**Solutions**:
+```bash
+# Check Docker is running
+sudo systemctl status docker
+
+# Test Docker manually
+docker run hello-world
+
+# Manually pull the image
+docker pull joedefen/ffmpeg-vaapi-docker:latest
+
+# If using Podman instead
+podman pull joedefen/ffmpeg-vaapi-docker:latest
+
+# Force pull with rmbloat (bypasses cache)
+rmbloat --chooser-tests --prefer-strategy docker_accel
+```
+
+### Conversions Repeatedly Failing
+
+**Symptoms**: Multiple videos showing `Er1`, `Er2`, etc. in the CVT column
+
+**Common causes and solutions**:
+
+1. **Corrupt source video**:
+   - Try playing the video in VLC or another player
+   - Use `--sample` mode to test a 30-second clip first
+   - Check the logs: `rmbloat --logs`
+
+2. **Insufficient disk space**:
+   - Conversions need space for temporary files
+   - Ensure at least 2x the source video size is available
+
+3. **Hardware acceleration issues**:
+   - Specific frames may trigger driver bugs
+   - `rmbloat` will automatically retry with CPU encoding
+   - Check logs to see which strategy succeeded
+
+4. **Subtitle codec incompatibility**:
+   - Some bitmap subtitle formats cause issues
+   - `rmbloat` automatically filters these out
+   - Check logs for subtitle-related warnings
+
+### rmbloat Won't Start - "Already Running"
+
+**Symptoms**: Error message about another instance running
+
+**Solutions**:
+```bash
+# Check for existing process
+ps aux | grep rmbloat
+
+# Find and remove stale lock file
+rm ~/.config/rmbloat/*.lock
+
+# If using rmbloatd
+rmbloatd status
+rmbloatd stop  # if needed
+```
+
+### Slow Conversion Speed
+
+**Expected speeds** (per video minute, on modern hardware):
+- Hardware acceleration: 30-60x realtime (2-minute video in 2-4 seconds)
+- CPU-only encoding: 3-10x realtime (2-minute video in 12-40 seconds)
+
+**If slower than expected**:
+```bash
+# Verify which strategy is being used
+rmbloat --chooser-tests
+
+# Try different strategies manually
+rmbloat --prefer-strategy system_accel /path/to/videos
+rmbloat --prefer-strategy docker_accel /path/to/videos
+
+# Check CPU usage during conversion
+htop  # or top
+# Should see high ffmpeg CPU usage
+
+# For hardware accel, check GPU usage
+intel_gpu_top  # Intel GPUs
+radeontop      # AMD GPUs
+```
+
+## Frequently Asked Questions (FAQ)
+
+### Can I run multiple instances of rmbloat?
+
+**No.** `rmbloat` enforces a single-instance policy by design. Video conversion is CPU and I/O intensive - running multiple instances would:
+- Compete for hardware acceleration resources
+- Slow down all conversions significantly
+- Create file conflicts if working on the same directories
+- Potentially corrupt output files
+
+If you need to process multiple directories, combine them in one run: `rmbloat /path1 /path2 /path3`
+
+### Will this hurt video quality?
+
+By default (`-q 28`), you should see **minimal to no perceptible quality loss** for most content:
+- Modern displays and streaming have conditioned viewers to H.265 at these quality levels
+- The "bloat" metric targets files that have excessive bitrate for their resolution
+- Very bloated files (4000+) have so much redundancy that compression is nearly lossless
+
+**Quality considerations:**
+- For archival/critical content: Use `-q 22` for higher quality
+- For space-constrained situations: Use `-q 32` for more compression
+- Test first: Use `--sample` to create 30-second samples and compare
+- You can always re-encode if unsatisfied (though it's rarely needed)
+
+### How long will it take to convert my collection?
+
+**Rough estimates** (for a 10TB collection):
+
+| Scenario | Speed | Time |
+|----------|-------|------|
+| Modern Intel/AMD with hardware accel | 30-60x realtime | 3-7 days |
+| Older hardware with acceleration | 15-30x realtime | 1-2 weeks |
+| CPU-only encoding | 3-10x realtime | 1-2 months |
+
+**Factors affecting speed:**
+- Source codec (MPEG-4 is fast, H.264 is slower)
+- Resolution (4K takes longer than 1080p)
+- Your quality setting (`-q` value)
+- Hardware acceleration availability
+- System load from other processes
+
+**Recommendation**: Start with a test run on a small subset (100-200 GB) to estimate your actual speed.
+
+### Can I pause and resume conversions?
+
+**Yes and no:**
+- **Stopping**: Quit with `q` - the current video conversion is **lost** and must restart
+- **Between videos**: Progress is saved after each completed video
+- **Long-term**: Use `rmbloatd` with tmux to detach/reattach
+- **Scheduled**: Use `--auto-hr` to run for a specific duration
+
+**Best practice for large collections:**
+1. Use `rmbloatd start -- --auto-hr 6` for overnight runs
+2. Let each run complete naturally
+3. Resume with another timed run when convenient
+
+### What happens to my original files?
+
+By default, `rmbloat` **deletes** the original file after successful conversion and replaces it with the new `.recode.mkv` file.
+
+**Options:**
+- **Keep backups**: Use `-B/--keep-backup` to rename originals to `ORIG.{videofile}`
+- **Minimum shrinkage**: `-m 10` (default) only replaces if new file is 10%+ smaller
+- **Test mode**: Use `--sample` to create test clips without touching originals
+
+**Safety features:**
+- Conversions are atomic - original is only deleted after successful conversion
+- If conversion fails, original file is untouched
+- Companion files (.srt, thumbnail folders) are automatically renamed to match
+
+### Does rmbloat work on Windows or macOS?
+
+Currently, `rmbloat` is **Linux-only** by design:
+- Developed and tested on Ubuntu/Debian systems
+- Relies on Linux-specific features (ionice, process management, tmux integration)
+- Hardware acceleration uses VA-API (Intel/AMD on Linux)
+
+**Workarounds:**
+- **Windows**: Use WSL2 (Windows Subsystem for Linux)
+- **macOS**: Not officially supported (different hardware acceleration APIs)
+
+### What about AV1 codec support?
+
+Currently, `rmbloat` focuses on **H.265/HEVC** encoding because:
+- Universal playback support (all modern devices)
+- Mature hardware acceleration (Intel QSV, AMD VCN, VA-API)
+- Excellent compression efficiency
+- Fast encoding with hardware support
+
+**AV1 considerations:**
+- Better compression than H.265, but slower encoding
+- Hardware support still limited (requires very recent Intel/AMD)
+- Not all devices can decode AV1 yet
+- May be added in future versions
+
+For now, H.265 provides the best balance of compression, speed, and compatibility.
+
 ## Under the Covers
 ### File Renaming Strategy
 Files are renamed in one of these forms if they are successfully "parsed":
@@ -431,6 +702,41 @@ For those video files for which the needed components cannot be determined, it c
 
 Companion files, like .srt files, and folders who share the same basename w/o the extension(s), will be renamed also if the video file was renamed.
 
+### Intelligent Quality Adjustment
+
+`rmbloat` doesn't just blindly use your `-q` quality setting for all videos. It intelligently adjusts quality based on resolution and encoding method to maintain consistent visual quality across your collection.
+
+**Resolution-Based Adjustment (The "Low-Res Tax")**
+
+Lower resolution videos need higher quality settings to look good, because they have fewer pixels to work with:
+
+| Resolution | Adjustment | Reason |
+|------------|-----------|--------|
+| < 480p (e.g., 352p, 240p) | -4 from base quality | SD content needs significant quality boost |
+| 480p-720p (e.g., 480p, 576p) | -2 from base quality | Moderate boost for older content |
+| 720p+ | No adjustment | Modern resolutions at base quality |
+
+**Example**: With `-q 28` (default):
+- A 1080p video uses quality 28 (standard)
+- A 480p video uses quality 26 (higher quality to compensate)
+- A 352p video uses quality 24 (much higher quality)
+
+**Hardware vs Software Quality Scales**
+
+Software and hardware encoders use different quality scales:
+
+- **Software encoders** (libx265, libx264): Use **CRF** (Constant Rate Factor)
+  - Lower is better quality: CRF 18 = excellent, CRF 28 = good, CRF 40 = poor
+
+- **Hardware encoders** (VAAPI): Use **QP** (Quantization Parameter)
+  - Different scale: QP 30 ≠ CRF 28 in visual quality
+  - `rmbloat` automatically maps CRF → QP using a calibrated table
+  - Mapping typically adds ~2 points (e.g., CRF 28 → QP 30)
+
+**Why this matters**: If you set `-q 28`, a hardware-encoded video might actually use QP 30 to match the visual quality of CRF 28 from software encoding. This ensures consistent quality regardless of which strategy is used.
+
+**Combined effect**: A 352p video with `-q 28` using hardware acceleration would actually encode at approximately QP 26 (28 - 4 for resolution + 2 for hardware mapping), giving it the quality boost it needs to look good despite the low resolution.
+
 ### Logging (--logs)
 When a conversion completes successfully or not, details are logged into files in your `~/.config/rmbloat` folder. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
 
@@ -439,11 +745,17 @@ By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering
 * **Decoupled Processing:** We do conversions in a dedicated background thread. This keeps the TUI (Terminal User Interface) smooth, allowing you to browse logs, check history, or adjust settings without interrupting the active (or even next) transcode.  When using hardware accelerated encoding, the dedicated thread prevents blocking the hardware transcode (e.g., to consume status) actually reducing CPU.
 
 ### Hardware Acceleration
-`rmbloat` automatically detects and uses hardware acceleration (VA-API) when available, providing significant performance improvements. The `FfmpegChooser` component:
-- Detects system ffmpeg with VA-API support
-- Falls back to Docker/Podman containers with hardware acceleration if needed
-- Automatically selects the best strategy (system or container, with or without acceleration)
-- Can be manually controlled with the `-p/--prefer-strategy` option
+`rmbloat` automatically detects and uses hardware acceleration (VA-API) when available, providing significant performance improvements. The `FfmpegChooser` component intelligently selects the best encoding strategy:
+
+**Priority Order (when using `auto` strategy):**
+1. **System ffmpeg with hardware acceleration** - Best performance, no container overhead
+2. **System ffmpeg CPU-only** - Uses installed system ffmpeg even without acceleration
+3. **Docker/Podman with hardware acceleration** - Only if system ffmpeg not installed
+4. **Docker/Podman CPU-only** - Last resort fallback
+
+**Key behavior**: If you have system ffmpeg installed, `rmbloat` will always prefer it over Docker, even if system hardware acceleration isn't working. Docker is only used when system ffmpeg is completely unavailable.
+
+You can override the automatic selection with the `-p/--prefer-strategy` option if needed.
 
 To test your hardware acceleration support:
 ```bash

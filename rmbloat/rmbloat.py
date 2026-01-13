@@ -543,7 +543,7 @@ class Converter:
             head_rows=4,
             body_rows=max(10+len(self.vids), 10000),
             min_cols_rows=(60,10),
-            ctrl_c_terminates=True,
+            ctrl_c_terminates=False,
         )
         self.win = win = ConsoleWindow(win_opts)
         # Initialize screens

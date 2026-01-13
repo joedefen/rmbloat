@@ -16,7 +16,7 @@ I looked at tools like Tdarr and Unmanic and felt they were overkill for my need
 So I wrote `rmbloat`. I can fire this up for 10,000 files, park it in tmux, and come back a week later to see how many GBs were shaved off. Or I just use it for a single season I just copied from BD.
 
 
-**Why use rmbloat?**
+**Why try rmbloat?**
 
 * Speed: If you have an 11th Gen or newer Intel CPU (QuickSync/VA-API), the throughput is incredible. My "months-long" conversion ended up taking weeks, often hitting 25x–30x speeds on 1080p/480p content.
 * The "Bloat" Metric: It calculates a score to show you which files are the biggest waste of space, so it can prioritize the high-yield conversions first.
@@ -24,7 +24,7 @@ So I wrote `rmbloat`. I can fire this up for 10,000 files, park it in tmux, and 
 * Low Impact: It defaults to nice and ionice priorities, meaning your server stays responsive for streaming while the background thread chugs away.
 * Zero Infrastructure: No background services or web GUIs. It’s a Python app you run when you need it and close when you’re done.
 
-**And why not? Beta Status & Limitations**
+**Limitations (Beta Status)**
 
 * I call this Beta because while it’s been rock-solid for my collection, it is tuned for Intel VA-API/QuickSync. I don't have an NVIDIA rig to test, so no claims (though it has a CPU fallback).
 * Startup requires scanning all the target directories and refreshing its probe cache; this is potentially too tiresome on NAS.
