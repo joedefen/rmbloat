@@ -246,7 +246,7 @@ class JobHandler:
         # Use BT.709 as the default standard for all three components
         DEFAULT_SPACE = 'bt709'
         DEFAULT_PRIMARIES = 'bt709'
-        DEFAULT_TRC = '709'  # Note: TRC often uses '709' instead of 'bt709' string
+        DEFAULT_TRC = 'bt709'  # x265 requires 'bt709' format
 
         # Check and replace 'unknown' or invalid values with the safe default
 
@@ -264,9 +264,6 @@ class JobHandler:
 
         # Color TRC:
         if trc_orig == 'unknown':
-            trc = DEFAULT_TRC
-        # FFmpeg also sometimes prefers the numerical '709' over 'bt709' for TRC
-        elif trc_orig == 'bt709':
             trc = DEFAULT_TRC
         else:
             trc = trc_orig

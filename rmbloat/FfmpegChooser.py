@@ -475,7 +475,7 @@ class FfmpegChooser:
                 input_file='input.mp4',
                 output_file='output.mkv',
                 crf=28,
-                color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', '709']
+                color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709']
             )
         """
         defaults = SimpleNamespace(
@@ -651,10 +651,18 @@ class FfmpegChooser:
             ])
 
         # 5. Input Files
+        # Pre-input options (e.g., -ss for seeking before decoding)
+        if params.pre_input_opts:
+            cmd.extend(params.pre_input_opts)
+
         if params.error_tolerant:
             cmd.extend(['-err_detect', 'ignore_err', '-fflags', '+genpts'])
 
         cmd.extend(['-i', input_basename if self.use_docker else params.input_file])
+
+        # Post-input options (e.g., -t for duration limiting)
+        if params.post_input_opts:
+            cmd.extend(params.post_input_opts)
         
         if params.external_subtitle:
             sub_path = Path(params.external_subtitle)
@@ -668,7 +676,7 @@ class FfmpegChooser:
         if params.external_subtitle:
             # Merge external: drop all internal subs, map the external file (input 1)
             cmd.extend(['-map', '-0:s', '-map', '1:s:0'])
-            cmd.extend(['-c:s', 'srt', '-metadata:s:s:0', 'language=eng'])
+            cmd.extend(['-c:s', params.subtitle_codec, '-metadata:s:s:0', 'language=eng'])
         else:
             # Internal cleanup: map all, then negative-map the unsafe ones
             cmd.extend(['-map', '0:s?'])
@@ -680,8 +688,8 @@ class FfmpegChooser:
                         cmd.extend(['-map', f'-0:s:{subtitle_idx}'])
                     subtitle_idx += 1
 
-            # Copy remaining safe subs (don't convert to avoid conversion failures)
-            cmd.extend(['-c:s', 'copy'])
+            # Copy remaining safe subs (or use specified codec)
+            cmd.extend(['-c:s', params.subtitle_codec])
 
         # Drop "bloat" (attachments/data)
         cmd.extend(['-map', '-0:t', '-map', '-0:d'])
@@ -701,12 +709,11 @@ class FfmpegChooser:
 
         if self.use_acceleration:
             # Hardware Path (VAAPI)
-            if params.codec == 'hevc':
-                video_codec = 'hevc_vaapi'
-            elif params.codec == 'h264':
-                video_codec = 'h264_vaapi'
-            else:
-                video_codec = f'{params.codec}_vaapi'
+            # Validate codec support for hardware encoding
+            supported_hw_codecs = {'hevc': 'hevc_vaapi', 'h264': 'h264_vaapi', 'vp9': 'vp9_vaapi'}
+            if params.codec not in supported_hw_codecs:
+                raise ValueError(f"Unsupported hardware codec: {params.codec}. Supported: {list(supported_hw_codecs.keys())}")
+            video_codec = supported_hw_codecs[params.codec]
 
             cmd.extend(['-c:v', video_codec, '-qp', str(quality_val)])
 
@@ -722,14 +729,19 @@ class FfmpegChooser:
             cmd.extend(['-vf', ','.join(filters)])
         else:
             # Software Path (CPU)
-            if params.codec == 'hevc':
-                video_codec = 'libx265'
-                if params.thread_count > 0:
-                    cmd.extend(['-x265-params', f'pools={params.thread_count}'])
-            else:
-                video_codec = 'libx264'
-                if params.thread_count > 0:
-                    cmd.extend(['-threads', str(params.thread_count)])
+            # Validate codec and thread count
+            if params.thread_count < 0 or params.thread_count > 256:
+                raise ValueError(f"Invalid thread_count: {params.thread_count}. Must be 0-256.")
+
+            supported_sw_codecs = {'hevc': 'libx265', 'h264': 'libx264'}
+            if params.codec not in supported_sw_codecs:
+                raise ValueError(f"Unsupported software codec: {params.codec}. Supported: {list(supported_sw_codecs.keys())}")
+
+            video_codec = supported_sw_codecs[params.codec]
+            if params.codec == 'hevc' and params.thread_count > 0:
+                cmd.extend(['-x265-params', f'pools={params.thread_count}'])
+            elif params.codec == 'h264' and params.thread_count > 0:
+                cmd.extend(['-threads', str(params.thread_count)])
 
             cmd.extend(['-c:v', video_codec, '-crf', str(quality_val)])
             
@@ -1004,7 +1016,7 @@ class FfmpegChooser:
                     output_file='output.mkv',
                     crf=28,
                     preset='medium',
-                    color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', '709'],
+                    color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'],
                 )
 
                 cmd = self.make_ffmpeg_cmd(params)
