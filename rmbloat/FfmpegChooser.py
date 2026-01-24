@@ -682,9 +682,10 @@ class FfmpegChooser:
             cmd.extend(['-map', '0:s?'])
             subtitle_idx = 0
             for s in params.streams:
-                if s.get('type') == 'subtitle':
-                    codec = s.get('codec', '').lower()
-                    if codec not in self.SAFE_SUBTITLE_CODECS:
+                # streams are stored as "type:codec" strings
+                stream_type, stream_codec = s.split(':', 1) if ':' in s else (s, '')
+                if stream_type == 'subtitle':
+                    if stream_codec.lower() not in self.SAFE_SUBTITLE_CODECS:
                         cmd.extend(['-map', f'-0:s:{subtitle_idx}'])
                     subtitle_idx += 1
 

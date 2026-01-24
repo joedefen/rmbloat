@@ -104,9 +104,14 @@ def get_candidate_video_files(file_args):
     # 1. Gather all unique, absolute paths from arguments and stdin
     for file_arg in file_args:
         if file_arg == "-":
-            # Handle STDIN
+            # Handle STDIN - also convert to absolute paths
             if not read_pipe:
-                paths_from_args.extend(sys.stdin.read().splitlines())
+                for line in sys.stdin.read().splitlines():
+                    if line:
+                        abs_path = os.path.abspath(line)
+                        if abs_path not in enqueued_paths:
+                            paths_from_args.append(abs_path)
+                            enqueued_paths.add(abs_path)
                 read_pipe = True
         else:
             # Convert to absolute path immediately
@@ -145,6 +150,9 @@ def get_candidate_video_files(file_args):
 
         # Recursively walk the directory structure
         for root, dirs, files in os.walk(dir_path):
+
+            # Skip trash and system directories (modify in-place to prevent os.walk from descending)
+            dirs[:] = [d for d in dirs if not (d.startswith('.Trash') or d in ('Trash', 'lost+found'))]
 
             # Sort the directory names before os.walk processes them (case-insensitive)
             # This ensures predictable traversal order of subdirectories

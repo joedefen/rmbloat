@@ -498,6 +498,11 @@ class JobHandler:
         params.use_nice_ionice = not self.opts.full_speed
         params.thread_count = self.opts.thread_cnt
 
+        # REQUIRED: Pass the streams so the mapper can find unsafe subtitles
+        params.streams = probe.streams
+        # REQUIRED: Pass height so the quality calculation works
+        params.height = probe.height
+
         if self.opts.sample:
             params.sample_mode = True
             start_secs = max(120, job.duration_secs) * 0.20
@@ -704,15 +709,19 @@ class JobHandler:
                 vid.ops.append(f"rename {basename!r} {job.orig_backup_file!r}")
             else:
                 try:
-                    send2trash.send2trash(basename)
                     trashes.add(basename)
-                    vid.ops.append(f"trash {basename!r}")
+                    if self.opts.use_trash:
+                        send2trash.send2trash(basename)
+                        vid.ops.append(f"trash {basename!r}")
+                    else:
+                        os.unlink(basename)
+                        vid.ops.append(f"unlink {basename!r}")
                 except Exception as why:
-                    vid.ops.append(f"ERROR during send2trash of {basename!r}: {why}")
-                    vid.ops.append("ERROR: using os.unlink() instead")
-                    os.unlink(basename)
-                    trashes.add(basename)
-                    vid.ops.append(f"unlink {basename!r}")
+                    if self.opts.use_trash:
+                        vid.ops.append(f"ERROR during send2trash of {basename!r}: {why}")
+                        vid.ops.append("ERROR: using os.unlink() instead")
+                        os.unlink(basename)
+                        vid.ops.append(f"unlink {basename!r}")
 
             # finalize the standard name
             finalize_standard_name(vid, job)
@@ -720,14 +729,18 @@ class JobHandler:
             os.rename(job.temp_file, vid.standard_name)
             vid.ops.append(f"rename {job.temp_file!r} {vid.standard_name!r}")
 
-            # 4. Handle bulk rename if needed (e.g., matching subtitle files)
+            # 4. Move probe cache entry to final path so it doesn't need re-probing
+            final_path = os.path.abspath(vid.standard_name)
+            self.probe_cache.move_entry(job.temp_file, final_path)
+
+            # 5. Handle bulk rename if needed (e.g., matching subtitle files)
             if vid.do_rename:
                 vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes)
 
-            # 5. Restore original timestamps to the new file
+            # 6. Restore original timestamps to the new file
             FileOps.apply_timestamps(vid.standard_name, timestamps)
 
-            # 6. Update Vid object for UI reference
+            # 7. Update Vid object for UI reference
             vid.basename1 = vid.standard_name
 
         except OSError as e:

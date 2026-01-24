@@ -37,6 +37,7 @@ from .Models import PathProbePair, Vid
 from . import FileOps
 from . import ConvertUtils
 from .JobHandler import JobHandler
+from .PersistentState import PersistentState
 
 lg = StructuredLogger('rmbloat')
 
@@ -86,6 +87,7 @@ class Converter:
         self.spinner = None # spinner object
         self.spins = None # spinner values
         self.search_re = None # the "accepted" search
+        self.search_re_valid = None # last valid regex pattern
         self.vids = []
         self.todo_vids = []
         self.visible_vids = []
@@ -122,6 +124,7 @@ class Converter:
         self.screens = None
         self.stack = None
         self.need_freeze_draw = False
+        self.persistent_state = PersistentState()
 
     def build_options_suffix(self):
         """Build the options suffix string for display."""
@@ -195,7 +198,15 @@ class Converter:
                 pattern = self.search_re
                 if self.spins.mangle:
                     pattern = Mangler.mangle(pattern)
-                match = re.search(pattern, line, re.IGNORECASE)
+                try:
+                    match = re.search(pattern, line, re.IGNORECASE)
+                    self.search_re_valid = pattern  # remember last valid pattern
+                except re.error:
+                    # invalid regex, fall back to last valid pattern
+                    if self.search_re_valid:
+                        match = re.search(self.search_re_valid, line, re.IGNORECASE)
+                    else:
+                        match = True  # no valid pattern yet, show all
                 if not match:
                     continue
             if vid.doit == '[X]':
@@ -268,6 +279,7 @@ class Converter:
             if next_vid:
                 if not os.path.isfile(next_vid.filepath):
                     self.vids = [v for v in self.vids if v != next_vid]
+                    self.visible_vids = [v for v in self.visible_vids if v != next_vid]
                     continue
 
                 # Start the engine
@@ -598,10 +610,7 @@ class Converter:
         spin.add_key('fancy_hdr', '_ - header style',
                      vals=['Underline', 'Reverse', 'Off'])
         spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
-
-        # Initialize theme
-        self.opts.theme = ''
-        Theme.set(self.opts.theme)
+        
 
         # NOTE: With relax_handled_keys=True (default in console_window),
         # we no longer need to call set_handled_keys() - all non-navigation
@@ -610,7 +619,10 @@ class Converter:
         # self.win.set_handled_keys(spin.keys | other)
 
         self.spins = spins = spin.default_obj
-
+        self.spins.theme = 'default'  # even if not in the themes, set it for compatibility
+        self.persistent_state.restore_updated_opts(self.spins)
+        # Initialize theme
+        Theme.set(self.spins.theme)
         curses.intrflush(False)
 
 
@@ -670,6 +682,10 @@ class Converter:
 
             # Process jobs
             self.advance_jobs()
+            # Save any persistent state changes
+            self.spins.theme = Theme.get_current()
+            self.persistent_state.save_updated_opts(self.spins)
+            self.persistent_state.sync()
 
             # Clear screen for next render
             if not spins.freeze or self.need_freeze_draw:
@@ -1327,6 +1343,7 @@ def main(args=None):
                                prefer_strategy='auto',
                                quality=28,
                                thread_cnt=4,
+                               use_trash=False,
                         )
         vals = ini.vals
         parser = argparse.ArgumentParser(
@@ -1368,6 +1385,11 @@ def main(args=None):
                     default=vals.thread_cnt, type=int,
                     help='thread count for ffmpeg conversions'
                         + f' [dflt={vals.thread_cnt}]')
+        parser.add_argument('--use-trash',
+                    action='store_false' if vals.use_trash else 'store_true',
+                    default=vals.use_trash,
+                    help='if set, use trashcan for converted videos'
+                        + f' [dflt={vals.use_trash}]')
 
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
