@@ -286,7 +286,7 @@ class StructuredLogger:
                 effective_age = age_seconds / self.ERR_AGE_WEIGHT if level == 'ERR' else age_seconds
                 weighted.append((effective_age, line, line_size))
 
-            # Sort by effective age (oldest first)
+            # Sort by effective age (newest first = lowest age)
             weighted.sort(key=lambda x: x[0])
 
             # Target: keep newest entries until total size <= MAX_LOG_SIZE * TRIM_TO_RATIO
@@ -294,8 +294,8 @@ class StructuredLogger:
             kept = []
             total_size = 0
 
-            # Work backwards (newest first) until we hit target
-            for effective_age, line, line_size in reversed(weighted):
+            # Keep newest entries (lowest effective age) until we hit target
+            for effective_age, line, line_size in weighted:
                 if total_size + line_size <= target_size:
                     kept.append(line)
                     total_size += line_size
