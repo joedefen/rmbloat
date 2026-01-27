@@ -3,10 +3,14 @@
 Structured Logger with JSON Lines format and weighted-age trimming.
 ERR entries age 10x slower than other entries, so they persist longer.
 """
-import os
+# pylint: disable=broad-exception-caught,multiple-statements,too-many-locals
+# pylint: disable=too-many-instance-attributes,invalid-name,line-too-long
+# pylint: disable=unused-argument
+
 import sys
 import json
 import inspect
+from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
@@ -391,32 +395,32 @@ class StructuredLogger:
         self._append_log(entry)
 
     def purge_at_or_before(self, timestamp: str, level_filter: Optional[str] = None):
-            """
-            TUI Support: Deletes entries older than or equal to the target timestamp.
-            Allows 'cleaning up' the history screen.
-            """
-            if not self.log_file.exists():
-                return
+        """
+        TUI Support: Deletes entries older than or equal to the target timestamp.
+        Allows 'cleaning up' the history screen.
+        """
+        if not self.log_file.exists():
+            return
 
-            kept = []
-            try:
-                with open(self.log_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if not line.strip(): continue
-                        try:
-                            data = json.loads(line)
-                            # Delete if timestamp matches/older AND (no filter OR level matches)
-                            if data.get('timestamp', '') <= timestamp:
-                                if level_filter is None or data.get('level') == level_filter:
-                                    continue
-                            kept.append(line)
-                        except json.JSONDecodeError:
-                            continue
+        kept = []
+        try:
+            with open(self.log_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip(): continue
+                    try:
+                        data = json.loads(line)
+                        # Delete if timestamp matches/older AND (no filter OR level matches)
+                        if data.get('timestamp', '') <= timestamp:
+                            if level_filter is None or data.get('level') == level_filter:
+                                continue
+                        kept.append(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                with open(self.log_file, 'w', encoding='utf-8') as f:
-                    f.writelines(kept)
-            except Exception as e:
-                print(f"PURGE ERROR: {e}", file=sys.stderr)
+            with open(self.log_file, 'w', encoding='utf-8') as f:
+                f.writelines(kept)
+        except Exception as e:
+            print(f"PURGE ERROR: {e}", file=sys.stderr)
 
     # ========================================================================
     # Filtering and Search Methods
@@ -484,7 +488,6 @@ class StructuredLogger:
             entries_dict: OrderedDict keyed by timestamp
             window_state: dict with 'file_size' and 'last_position'
         """
-        from collections import OrderedDict
 
         entries = OrderedDict()
         if not self.log_file.exists():
@@ -527,8 +530,6 @@ class StructuredLogger:
         Refresh window with new entries from log file.
         Returns: updated (entries_dict, window_state)
         """
-        from collections import OrderedDict
-
         if not self.log_file.exists():
             return window, window_state
 

@@ -2,15 +2,19 @@
 """
 FfmpegChooser - Intelligent FFmpeg runtime selection with hardware acceleration support
 """
+# pylint: disable=too-many-branches,too-many-statements,too-many-locals,invalid-name
+# pylint: disable=too-many-instance-attributes,broad-exception-caught,line-too-long
 
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import shutil
+import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 from types import SimpleNamespace
-
 
 class FfmpegChooser:
     """
@@ -100,7 +104,8 @@ class FfmpegChooser:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
-                text=text_output
+                text=text_output,
+                check=False
             )
         except subprocess.TimeoutExpired:
             return None
@@ -123,9 +128,9 @@ class FfmpegChooser:
         self.has_system_acceleration = self._test_system_acceleration()
         if not self.quiet:
             if self.has_system_acceleration:
-                print(f"  ✓ System ffmpeg has working hardware acceleration")
+                print("  ✓ System ffmpeg has working hardware acceleration")
             else:
-                print(f"  ✗ System ffmpeg hardware acceleration not available")
+                print("  ✗ System ffmpeg hardware acceleration not available")
 
         # Detect 10-bit VAAPI support (only if acceleration is available)
         if self.has_system_acceleration:
@@ -211,11 +216,10 @@ class FfmpegChooser:
                 if not self.quiet:
                     print("  ✓ VAAPI supports 10-bit HEVC encoding (verified by test)")
                 return True
-            else:
-                # Check if error is specifically about profile
-                if 'No usable encoding profile found' in result.stderr or 'profile' in result.stderr.lower():
-                    if not self.quiet:
-                        print("  ⚠ VAAPI does not support 10-bit HEVC encoding (will use 8-bit)")
+            # Check if error is specifically about profile
+            if 'No usable encoding profile found' in result.stderr or 'profile' in result.stderr.lower():
+                if not self.quiet:
+                    print("  ⚠ VAAPI does not support 10-bit HEVC encoding (will use 8-bit)")
 
         return False
 
@@ -310,7 +314,7 @@ class FfmpegChooser:
         # Test command
         test_cmd = [
             self.runtime, 'run', '--rm',
-            f'--device=/dev/dri:/dev/dri',
+            '--device=/dev/dri:/dev/dri',
             self.image,
             '-y',
             '-init_hw_device', f'vaapi=va:{render_device}',
@@ -334,7 +338,7 @@ class FfmpegChooser:
                     print(f"  ✗ Hardware acceleration test failed in {self.runtime}")
         else:
             if not self.quiet:
-                print(f"  ✗ Hardware acceleration test timed out")
+                print("  ✗ Hardware acceleration test timed out")
 
     def _decide_strategy(self) -> None:
         """Decide which FFmpeg to use based on available options and preference."""
@@ -434,7 +438,7 @@ class FfmpegChooser:
         if self.use_acceleration:
             print(f"Acceleration: Enabled (VA-API via {self.render_device})")
         else:
-            print(f"Acceleration: Disabled (CPU encoding)")
+            print("Acceleration: Disabled (CPU encoding)")
 
         print(f"Strategy:     {self.strategy}")
         print("="*60 + "\n")
@@ -631,9 +635,9 @@ class FfmpegChooser:
             ])
             if self.use_acceleration:
                 cmd.extend(['--device=/dev/dri:/dev/dri'])
-            
+
             cmd.append(self.image)
-            
+
             if params.use_nice_ionice:
                 cmd.extend(['ionice', '-c3', 'nice', '-n20'])
 
@@ -663,7 +667,7 @@ class FfmpegChooser:
         # Post-input options (e.g., -t for duration limiting)
         if params.post_input_opts:
             cmd.extend(params.post_input_opts)
-        
+
         if params.external_subtitle:
             sub_path = Path(params.external_subtitle)
             cmd.extend(['-i', sub_path.name if self.use_docker else str(sub_path)])
@@ -745,7 +749,7 @@ class FfmpegChooser:
                 cmd.extend(['-threads', str(params.thread_count)])
 
             cmd.extend(['-c:v', video_codec, '-crf', str(quality_val)])
-            
+
             pix_fmt = 'yuv420p10le' if params.use_10bit else 'yuv420p'
             cmd.extend(['-pix_fmt', pix_fmt])
 
@@ -786,8 +790,6 @@ class FfmpegChooser:
                     'system_accel': {...}
                 }
         """
-        import tempfile
-        import time
 
         if output_dir is None:
             output_dir = tempfile.mkdtemp(prefix='ffmpeg_test_')
@@ -843,10 +845,8 @@ class FfmpegChooser:
                     post_input_opts=['-t', str(duration)],
                     use_nice_ionice=False,  # Don't use nice for tests
                 )
-
                 cmd = temp_chooser.make_ffmpeg_cmd(params)
 
-                # Print the command being run (helpful for debugging)
                 cmd_str = ' '.join(f"'{arg}'" if ' ' in str(arg) else str(arg) for arg in cmd)
                 print(f"  → {cmd_str}")
 
@@ -856,7 +856,8 @@ class FfmpegChooser:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=duration * 5  # Generous timeout
+                    timeout=duration * 5,  # Generous timeout
+                    check=False
                 )
                 elapsed = time.time() - start_time
 
@@ -973,7 +974,6 @@ class FfmpegChooser:
 
         return cmd
 
-
     def run_tests(self, video_file: Optional[str] = None, duration: int = 30,
                   output_dir: Optional[str] = None, show_test_encode: bool = False) -> int:
         """
@@ -1041,7 +1041,6 @@ class FfmpegChooser:
 
 def main() -> int:
     """Test the FfmpegChooser."""
-    import argparse
 
     parser = argparse.ArgumentParser(
         description="Detect and configure FFmpeg runtime with hardware acceleration"

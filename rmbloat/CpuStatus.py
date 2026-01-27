@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+""" CPU Current Usage Support"""
 import time
 import collections
-from typing import Tuple, Deque, List
+from typing import Tuple, Deque
+# pylint: disable=invalid-name,broad-exception-caught,raise-missing-from
 
 class CpuStatus:
     """
@@ -31,7 +33,7 @@ class CpuStatus:
     def _get_core_count(self) -> int:
         """Reads /proc/cpuinfo to determine the number of logical cores."""
         try:
-            with open("/proc/cpuinfo", "r") as f:
+            with open("/proc/cpuinfo", "r", encoding='utf-8') as f:
                 return sum(1 for line in f if line.startswith("processor"))
         except FileNotFoundError:
             print("Warning: /proc/cpuinfo not found. Defaulting to 1 core.")
@@ -43,7 +45,7 @@ class CpuStatus:
     def _get_current_jiffies(self) -> Tuple[int, int]:
         """Reads the first line of /proc/stat and returns (work_jiffies, total_jiffies)."""
         try:
-            with open("/proc/stat", "r") as f:
+            with open("/proc/stat", "r", encoding='utf-8') as f:
                 line = f.readline().split()
                 if not line or line[0] != 'cpu':
                     raise ValueError("Invalid format in /proc/stat")
@@ -133,7 +135,7 @@ class CpuStatus:
         return self.max_capacity
 
 # -------------------------
-## 💡 Example Usage
+## Example Usage
 
 if __name__ == "__main__":
     # Define the averaging window externally

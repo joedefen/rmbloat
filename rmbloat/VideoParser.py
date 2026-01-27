@@ -15,9 +15,7 @@ from ruamel.yaml import YAML
 yaml = YAML()
 yaml.default_flow_style = False
 
-# Simple placeholder for the external function yaml_dump used in run_regressions.
-# This assumes the intent was to dump a complex Python structure (like a dict
-# containing SimpleNamespaces) to a formatted YAML string/file.
+# Placeholder for the external function yaml_dump used in run_regressions.
 # For simplicity, this uses the ruamel.yaml instance to dump to a string.
 def custom_yaml_dump(data, flow_nodes=None, indent=4):
     """
@@ -25,7 +23,7 @@ def custom_yaml_dump(data, flow_nodes=None, indent=4):
     """
     string_stream = StringIO()
     # Note: flow_nodes and indent control formatting, but a simple dump suffices
-    # to demonstrate the current test results.
+    # to demo the current test results.
     yaml.dump(data, string_stream)
     return string_stream.getvalue()
 

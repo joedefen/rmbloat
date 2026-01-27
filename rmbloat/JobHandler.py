@@ -392,11 +392,11 @@ class JobHandler:
             use_10bit=self.should_use_10bit(probe.pix_fmt, probe.codec),
             error_tolerant=retry_with_error_tolerance
         )
-        
+
         # REQUIRED: Pass the streams so the mapper can find unsafe subtitles
-        params.streams = probe.streams 
+        params.streams = probe.streams
         # REQUIRED: Pass height so the quality calculation works
-        params.height = probe.height 
+        params.height = probe.height
 
         params.crf = self.opts.quality
         params.use_nice_ionice = not self.opts.full_speed
@@ -416,12 +416,12 @@ class JobHandler:
         else:
             params.target_width = None
             params.target_height = None
-            
+
         params.color_opts = self.make_color_opts(probe.color_spt)
         params.external_subtitle = merged_external_subtitle
 
         # 4. Finalize Command and Launch Thread
-        # All the "Magic" (Scaling filters, Subtitle pruning, HW vs SW mapping) 
+        # All the "Magic" (Scaling filters, Subtitle pruning, HW vs SW mapping)
         # now happens inside this one call.
         ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
         run.command = bash_quote(ffmpeg_cmd)
@@ -518,7 +518,7 @@ class JobHandler:
             params.target_width = None
             params.target_height = None
 
-            
+
         params.color_opts = self.make_color_opts(vid.probe0.color_spt)
 
 #       params.map_opts = map_opts
@@ -594,6 +594,7 @@ class JobHandler:
                     vid.ops.append(f"REJECTED: Already {vid.probe0.codec} and shrink ({net_pct}%) not > -{self.opts.min_shrink_pct}%")
                     self.probe_cache.set_anomaly(vid.filepath, 'OPT')
                     success = False
+                    vid.doit = 'ERR'
 
         # 3. Handle Vitals for Auto Mode
         if self.auto_mode_enabled:

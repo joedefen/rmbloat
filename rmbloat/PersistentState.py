@@ -2,6 +2,7 @@
 PersistentState class for saving user preferences
 """
 # pylint: disable=invalid-name,broad-exception-caught,line-too-long
+# pylint: disable=consider-using-dict-items
 import json
 from pathlib import Path
 

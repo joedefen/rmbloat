@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
+""" rmbloat main """
 # pylint: disable=too-many-statements
-"""
-rmbloat
-"""
-
 # pylint: disable=too-many-locals,line-too-long,broad-exception-caught
 # pylint: disable=no-else-return,too-many-branches
 # pylint: disable=too-many-return-statements,too-many-instance-attributes
@@ -610,7 +607,7 @@ class Converter:
         spin.add_key('fancy_hdr', '_ - header style',
                      vals=['Underline', 'Reverse', 'Off'])
         spin.add_key('freeze', 'p - pause/release screen', vals=[False, True])
-        
+
 
         # NOTE: With relax_handled_keys=True (default in console_window),
         # we no longer need to call set_handled_keys() - all non-navigation

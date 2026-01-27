@@ -784,6 +784,59 @@ During the probe phase, `rmbloat` detects problematic subtitle codecs and automa
 
 External `.en.srt` subtitle files can be merged into the output with the `-M/--merge-subtitles` option.
 
+### What Gets Dropped or Changed
+
+Beyond video re-encoding, `rmbloat` makes several decisions about stream handling that are designed to reduce bloat while preserving what matters. Understanding these helps avoid surprises.
+
+**Streams Always Dropped:**
+
+| Stream Type | Why Dropped |
+|-------------|-------------|
+| **Attachments** (`-map -0:t`) | Fonts, cover art, thumbnails embedded in MKV. Often 10-50MB of bloat. Your media server typically ignores these anyway. |
+| **Data streams** (`-map -0:d`) | Timecodes, chapter thumbnails, misc metadata. Rarely used by players. |
+| **Bitmap subtitles** | DVD/Blu-ray image-based subs (PGS, VobSub). Can't be stored in MKV text tracks and often cause FFmpeg failures. See [Subtitle Handling](#subtitle-handling). |
+
+**Streams Always Kept:**
+
+| Stream Type | How Handled |
+|-------------|-------------|
+| **Video** | Re-encoded to HEVC (that's the point) |
+| **All audio tracks** | Copied without re-encoding (`-c:a copy`). All languages preserved. |
+| **Text subtitles** | Copied if safe codec, dropped if bitmap. See [Subtitle Handling](#subtitle-handling). |
+
+**Pixel Format Decisions:**
+
+The output pixel format depends on your hardware and the `use_10bit` setting:
+
+| Scenario | Pixel Format | Notes |
+|----------|--------------|-------|
+| Hardware + 10-bit supported | `p010le` (10-bit) | Best quality, requires modern Intel (Tiger Lake+) or AMD (Zen 3+) |
+| Hardware + 10-bit NOT supported | `nv12` (8-bit) | Older hardware falls back automatically |
+| Software + 10-bit | `yuv420p10le` | CPU encoding always supports 10-bit |
+| Software + 8-bit | `yuv420p` | Standard 8-bit if `use_10bit=False` |
+
+**10-bit encoding** provides better gradient handling (fewer banding artifacts) at the cost of slightly larger files. `rmbloat` defaults to 10-bit and automatically detects if your hardware supports it.
+
+**Container Format:**
+
+All output is **MKV** (Matroska), regardless of input format. MKV is chosen because:
+- Supports all common audio/video codecs
+- Handles multiple audio and subtitle tracks well
+- No arbitrary stream limits (unlike MP4)
+- Good compatibility with media servers (Plex, Jellyfin, Emby)
+
+**What This Means in Practice:**
+
+If you have a Blu-ray rip with:
+- 40GB video track → Re-encoded to ~8GB HEVC
+- 5 audio tracks (DTS-HD, TrueHD, etc.) → All kept, unchanged
+- 3 PGS subtitle tracks → Dropped (bitmap format)
+- 2 SRT subtitle tracks → Kept
+- 20MB of embedded fonts → Dropped
+- Cover art attachment → Dropped
+
+The result is a much smaller file that plays identically on media servers, just without the embedded extras that most setups ignore anyway.
+
 ### Videos Removed/Moved While Running
 If videos are removed or moved while `rmbloat` is running, they will only be detected just before starting a conversion (if ever).
 In that case, they are silently removed from the queue (in the Conversion screen), but there is a log of the event.

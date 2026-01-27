@@ -3,6 +3,7 @@
 Utility functions for video file conversion
 """
 # pylint: disable=too-many-locals,too-many-branches
+# pylint: disable=line-too-long,too-many-nested-blocks
 import os
 import sys
 import shlex

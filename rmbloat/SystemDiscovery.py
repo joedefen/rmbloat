@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-SystemDiscovery - Detect system capabilities and available tools (Linux-only)
+SystemDiscovery - Detect system capabilities and available tools
 
 This module provides system capability detection including:
 - Clipboard tools (wl-copy, xclip, xsel)
 - Display server type (Wayland, X11, or headless)
 - Available commands
 """
+# pylint: disable=broad-exception-caught,consider-using-with,line-too-long
+# pylint: disable=global-statement,invalid-name
 
 import os
 import subprocess
@@ -56,7 +58,7 @@ class SystemDiscovery:
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE
                     )
-                    stdout, stderr = proc.communicate(input=b'', timeout=1)
+                    _, stderr = proc.communicate(input=b'', timeout=1)
 
                     # Check stderr for connection failures
                     stderr_text = stderr.decode('utf-8', errors='replace').lower()
@@ -115,13 +117,12 @@ class SystemDiscovery:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
-            stdout, stderr = proc.communicate(input=text.encode('utf-8'), timeout=5)
+            _, stderr = proc.communicate(input=text.encode('utf-8'), timeout=5)
 
             if proc.returncode == 0:
                 return True, None
-            else:
-                error = stderr.decode('utf-8', errors='replace').strip()
-                return False, f"Clipboard command failed: {error or 'unknown error'}"
+            error = stderr.decode('utf-8', errors='replace').strip()
+            return False, f"Clipboard command failed: {error or 'unknown error'}"
 
         except subprocess.TimeoutExpired:
             proc.kill()

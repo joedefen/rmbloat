@@ -1,3 +1,7 @@
+""" TBD """
+# pylint: disable=broad-exception-caught,line-too-long,invalid-name
+# pylint: disable=consider-using-dict-items
+
 import configparser
 import os
 import types
@@ -9,8 +13,7 @@ class IniManager:
     within the user's home directory.
 
     All configuration fields are stored within a SimpleNamespace object accessible
-    via the 'vals' attribute (e.g., cfg.vals.field1). This avoids Pylint/static
-    analysis errors related to dynamic attribute creation.
+    via the 'vals' attribute (e.g., cfg.vals.field1).
 
     The constructor handles initial setup:
     1. Determines the file path (~/app_name/config.ini).
@@ -95,7 +98,7 @@ class IniManager:
     def _update_vals_from_config(self, config):
         """Sets object attributes within self.vals based on values read from the ConfigParser."""
         if self.SECTION in config:
-            for key in self._default_values.keys():
+            for key in self._default_values:
                 if key in config[self.SECTION]:
                     try:
                         # Attempt to cast back based on the type of the default value.
@@ -142,8 +145,7 @@ class IniManager:
         config[self.SECTION] = {}
 
         # Transfer all current attribute values from self.vals
-        for key in self._default_values.keys():
-            value = getattr(self.vals, key)
+        for key, value in self._default_values.items():
             # Handle list type: store as newline-separated values
             if isinstance(value, list):
                 config[self.SECTION][key] = '\n' + '\n'.join(str(item) for item in value)
@@ -151,7 +153,7 @@ class IniManager:
                 config[self.SECTION][key] = str(value)
 
         try:
-            with open(self.config_file_path, 'w') as configfile:
+            with open(self.config_file_path, 'w', encoding='utf-8') as configfile:
                 config.write(configfile)
             print(f"Write operation complete. Configuration saved to {self.config_file_path}")
         except Exception as e:
@@ -174,12 +176,14 @@ if __name__ == '__main__':
     )
 
     # Note the access change: manager1.vals.log_level
-    print(f"Initial attributes: LogLevel={manager1.vals.log_level}, Threads={manager1.vals.max_threads}, Enabled={manager1.vals.is_enabled}\n")
+    print(f"Initial attributes: LogLevel={manager1.vals.log_level},"
+          + f" Threads={manager1.vals.max_threads}, Enabled={manager1.vals.is_enabled}\n")
 
     # Change attributes in memory
     manager1.vals.log_level = "INFO"
     manager1.vals.max_threads = 10
-    print(f"Updated attributes in memory: LogLevel={manager1.vals.log_level}, Threads={manager1.vals.max_threads}\n")
+    print(f"Updated attributes in memory: LogLevel={manager1.vals.log_level},"
+          + f" Threads={manager1.vals.max_threads}\n")
 
     # Save changes to the file
     manager1.write()
@@ -195,7 +199,8 @@ if __name__ == '__main__':
         is_enabled=True    # Default will be read
     )
 
-    print(f"Loaded attributes: LogLevel={manager2.vals.log_level}, Threads={manager2.vals.max_threads}, Enabled={manager2.vals.is_enabled}\n")
+    print(f"Loaded attributes: LogLevel={manager2.vals.log_level},"
+          + f" Threads={manager2.vals.max_threads}, Enabled={manager2.vals.is_enabled}\n")
     print("-" * 40 + "\n")
 
 
@@ -211,7 +216,3 @@ if __name__ == '__main__':
     # The constructor should have printed an INFO message about updating the INI file
     print(f"Loaded attributes: Timeout={manager3.vals.timeout_seconds}")
     print("The config.ini file should now include 'timeout_seconds=30'")
-
-    # Clean up the test files/folder (optional)
-    # import shutil
-    # shutil.rmtree(manager3.config_file_path.parent)

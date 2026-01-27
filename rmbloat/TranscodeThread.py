@@ -66,10 +66,10 @@ class TranscodeThread(threading.Thread):
             return
 
         # Added 'total_size' and 'out_time_ms' to filter out more bloat
-        PROGRESS_KEYS = {
-            b"frame", b"fps", b"bitrate", b"out_time", b"progress",
-            b"speed", b"total_size", b"out_time_ms", b"out_time_us"
-        }
+#       PROGRESS_KEYS = {
+#           b"frame", b"fps", b"bitrate", b"out_time", b"progress",
+#           b"speed", b"total_size", b"out_time_ms", b"out_time_us"
+#       }
 
         partial_line = b""
         while not self._stop_event.is_set():

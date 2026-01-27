@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+""" rmbloatd main """
+import os
+import sys
+import shlex
+
 BASH_SCRIPT_CONTENT = """#!/usr/bin/env bash
 # rmbloatd.sh
 # A dedicated tmux wrapper script to manage a persistent, long-running
@@ -166,7 +171,6 @@ esac
 exit 0
 """
 
-
 def main():
     """
     Replaces the current Python process with a bash shell that executes
@@ -177,7 +181,6 @@ def main():
     - Args must come after "--" separator
     - Format: rmbloatd start -- {rmbloat_args...}
     """
-    import os, sys
 
     # Executable path: The bash interpreter
     program = "/bin/bash"
@@ -212,7 +215,6 @@ def main():
     env = os.environ.copy()
     if rmbloat_args:
         # Join args with proper shell escaping
-        import shlex
         env['RMBLOAT_ARGS'] = ' '.join(shlex.quote(arg) for arg in rmbloat_args)
     else:
         env['RMBLOAT_ARGS'] = ''

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """ ProbeCache - Video metadata cache keyed by basename + size """
+# pylint: disable=invalid-name,broad-exception-caught,line-too-long
+# pylint: disable=too-many-return-statements,too-many-statements
+# pylint: disable=too-many-locals,too-many-branches,consider-using-with
+# pylint: disable=too-many-instance-attributes,consider-using-dict-items
+
 import json
 import os
 import sys
@@ -13,8 +18,6 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
-# pylint: disable=invalid-name,broad-exception-caught,line-too-long
-# pylint: disable=too-many-return-statements,too-many-statements
 
 _dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
 
@@ -69,7 +72,7 @@ class ProbeCache:
     def _acquire_instance_lock(self):
         """Acquire exclusive lock - only one rmbloat instance can run"""
         try:
-            self._lock_file = open(self.lock_path, 'w')
+            self._lock_file = open(self.lock_path, 'w', encoding='utf-8')
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Register cleanup on exit
             atexit.register(self._release_instance_lock)
