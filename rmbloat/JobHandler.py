@@ -410,9 +410,9 @@ class JobHandler:
             params.post_input_opts = ['-t', str(self.sample_seconds)]
 
         # Scaling and Color
-        if probe.height > 1080:
-            params.target_width = 1080 * probe.width // probe.height
-            params.target_height = 1080
+        if probe.height > self.opts.max_height:
+            params.target_width = self.opts.max_height * probe.width // probe.height
+            params.target_height = self.opts.max_height
         else:
             params.target_width = None
             params.target_height = None
@@ -510,10 +510,10 @@ class JobHandler:
             params.post_input_opts = ['-t', str(self.sample_seconds)]
 
         # Scaling and Color
-        if probe.height > 1080:
+        if probe.height > self.opts.max_height:
             # Just pass the target dimensions, let make_ffmpeg_cmd build the filter
-            params.target_width = 1080 * probe.width // probe.height
-            params.target_height = 1080
+            params.target_width = self.opts.max_height * probe.width // probe.height
+            params.target_height = self.opts.max_height
         else:
             params.target_width = None
             params.target_height = None

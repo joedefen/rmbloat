@@ -567,13 +567,16 @@ class FfmpegChooser:
         """
         target = base_crf
 
-        # 1. Resolution Adjustment (The "Low-Res Tax")
-        # If the video is SD or lower, we need to boost quality (lower numbers)
+        # 1. Resolution Adjustment
+        # Balance quality across resolutions: boost SD, allow savings for 4K+
         if height:
-            if height < 480:     # 352p etc
+            if height < 480:     # 352p etc - significant boost
                 target -= 4
-            elif height < 720:   # 480p/576p
+            elif height < 720:   # 480p/576p - moderate boost
                 target -= 2
+            elif height >= 2160: # 4K (2160p) and above - allow higher compression
+                target += 2
+            # 720p-1080p: no adjustment (baseline)
 
         # 2. Hardware Mapping (The "VA-API Tax")
         # QP 30 != CRF 28. Hardware needs a lower QP to match software quality.

@@ -64,8 +64,6 @@ def store_cache_on_exit():
 class Converter:
     """ TBD """
     # --- Conversion Criteria Constants (Customize these) ---
-    TARGET_WIDTH = 1920
-    TARGET_HEIGHT = 1080
     TARGET_CODECS = ['h265', 'hevc']
     MAX_BITRATE_KBPS = 2100 # about 15MB/min (or 600MB for 40m)
 
@@ -358,7 +356,7 @@ class Converter:
 
         vid.codec_ok = JobHandler.is_allowed_codec(self.opts, probe)
 
-        vid.res_ok = bool(vid.height is not None and vid.height <= self.TARGET_HEIGHT)
+        vid.res_ok = bool(vid.height is not None and vid.height <= self.opts.max_height)
         vid.bloat_ok = bool(vid.bloat < self.opts.bloat_thresh)
         vid.all_ok = bool(vid.res_ok and vid.bloat_ok and vid.codec_ok)
 
@@ -369,7 +367,7 @@ class Converter:
     def append_vid(self, ppp):
         """
         Checks if a video file already meets the updated conversion criteria:
-        1. Resolution is at least TARGET_WIDTH x TARGET_HEIGHT.
+        1. Resolution height is at or below max_height (configurable via --max-height).
         2. Video codec is TARGET_CODECS (e.g., 'h264').
         3. Video "bloat" is below bloat_thresh.
 
@@ -1335,6 +1333,7 @@ def main(args=None):
                                files=[],  # Default video collection paths
                                full_speed=False,
                                keep_backup=False,
+                               max_height=65536,
                                merge_subtitles=False,
                                min_shrink_pct=10,
                                prefer_strategy='auto',
@@ -1366,6 +1365,10 @@ def main(args=None):
                     action='store_false' if vals.merge_subtitles else 'store_true',
                     help='Merge external .en.srt subtitle files into output'
                     + f' [dflt={vals.merge_subtitles}]')
+        parser.add_argument('-H', '--max-height',
+                    default=vals.max_height, type=int,
+                    help='Maximum video height in pixels; videos taller than this will be scaled down'
+                    + f' [dflt={vals.max_height}]')
         parser.add_argument('-m', '--min-shrink-pct',
                     default=vals.min_shrink_pct, type=int,
                     help='minimum conversion reduction percent for replacement'
@@ -1390,7 +1393,7 @@ def main(args=None):
 
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
-                    help='save the -B/-b/-p/-q/-a/-F/-m/-M options and file paths as defaults')
+                    help='save the -B/-b/-p/-q/-a/-F/-H/-m/-M options and file paths as defaults')
         parser.add_argument('--auto-hr', type=float, default=None,
                     help='Auto mode: run unattended for specified hours, '
                          'auto-select [X] files and auto-start conversions')

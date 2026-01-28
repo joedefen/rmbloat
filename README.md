@@ -52,10 +52,6 @@ Anyhow, you have three options for running `ffmpeg` described below. These instr
 > *   Minimum: 8GB
 > *   Recommended: 16GB (especially if processing 4K content)
 >     *   Why: While the logger is lightweight, the underlying video buffers and the TUI's 50MB log window require stable overhead to prevent interface lag during heavy I/O.
->
-> **Storage (SSD)**
-> *   Requirement: An SSD is highly recommended for the ~/.config directory (where events.jsonl is stored).
->     *   Why: The History Screen performs "read-modify-write" operations when purging or trimming the 50MB log file. An SSD ensures these operations complete in milliseconds, keeping the TUI snappy and preventing "disk-wait" stutters.
 
 ### Option 1: Local FFmpeg with Hardware Acceleration (Recommended)
 
@@ -187,7 +183,7 @@ The output will show which strategies work and recommend the best one. `rmbloat`
 `rmbloat` requires a list of files or directories to scan for conversion candidates (or uses saved defaults if configured).  The full list of options are:
 ```
 usage: rmbloat.py [-h] [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F] [-B]
-                  [-M] [-m MIN_SHRINK_PCT]
+                  [-M] [-H MAX_HEIGHT] [-m MIN_SHRINK_PCT]
                   [-p {auto,system_accel,docker_accel,system_cpu,docker_cpu}]
                   [-q QUALITY] [-t THREAD_CNT] [-S] [--auto-hr AUTO_HR]
                   [-n] [-s] [-L] [-T]
@@ -212,6 +208,9 @@ options:
   -M, --merge-subtitles
                         Merge external .en.srt subtitle files into output
                         [dflt=False]
+  -H MAX_HEIGHT, --max-height MAX_HEIGHT
+                        Maximum video height in pixels; videos taller than
+                        this will be scaled down [dflt=65536]
   -m MIN_SHRINK_PCT, --min-shrink-pct MIN_SHRINK_PCT
                         minimum conversion reduction percent for
                         replacement [dflt=10]
@@ -222,7 +221,7 @@ options:
                         output quality (CRF) [dflt=28]
   -t THREAD_CNT, --thread-cnt THREAD_CNT
                         thread count for ffmpeg conversions [dflt=4]
-  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-m/-M options and file
+  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M options and file
                         paths as defaults
   --auto-hr AUTO_HR     Auto mode: run unattended for specified hours,
                         auto-select [X] files and auto-start conversions
@@ -234,6 +233,13 @@ options:
   You can (and should) customize the defaults by setting the desired options and adding the `--save-defaults` option to write the current choices to its .ini file.
   * Setting the default for `--prefer-strategy` will speed startup once you have tested and found the best strategy.
   * `--save-defaults` includes saving your video collection root paths, so you don't need to specify them every time you run `rmbloat`. File paths are automatically sanitized: converted to absolute paths, non-existing paths removed, and redundant paths (subdirectories of other saved paths) eliminated. Non-video files in the given files and directories are simply ignored.
+
+  **Resolution Control**: By default, `rmbloat` processes videos of any height (max-height defaults to 65536 pixels). Videos taller than the max-height setting will be automatically downscaled while preserving aspect ratio. To limit conversions to a specific resolution:
+  * For 1080p max: `rmbloat --max-height 1080 /path/to/videos`
+  * For 4K/2160p max: `rmbloat --max-height 2160 /path/to/videos`
+  * Save as default: `rmbloat --max-height 1080 -S` (applies to all future runs)
+
+  This is useful for media server owners who want to cap their collection at a specific resolution to manage storage or ensure compatibility with playback devices.
 
   Candidate video files are probed (with `ffprobe`). If the probe fails, then the candidate is simply ignored. Probing many files can be time consuming, but `rmbloat` keeps a cache of probes so start-up can be fast if most of the candidates have been successfully probed.
 
@@ -604,10 +610,12 @@ By default (`-q 28`), you should see **minimal to no perceptible quality loss** 
 - Modern displays and streaming have conditioned viewers to H.265 at these quality levels
 - The "bloat" metric targets files that have excessive bitrate for their resolution
 - Very bloated files (4000+) have so much redundancy that compression is nearly lossless
+- Quality is automatically adjusted by resolution (see [Intelligent Quality Adjustment](#intelligent-quality-adjustment))
 
 **Quality considerations:**
 - For archival/critical content: Use `-q 22` for higher quality
 - For space-constrained situations: Use `-q 32` for more compression
+- For 4K collections: The default `-q 28` works well (encodes at effective CRF 30, which is ideal for 4K)
 - Test first: Use `--sample` to create 30-second samples and compare
 - You can always re-encode if unsatisfied (though it's rarely needed)
 
@@ -706,20 +714,24 @@ Companion files, like .srt files, and folders who share the same basename w/o th
 
 `rmbloat` doesn't just blindly use your `-q` quality setting for all videos. It intelligently adjusts quality based on resolution and encoding method to maintain consistent visual quality across your collection.
 
-**Resolution-Based Adjustment (The "Low-Res Tax")**
+**Resolution-Based Adjustment**
 
-Lower resolution videos need higher quality settings to look good, because they have fewer pixels to work with:
+`rmbloat` intelligently adjusts quality settings based on resolution to optimize the balance between file size and visual quality:
 
 | Resolution | Adjustment | Reason |
 |------------|-----------|--------|
 | < 480p (e.g., 352p, 240p) | -4 from base quality | SD content needs significant quality boost |
 | 480p-720p (e.g., 480p, 576p) | -2 from base quality | Moderate boost for older content |
-| 720p+ | No adjustment | Modern resolutions at base quality |
+| 720p-1080p | No adjustment | Baseline quality (reference point) |
+| 4K+ (2160p and above) | +2 from base quality | High pixel density allows efficient compression |
 
 **Example**: With `-q 28` (default):
-- A 1080p video uses quality 28 (standard)
+- A 4K (2160p) video uses quality 30 (efficient compression for high resolution)
+- A 1080p video uses quality 28 (baseline)
 - A 480p video uses quality 26 (higher quality to compensate)
 - A 352p video uses quality 24 (much higher quality)
+
+**Why this matters**: 4K content has 4x the pixels of 1080p. Using the same CRF would result in massive file sizes with imperceptible quality gains. The +2 adjustment for 4K content provides excellent quality while keeping file sizes reasonable.
 
 **Hardware vs Software Quality Scales**
 
@@ -735,7 +747,9 @@ Software and hardware encoders use different quality scales:
 
 **Why this matters**: If you set `-q 28`, a hardware-encoded video might actually use QP 30 to match the visual quality of CRF 28 from software encoding. This ensures consistent quality regardless of which strategy is used.
 
-**Combined effect**: A 352p video with `-q 28` using hardware acceleration would actually encode at approximately QP 26 (28 - 4 for resolution + 2 for hardware mapping), giving it the quality boost it needs to look good despite the low resolution.
+**Combined effects**:
+- A 352p video with `-q 28` using hardware acceleration would encode at approximately QP 26 (28 - 4 for resolution + 2 for hardware mapping), giving it the quality boost it needs to look good despite the low resolution.
+- A 4K video with `-q 28` using hardware acceleration would encode at approximately QP 32 (28 + 2 for resolution + 2 for hardware mapping), efficiently compressing the high pixel count while maintaining excellent visual quality.
 
 ### Logging (--logs)
 When a conversion completes successfully or not, details are logged into files in your `~/.config/rmbloat` folder. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
