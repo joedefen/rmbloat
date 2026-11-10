@@ -411,10 +411,10 @@ class JobHandler:
         else:
             run.descr = 'initial run'
 
-        job = Job(vid, orig_backup_file, temp_file, duration_secs, self.opts)
-        job.is_retry = retry_with_error_tolerance
-        job.is_software_fallback = force_software
-        job.temp_dir = self.temp_dir
+        job = Job(vid, orig_backup_file, temp_file, duration_secs, self.opts,
+                  is_retry=retry_with_error_tolerance,
+                  is_software_fallback=force_software,
+                  temp_dir=self.temp_dir)
         self.job = job
 
         # 2. Determine encoding strategy

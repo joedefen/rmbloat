@@ -89,7 +89,8 @@ class Vid:
 
 class Job:
     """ Represents a video conversion job """
-    def __init__(self, vid, orig_backup_file, temp_file, duration_secs, opts):
+    def __init__(self, vid, orig_backup_file, temp_file, duration_secs, opts,
+                 is_retry=False, is_software_fallback=False, temp_dir=None):
         self.vid = vid
         self.opts = opts # Needed for TranscodeThread timeout logic
         self.start_mono = time.monotonic()
@@ -98,6 +99,15 @@ class Job:
         self.orig_backup_file = orig_backup_file
         self.temp_file = temp_file
         self.duration_secs = duration_secs
+
+        # Retry-ladder state.  These are part of the job's declared state
+        # because `check_job_status()` and `_execute_file_swap()` read them
+        # unconditionally; injecting them after construction made any other
+        # `Job(...)` call site raise `AttributeError`.
+        self.is_retry = bool(is_retry)
+        self.is_software_fallback = bool(is_software_fallback)
+        # Private per-job output directory, when one was created.
+        self.temp_dir = temp_dir
         self.total_duration_formatted = self.trim0(
                         str(timedelta(seconds=int(duration_secs))))
 
