@@ -366,6 +366,54 @@ class SampleOutputTests(unittest.TestCase):
             self.chooser.make_namespace.call_args.kwargs['output_file'],
             job.temp_file)
 
+    def test_sample_can_be_produced_twice_for_the_same_source(self):
+        """Re-sampling must replace the previous sample instead of failing.
+
+        The sample name is deterministic (``SAMPLE.<crf>.<standard_name>``), so
+        sampling the same source twice at the same quality addresses the same
+        destination.  The second run must replace the previous sample, keep
+        ``doit`` successful, and leave the auto-mode failure counters alone.
+        """
+        handler = JobHandlerModule.JobHandler(
+            self.opts, chooser=self.chooser, probe_cache=self.probe_cache,
+            auto_mode_enabled=True)
+        self.probe_cache.get.return_value = types.SimpleNamespace(gb=0.5)
+        sample_name = f'SAMPLE.28.{self.standard_name}'
+        sample_path = self.root / sample_name
+
+        last_vid = None
+        for index, payload in enumerate((b'first-sample', b'second-sample')):
+            vid = self.make_vid()
+            vid.runs = [types.SimpleNamespace(
+                command='-crf 28', return_code=0, texts=[], descr='run')]
+            work_dir = self.root / f'.rmbloat-tmp-{index}'
+            work_dir.mkdir()
+            temp_path = work_dir / sample_name
+            temp_path.write_bytes(payload)
+            job = types.SimpleNamespace(
+                vid=vid,
+                temp_file=str(temp_path),
+                temp_dir=str(work_dir),
+                thread=types.SimpleNamespace(is_alive=lambda: False),
+            )
+
+            probe = handler.finish_transcode_job(job)
+
+            self.assertIsNotNone(probe)
+            self.assertEqual(vid.doit, ' OK')
+            self.assertEqual(sample_path.read_bytes(), payload)
+            self.assertFalse(work_dir.exists())
+            last_vid = vid
+
+        self.assertEqual(handler.error_count, 0)
+        self.assertEqual(handler.consecutive_failures, 0)
+        self.assertTrue(any('replaced previous sample' in op
+                            for op in last_vid.ops))
+        # Only the newest sample is left next to the source.
+        samples = sorted(path.name for path in self.root.iterdir()
+                         if path.name.startswith('SAMPLE.'))
+        self.assertEqual(samples, [sample_name])
+
     def test_finish_sample_keeps_only_the_basename_for_display(self):
         vid = self.make_vid()
         work_dir = self.root / '.rmbloat-tmp-test'

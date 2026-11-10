@@ -343,6 +343,50 @@ class JobHandler:
 
         return False
 
+    def _discard_pending_temp(self):
+        """Drop the previous attempt's temp output and private directory.
+
+        A retry re-enters :meth:`start_transcode_job` while the failed
+        attempt's ``TEMP.*``/``SAMPLE.*`` file and its ``.rmbloat-tmp-*``
+        directory are still on disk.  :meth:`finish_transcode_job` only removes
+        the directory of the *final* job, so without this every retry leaked one
+        partial encode into the media directory.  The scanner deliberately
+        ignores ``.rmbloat-*`` names, so nothing surfaced the leak.
+        """
+        temp_file = getattr(self, 'temp_file', None)
+        if temp_file:
+            try:
+                if os.path.lexists(temp_file):
+                    os.unlink(temp_file)
+            except OSError as exc:
+                print(f"Warning: could not remove previous temp file "
+                      f"{temp_file!r}: {exc}")
+        # Only removes the directory when it is empty; a preserved output (for
+        # example from a failed install) is never deleted here.
+        Sandbox.remove_private_work_dir(getattr(self, 'temp_dir', None))
+        self.temp_file = None
+        self.temp_dir = None
+
+    @staticmethod
+    def _install_sample(temp_file: str, sample_target: str) -> bool:
+        """Move a finished sample beside its source; return True if replaced.
+
+        The destination is deterministic (``SAMPLE.<crf>.<standard_name>``), so
+        sampling the same source twice at the same quality addresses the same
+        file.  That file is a previous sample - possibly a truncated leftover
+        from a crash - so replacing it is the intended action.  Refusing would
+        report a perfectly good transcode as an error.  A directory at the
+        destination is still refused, and ``os.replace`` is atomic, so the old
+        sample is never left half-deleted.
+        """
+        if not os.path.lexists(sample_target):
+            FileOps._rename_no_clobber(temp_file, sample_target, False)
+            return False
+        if os.path.isdir(sample_target) and not os.path.islink(sample_target):
+            raise FileExistsError(f'destination is a directory: {sample_target}')
+        os.replace(temp_file, sample_target)
+        return True
+
     def start_transcode_job(self, vid: Vid, retry_with_error_tolerance=False,
                             force_software=False):
         """Start a transcoding job using the Threaded TranscodeThread.
@@ -356,6 +400,10 @@ class JobHandler:
         video_dir = os.path.dirname(video_path)
         basename = os.path.basename(video_path)
         probe = vid.probe0
+
+        # A retry re-enters this method after the previous attempt completed;
+        # discard that attempt's output before allocating a fresh directory.
+        self._discard_pending_temp()
 
         # ... [Subtitle and Path Logic] ...
         merged_external_subtitle = None
@@ -558,16 +606,19 @@ class JobHandler:
                 success = False
                 vid.doit = 'ERR'
         elif success and self.opts.sample:
-            # --sample promises a file next to the source.  Move it out of the
-            # private work directory with the same no-clobber rule used by the
-            # real install.
+            # --sample promises a file next to the source.  An existing file at
+            # that deterministic name is the previous sample, so replace it
+            # instead of failing the job (and instead of accumulating
+            # SAMPLE.* files next to the media).
             sample_target = os.path.join(
                 os.path.dirname(os.path.abspath(vid.filepath)),
                 os.path.basename(job.temp_file))
             try:
-                FileOps._rename_no_clobber(job.temp_file, sample_target, False)
+                replaced = self._install_sample(job.temp_file, sample_target)
                 job.temp_file = sample_target
-                vid.ops.append(f"sample {sample_target!r}")
+                vid.ops.append(
+                    f"sample {sample_target!r}"
+                    + (" (replaced previous sample)" if replaced else ""))
             except OSError as exc:
                 vid.ops.append(
                     f"ERROR: could not place sample {sample_target!r}: {exc}")

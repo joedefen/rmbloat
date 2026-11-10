@@ -39,8 +39,8 @@ class RmbloatModuleTestCase(unittest.TestCase):
             setattr, self.rmbloat.Converter, 'singleton', previous_singleton)
 
 
-class JobCwdIsolationTests(RmbloatModuleTestCase):
-    """Transcodes must use absolute paths and leave the process CWD alone."""
+class JobHandlerFixtureTestCase(RmbloatModuleTestCase):
+    """Shared media directory, options, chooser, and handler setup."""
 
     def setUp(self):
         super().setUp()
@@ -101,6 +101,10 @@ class JobCwdIsolationTests(RmbloatModuleTestCase):
         vid.start_new_run = start_new_run
         return vid
 
+
+class JobCwdIsolationTests(JobHandlerFixtureTestCase):
+    """Transcodes must use absolute paths and leave the process CWD alone."""
+
     def test_start_transcode_job_keeps_cwd_and_builds_absolute_paths(self):
         vid = self.make_vid()
         cwd_before = os.getcwd()
@@ -159,6 +163,55 @@ class JobCwdIsolationTests(RmbloatModuleTestCase):
             self.assertEqual(vid.basename1, self.standard_name)
         finally:
             os.chdir(cwd_before)
+
+
+class RetryWorkDirCleanupTests(JobHandlerFixtureTestCase):
+    """A retry must not leak the previous attempt's private work directory."""
+
+    @staticmethod
+    def _work_dirs(video_dir):
+        return [path for path in Path(video_dir).iterdir()
+                if path.name.startswith('.rmbloat-tmp-')]
+
+    def test_retry_discards_the_previous_private_work_directory(self):
+        vid = self.make_vid()
+
+        with mock.patch.object(
+                self.job_handler_module, 'TranscodeThread') as thread_cls:
+            first_job = self.handler.start_transcode_job(vid)
+            first_temp = Path(first_job.temp_file)
+            first_dir = first_temp.parent
+            first_temp.write_bytes(b'partial encode')
+            self.assertTrue(first_dir.is_dir())
+
+            # The retry ladder re-enters start_transcode_job(); that attempt's
+            # partial output and directory must be gone, so exactly one
+            # private directory remains for the new attempt.
+            second_job = self.handler.start_transcode_job(vid)
+
+        self.assertEqual(thread_cls.call_count, 2)
+        self.assertFalse(first_temp.exists())
+        self.assertFalse(first_dir.exists())
+        work_dirs = self._work_dirs(self.video_dir.name)
+        self.assertEqual(len(work_dirs), 1)
+        self.assertEqual(work_dirs[0], Path(second_job.temp_file).parent)
+
+    def test_cleanup_after_a_skipped_job_removes_its_work_directory(self):
+        vid = self.make_vid()
+
+        with mock.patch.object(self.job_handler_module, 'TranscodeThread'):
+            job = self.handler.start_transcode_job(vid)
+            temp_path = Path(job.temp_file)
+            temp_path.write_bytes(b'partial encode')
+            self.assertTrue(temp_path.parent.is_dir())
+
+            # Skipping a conversion tears the handler down without calling
+            # finish_transcode_job(); exit cleanup must still remove both the
+            # partial file and its private directory.
+            self.handler.emergency_cleanup()
+
+        self.assertFalse(temp_path.exists())
+        self.assertFalse(self._work_dirs(self.video_dir.name))
 
 
 if __name__ == '__main__':
