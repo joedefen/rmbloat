@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""" ProbeCache - Video metadata cache keyed by basename + size """
+""" ProbeCache - Video metadata cache keyed by absolute path + size """
 # pylint: disable=invalid-name,broad-exception-caught,line-too-long
 # pylint: disable=too-many-return-statements,too-many-statements
 # pylint: disable=too-many-locals,too-many-branches,consider-using-with
@@ -49,14 +49,14 @@ class Probe:
     gb: float = field(default=0.0, init=False)
 
 class ProbeCache:
-    """Video probe cache keyed by basename + size_bytes"""
+    """Video probe cache keyed by absolute file path + size_bytes"""
     disk_fields = set(('folder last_seen anomaly width height codec bitrate fps'
                       ' duration size_bytes color_spt customs pix_fmt streams').split())
 
     def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp", chooser=None):
         self.cache_path = os.path.join(cache_dir_name, cache_file_name)
         self.lock_path = self.cache_path + ".lock"
-        self.cache_data: Dict[str, Dict[str, Any]] = {}  # basename -> {size_str -> probe_dict}
+        self.cache_data: Dict[str, Dict[str, Any]] = {}  # abs_path -> {size_str -> probe_dict}
         self._dirty_count = 0
         self._cache_lock = Lock()
         self.chooser = chooser  # FfmpegChooser instance for building ffprobe commands
@@ -92,6 +92,11 @@ class ProbeCache:
                     os.remove(self.lock_path)
             except Exception:
                 pass
+
+    @staticmethod
+    def _cache_key(filepath: str) -> str:
+        """Canonical cache key for a file: its absolute, normalized path."""
+        return os.path.abspath(filepath)
 
     @staticmethod
     def _get_file_size(filepath: str) -> Optional[int]:
@@ -224,7 +229,7 @@ class ProbeCache:
 
     def _increment_probe_failure(self, filepath: str) -> Probe:
         """Increment the probe failure counter (?P1 -> ?P2 -> ... -> ?P9)"""
-        basename = os.path.basename(filepath)
+        key = self._cache_key(filepath)
         size_bytes = self._get_file_size(filepath)
         if size_bytes is None:
             size_bytes = 0
@@ -232,8 +237,8 @@ class ProbeCache:
 
         # Check for existing probe failure
         current_anomaly = None
-        if basename in self.cache_data and size_str in self.cache_data[basename]:
-            current_anomaly = self.cache_data[basename][size_str].get('anomaly')
+        if key in self.cache_data and size_str in self.cache_data[key]:
+            current_anomaly = self.cache_data[key][size_str].get('anomaly')
 
         # Determine new probe failure number
         if current_anomaly and current_anomaly.startswith('?P'):
@@ -246,7 +251,7 @@ class ProbeCache:
             new_num = 1
 
         meta = Probe(
-            folder=os.path.dirname(filepath) + '/',
+            folder=os.path.dirname(key) + '/',
             last_seen=int(time.time()),
             anomaly=f'?P{new_num}',
             size_bytes=size_bytes
@@ -272,9 +277,9 @@ class ProbeCache:
         fields = set(entry.keys())
         return fields == self.disk_fields
 
-    def _load_probe_data(self, basename: str, size_str: str) -> Probe:
+    def _load_probe_data(self, key: str, size_str: str) -> Probe:
         """Helper to convert stored dictionary back into Probe."""
-        meta = Probe(**self.cache_data[basename][size_str])
+        meta = Probe(**self.cache_data[key][size_str])
         self._compute_fields(meta)
         return meta
 
@@ -288,19 +293,39 @@ class ProbeCache:
                 print(f"Warning: Could not read cache file at {self.cache_path}. Starting fresh.")
                 raw_data = {}
 
-            # Validate and migrate: new format has basename -> {size_str -> probe_dict}
+            # Validate and migrate to the current format:
+            #   absolute file path -> {size_str -> probe_dict}
+            # Older releases keyed the outer mapping by basename, which made
+            # same-named, same-sized files in different folders collide. Those
+            # entries are re-keyed here using their stored ``folder`` field.
             self.cache_data = {}
             for key, value in raw_data.items():
-                # Check if this looks like new format (basename key with dict of size keys)
-                if isinstance(value, dict):
-                    # Check if value contains size sub-keys (digits) with probe dicts
-                    valid_sizes = {}
-                    for size_key, probe_dict in value.items():
-                        if size_key.isdigit() and self._is_valid_entry(probe_dict):
-                            valid_sizes[size_key] = probe_dict
-                    if valid_sizes:
-                        self.cache_data[key] = valid_sizes
-                # Old format entries (full path -> probe_dict) are simply discarded
+                if not isinstance(value, dict):
+                    # Legacy flat ``full path -> probe_dict`` entries are discarded.
+                    continue
+
+                # Value must be a mapping of size keys to probe dicts.
+                valid_sizes = {}
+                for size_key, probe_dict in value.items():
+                    if size_key.isdigit() and self._is_valid_entry(probe_dict):
+                        valid_sizes[size_key] = probe_dict
+                if not valid_sizes:
+                    continue
+
+                if os.path.isabs(key):
+                    # Already path-keyed; normalize so lookups match exactly.
+                    bucket = self.cache_data.setdefault(os.path.normpath(key), {})
+                    bucket.update(valid_sizes)
+                    continue
+
+                # Legacy basename-keyed format: rebuild the full path from the
+                # stored folder so distinct files no longer share an entry.
+                for size_key, probe_dict in valid_sizes.items():
+                    folder = probe_dict.get('folder') or ''
+                    if not folder:
+                        continue
+                    path_key = self._cache_key(os.path.join(folder, key))
+                    self.cache_data.setdefault(path_key, {})[size_key] = probe_dict
 
     def store(self):
         """Writes the current cache data atomically if dirty, pruning old entries."""
@@ -310,7 +335,7 @@ class ProbeCache:
             cutoff = now - EXPIRY_SECONDS
             basenames_to_delete = []
 
-            for basename, sizes in self.cache_data.items():
+            for cache_key, sizes in self.cache_data.items():
                 sizes_to_delete = []
                 for size_str, probe_dict in sizes.items():
                     last_seen = probe_dict.get('last_seen', 0)
@@ -321,10 +346,10 @@ class ProbeCache:
                     del sizes[size_str]
 
                 if not sizes:
-                    basenames_to_delete.append(basename)
+                    basenames_to_delete.append(cache_key)
 
-            for basename in basenames_to_delete:
-                del self.cache_data[basename]
+            for cache_key in basenames_to_delete:
+                del self.cache_data[cache_key]
 
             # Write atomically
             temp_path = self.cache_path + ".tmp"
@@ -341,11 +366,11 @@ class ProbeCache:
 
     def _set_cache(self, filepath: str, meta: Probe):
         """Stores the metadata in the cache dictionary."""
-        basename = os.path.basename(filepath)
+        key = self._cache_key(filepath)
         size_str = str(meta.size_bytes)
 
         # Ensure folder and last_seen are set
-        meta.folder = os.path.dirname(filepath) + '/'
+        meta.folder = os.path.dirname(key) + '/'
         if meta.last_seen == 0:
             meta.last_seen = int(time.time())
 
@@ -354,18 +379,18 @@ class ProbeCache:
         probe_dict.pop('gb', None)
         probe_dict.pop('bloat', None)
 
-        if basename not in self.cache_data:
-            self.cache_data[basename] = {}
-        self.cache_data[basename][size_str] = probe_dict
+        if key not in self.cache_data:
+            self.cache_data[key] = {}
+        self.cache_data[key][size_str] = probe_dict
         self._dirty_count += 1
 
     def _get_valid_entry(self, filepath: str) -> Optional[Probe]:
         """
-        Look up cache entry by basename + size.
-        Updates path if file moved, updates last_seen.
+        Look up cache entry by absolute path + size.
+        Updates the stored folder and last_seen.
         Returns Probe if valid, None otherwise.
         """
-        basename = os.path.basename(filepath)
+        key = self._cache_key(filepath)
         current_size = self._get_file_size(filepath)
 
         if current_size is None:
@@ -374,19 +399,19 @@ class ProbeCache:
 
         size_str = str(current_size)
 
-        if basename not in self.cache_data:
+        if key not in self.cache_data:
             return None
 
-        if size_str not in self.cache_data[basename]:
+        if size_str not in self.cache_data[key]:
             return None
 
-        entry = self.cache_data[basename][size_str]
+        entry = self.cache_data[key][size_str]
 
         # Validate entry has correct fields
         if not self._is_valid_entry(entry):
-            del self.cache_data[basename][size_str]
-            if not self.cache_data[basename]:
-                del self.cache_data[basename]
+            del self.cache_data[key][size_str]
+            if not self.cache_data[key]:
+                del self.cache_data[key]
             self._dirty_count += 1
             return None
 
@@ -400,8 +425,8 @@ class ProbeCache:
             except (ValueError, IndexError):
                 pass
 
-        # Update folder if file moved
-        folder = os.path.dirname(filepath) + '/'
+        # Keep the stored folder in sync with the key's directory.
+        folder = os.path.dirname(key) + '/'
         if entry.get('folder') != folder:
             entry['folder'] = folder
             self._dirty_count += 1
@@ -410,7 +435,7 @@ class ProbeCache:
         entry['last_seen'] = int(time.time())
         self._dirty_count += 1
 
-        return self._load_probe_data(basename, size_str)
+        return self._load_probe_data(key, size_str)
 
     def get(self, filepath: str) -> Optional[Probe]:
         """
@@ -437,7 +462,7 @@ class ProbeCache:
         Sets the anomaly field to the given value.
         The entry MUST exist in the cache.
         """
-        basename = os.path.basename(filepath)
+        key = self._cache_key(filepath)
         current_size = self._get_file_size(filepath)
 
         if current_size is None:
@@ -446,11 +471,11 @@ class ProbeCache:
 
         size_str = str(current_size)
 
-        if basename not in self.cache_data or size_str not in self.cache_data[basename]:
+        if key not in self.cache_data or size_str not in self.cache_data[key]:
             print(f"Warning: set_anomaly({anomaly}) - no cache entry for {filepath}")
             return None
 
-        entry = self.cache_data[basename][size_str]
+        entry = self.cache_data[key][size_str]
 
         if anomaly and anomaly.startswith('Er'):
             current_anomaly = entry.get('anomaly')
@@ -468,45 +493,44 @@ class ProbeCache:
             if anomaly != '---':
                 self.store()
 
-        return self._load_probe_data(basename, size_str)
+        return self._load_probe_data(key, size_str)
 
     def move_entry(self, old_path: str, new_path: str) -> bool:
         """
-        Update the stored folder for a cache entry after file rename.
-        Looks up by basename+size of old_path, updates folder to new location.
+        Re-key a cache entry after a file rename/move.
+        Looks up the exact old path and moves all its size entries to new_path.
         """
-        old_basename = os.path.basename(old_path)
-        new_basename = os.path.basename(new_path)
-        old_folder = os.path.dirname(old_path) + '/'
-        new_folder = os.path.dirname(new_path) + '/'
+        old_key = self._cache_key(old_path)
+        new_key = self._cache_key(new_path)
 
-        if old_basename not in self.cache_data:
+        if old_key not in self.cache_data:
             return False
 
-        # Find entry matching old folder
-        for size_str, entry in self.cache_data[old_basename].items():
-            if entry.get('folder') == old_folder:
-                # Found it - move to new basename if different
-                if old_basename != new_basename:
-                    # Remove from old basename
-                    probe_dict = self.cache_data[old_basename].pop(size_str)
-                    if not self.cache_data[old_basename]:
-                        del self.cache_data[old_basename]
-                    # Add to new basename
-                    if new_basename not in self.cache_data:
-                        self.cache_data[new_basename] = {}
-                    probe_dict['folder'] = new_folder
-                    probe_dict['last_seen'] = int(time.time())
-                    self.cache_data[new_basename][size_str] = probe_dict
-                else:
-                    entry['folder'] = new_folder
-                    entry['last_seen'] = int(time.time())
+        entries = self.cache_data[old_key]
+        if not entries:
+            del self.cache_data[old_key]
+            return False
 
-                self._dirty_count += 1
-                self.store()
-                return True
+        now = int(time.time())
 
-        return False
+        if old_key == new_key:
+            for entry in entries.values():
+                entry['last_seen'] = now
+            self._dirty_count += 1
+            self.store()
+            return True
+
+        new_folder = os.path.dirname(new_key) + '/'
+        target = self.cache_data.setdefault(new_key, {})
+        for size_str, entry in entries.items():
+            entry['folder'] = new_folder
+            entry['last_seen'] = now
+            target[size_str] = entry
+        del self.cache_data[old_key]
+
+        self._dirty_count += 1
+        self.store()
+        return True
 
     def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Probe]:
         """

@@ -209,6 +209,55 @@ class BatchProbeNoneTests(unittest.TestCase):
         self.assertIsNotNone(results[movie])
         self.assertNotIn(missing, results)
 
+    def _make_file(self, folder, basename, payload=b'data' * 10):
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, basename)
+        with open(path, 'wb') as handle:
+            handle.write(payload)
+        return path
+
+    def test_same_basename_and_size_in_different_folders_do_not_collide(self):
+        """Two same-named, same-sized files must keep separate cache entries."""
+        dir_a = os.path.join(self._tmpdir.name, 'a')
+        dir_b = os.path.join(self._tmpdir.name, 'b')
+        file_a = self._make_file(dir_a, 'same.mp4')
+        file_b = self._make_file(dir_b, 'same.mp4')
+        size = os.path.getsize(file_a)
+        self.assertEqual(size, os.path.getsize(file_b))
+
+        self.cache._set_cache(  # pylint: disable=protected-access
+            file_a, Probe(size_bytes=size, codec='h264', width=640, height=480))
+        self.cache._set_cache(  # pylint: disable=protected-access
+            file_b, Probe(size_bytes=size, codec='hevc', width=3840, height=2160))
+
+        meta_a = self.cache.get(file_a)
+        meta_b = self.cache.get(file_b)
+
+        self.assertIsNotNone(meta_a)
+        self.assertIsNotNone(meta_b)
+        self.assertEqual(meta_a.codec, 'h264')
+        self.assertEqual(meta_b.codec, 'hevc')
+        self.assertEqual(meta_a.height, 480)
+        self.assertEqual(meta_b.height, 2160)
+        self.assertEqual(meta_a.folder, dir_a + '/')
+        self.assertEqual(meta_b.folder, dir_b + '/')
+
+    def test_move_entry_rekeys_by_full_path(self):
+        """A managed rename should move the entry, not share it by basename."""
+        old_path = self._make_file(self._tmpdir.name, 'TEMP.movie.mkv')
+        new_path = os.path.join(self._tmpdir.name, 'movie.mkv')
+        size = os.path.getsize(old_path)
+        self.cache._set_cache(  # pylint: disable=protected-access
+            old_path, Probe(size_bytes=size, codec='hevc'))
+        os.rename(old_path, new_path)
+
+        self.assertTrue(self.cache.move_entry(old_path, new_path))
+        self.assertNotIn(os.path.abspath(old_path), self.cache.cache_data)
+
+        meta = self.cache.get(new_path)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.codec, 'hevc')
+
 
 class MainLoopNoneProbeTests(unittest.TestCase):
     """`main_loop()` must survive a `PathProbePair` with a `None` probe."""

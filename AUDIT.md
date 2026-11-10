@@ -27,6 +27,10 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H1. Duplicate `start_transcode_job()` definition** — Resolved in [`start_transcode_job()`](rmbloat/JobHandler.py:353). Commit `71c5c3c` inserted a rewritten method above the original body without deleting the old one, so both copies were maintained in parallel (later fixes such as `max_height` scaling were applied to each) and the *older* body, being last in the class, was the one bound at import time. The stale copy is deleted; the surviving implementation keeps the newer sample logic (`start_secs = max(120, probe.duration) * 0.20`, which seeks 20% into the full movie instead of 20% into the 30-second sample, where `job.duration_secs` is only the sample length) and now also sets `params.subtitle_codec` (`'srt'` for internal text subtitles, `'copy'` when merging an external `.en.srt`), behaviour that only the deleted copy had. `pylint --errors-only rmbloat/JobHandler.py` no longer reports `E0102`, and `python3 -m unittest discover -s tests -t .` passes (38 tests).
 
+- **H2. Filename purge loop dropped later codec/resolution tokens** — Resolved in [`standard_name()`](rmbloat/ConvertUtils.py:201). The manual loop reused slice-relative match offsets as indices into the already-mutated full name, so the scan position was wrong after the first removal. It is replaced by a single [`re.sub()`](rmbloat/ConvertUtils.py:258) over `[^a-z0-9](?:[xh]\.?264|avc|xvid|divx|\d+[pik]|UHD)\b`, which removes every token and its leading delimiter in one pass. Verified: `Movie.1080p.x264.mkv` → `Movie.1080p.x265-cmf28.recode.mkv`, `Show.S01E02.720p.H.264.mkv` → `Show.s01e02.1080p.x265-cmf28.recode.mkv`, and `Something.xvid.480p.avi` → `Something.1080p.x265-cmf28.recode.mkv` (the remaining `1080p` is the newly appended target resolution, not a leftover).
+
+- **H3. Probe cache key collision** — Resolved in [`ProbeCache`](rmbloat/ProbeCache.py:51). Entries are now keyed by absolute file path followed by size (`abs_path -> {size -> probe}`) instead of basename + size, via [`_cache_key()`](rmbloat/ProbeCache.py:97), so `same.mp4` of equal size in different folders keeps separate metadata. [`load()`](rmbloat/ProbeCache.py:286) migrates existing basename-keyed cache files by rebuilding each path from the stored `folder`, and [`move_entry()`](rmbloat/ProbeCache.py:498) now re-keys all size entries for the exact old path. Verified with two same-named/same-sized files in separate folders (each retains its own codec, height, and folder) and with a managed rename; regression coverage lives in [`tests/test_input_validation.py`](tests/test_input_validation.py).
+
 ---
 
 # Critical findings
@@ -78,9 +82,9 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
    - `Movie.1080p.x264` → `Movie.x264.1080p.x265.cmf28.recode.mkv`
    - `Show.S01E02.720p.H.264` → `Show.S01E02.H.264.1080p.x265.cmf28.recode.mkv`
    - `Something.xvid.480p.avi` → `Something.480p.avi.1080p.x265.cmf28.recode.mkv`
-   This leaves old codec/resolution tokens in names and can duplicate resolution tags. Use `re.sub` or correctly accumulate offsets.
+   This leaves old codec/resolution tokens in names and can duplicate resolution tags. Use `re.sub` or correctly accumulate offsets. **Resolved** — see the H2 entry under “Resolved findings”.
 
-3. **Probe cache key collision.** [`_get_valid_entry()`](rmbloat/ProbeCache.py:362) keys only on basename + size, and rewrites the stored `folder`. Reproduced with two different files named `same.mp4` of equal size in different folders: looking up the second returned the first file’s cached metadata. This can assign wrong codec/resolution/duration/subtitle info and confuse [`move_entry()`](rmbloat/ProbeCache.py:473).
+3. **Probe cache key collision.** [`_get_valid_entry()`](rmbloat/ProbeCache.py:362) keys only on basename + size, and rewrites the stored `folder`. Reproduced with two different files named `same.mp4` of equal size in different folders: looking up the second returned the first file’s cached metadata. This can assign wrong codec/resolution/duration/subtitle info and confuse [`move_entry()`](rmbloat/ProbeCache.py:473). **Resolved** — see the H3 entry under “Resolved findings”.
 
 4. **Sample mode writes to a hardcoded developer path.** [`start_transcode_job()`](rmbloat/JobHandler.py:457) uses `prefix = '/heap/samples/SAMPLE...'` and never creates the directory. `--sample` will fail on any normal machine and leaves an absolute temp path in `vid.basename1` ([`JobHandler.py:612`](rmbloat/JobHandler.py:612)).
 
