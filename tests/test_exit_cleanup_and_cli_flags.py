@@ -1,4 +1,4 @@
-"""Regression tests for exit cleanup and CLI boolean semantics (M10/M11).
+"""Regression tests for exit cleanup and CLI boolean semantics.
 
 ``JobHandler.emergency_cleanup()`` was never registered, and the transcode
 thread is a daemon, so a SIGTERM/crash could orphan an ffmpeg child and leave

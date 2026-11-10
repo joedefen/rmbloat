@@ -1,4 +1,4 @@
-"""Regression tests for audit finding H6: log trimming scrambled chronology.
+"""Regression tests: log trimming must preserve chronology.
 
 ``_trim_log_file()`` selects survivors by *effective* age so ``ERR`` entries are
 kept longer.  It then reversed that weighted order before writing, which is not

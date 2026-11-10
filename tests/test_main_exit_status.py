@@ -1,4 +1,4 @@
-"""Regression tests for audit finding H10.
+"""Regression tests for ``main()`` exit status.
 
 ``main()`` used to catch every ``Exception``, print a traceback, and return
 normally, so the process always exited with status 0.  Shell scripts, cron,

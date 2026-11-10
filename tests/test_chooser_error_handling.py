@@ -1,4 +1,4 @@
-"""Regression tests for chooser exception handling and test-output safety (M7).
+"""Regression tests for chooser exception handling and test-output safety.
 
 [`_run_command()`](rmbloat/FfmpegChooser.py:93) used to catch only
 ``TimeoutExpired`` and ``FileNotFoundError``, so a ``PermissionError`` or any

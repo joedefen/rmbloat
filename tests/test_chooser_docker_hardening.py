@@ -1,4 +1,4 @@
-"""Regression tests for Docker hardening/portability (audit finding M6).
+"""Regression tests for Docker hardening/portability.
 
 The container invocation used ``--net=host --ipc=host``, bind mounts lacked an
 SELinux ``:z`` label, and the image was pulled automatically during startup.

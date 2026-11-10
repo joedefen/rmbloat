@@ -1,6 +1,6 @@
 """Regression tests for VideoParser episode/special handling.
 
-Two low-severity audit findings lived here: ``is_same_episode()`` tested the
+Two parser regressions were fixed here: ``is_same_episode()`` tested the
 bound method instead of calling it, and ``check_special()`` contained a
 duplicate ``specialsdir_pat`` branch while the specials regex used ``(:?``
 instead of the non-capturing ``(?:``.

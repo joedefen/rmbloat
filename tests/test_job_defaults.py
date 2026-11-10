@@ -1,4 +1,4 @@
-"""Regression tests for audit finding H13: ``Job``'s retry-ladder state.
+"""Regression tests for ``Job``'s retry-ladder state.
 
 [`check_job_status()`](../rmbloat/JobHandler.py:201) and
 [`_execute_file_swap()`](../rmbloat/JobHandler.py:654) read ``is_retry``,

@@ -1,4 +1,4 @@
-"""Regression tests for audit finding C7: the original-file swap must be safe.
+"""Regression tests: the original-file swap must be safe.
 
 Previously ``_execute_file_swap()`` trashed or unlinked the original *before*
 renaming the transcoded temp file into place. A failing final rename therefore
@@ -284,7 +284,7 @@ class FileSwapTests(unittest.TestCase):
 
 
 class SampleOutputTests(unittest.TestCase):
-    """Regression tests for audit finding H4: no hardcoded sample directory."""
+    """Regression tests: sample output must not use a hardcoded directory."""
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()

@@ -1,4 +1,4 @@
-"""Regression tests for the status filter and History search refresh (M8/M9).
+"""Regression tests for the status filter and History search refresh.
 
 ``make_lines()`` compared the raw status to ``'OK'``, but successful jobs are
 stored as ``' OK'`` (leading space), so the ``-DUN`` filters never hid them.

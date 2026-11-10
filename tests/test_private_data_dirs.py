@@ -1,4 +1,4 @@
-"""Regression tests for private log/probe-cache locations (audit L7/L8).
+"""Regression tests for private log/probe-cache locations.
 
 The structured log and probe cache contain absolute media paths and ffmpeg
 output.  They must live in per-user XDG directories and be inaccessible to

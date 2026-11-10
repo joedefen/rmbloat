@@ -1,4 +1,4 @@
-"""Regression tests for audit finding H7: unbounded ffmpeg log capture.
+"""Regression tests: ffmpeg log capture must stay bounded.
 
 Two places previously grew without limit:
 

@@ -1,4 +1,4 @@
-"""Regression tests for the `rmbloat --logs` command (audit finding C1).
+"""Regression tests for the `rmbloat --logs` command.
 
 The original handler assumed ``StructuredLogger.log_paths`` returned at least
 two paths and unconditionally accessed ``files[1]``.  The logger actually

@@ -1,4 +1,4 @@
-"""Regression test for the documented `rmbloat --chooser-tests` command (C2).
+"""Regression test for the documented `rmbloat --chooser-tests` command.
 
 When no video file is supplied, ``main()`` asks ``FfmpegChooser.run_tests()``
 to print example encode commands.  Those examples use the illustrative path

@@ -1,6 +1,6 @@
 """Regression tests for ``IniManager.write()`` persisting current values.
 
-Audit finding C3: ``write()`` iterated the constructor-supplied
+``write()`` used to iterate the constructor-supplied
 ``_default_values`` instead of the live ``self.vals`` attributes, so
 ``rmbloat --save-defaults`` printed "new defaults" that were never stored.
 The same bug meant that any schema-mismatch rewrite (a new field added in a

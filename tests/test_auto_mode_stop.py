@@ -1,4 +1,4 @@
-"""Regression tests for audit finding C5: ``--auto-hr`` must actually stop.
+"""Regression tests: ``--auto-hr`` must actually stop.
 
 Previously the auto-mode time limit was stored but never read, the vitals
 report was never printed, and an empty queue simply returned, leaving an

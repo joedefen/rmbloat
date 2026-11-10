@@ -1,9 +1,8 @@
-"""Regression tests for the medium-severity audit finding:
+"""Regression tests for incomplete recycle-directory exclusion.
 
-    Incomplete recycle-directory exclusion: only ``.Trash*``, ``Trash`` and
-    ``lost+found`` were skipped, so Synology ``#recycle``, QNAP ``@Recycle``,
-    ``.recycle`` and similar stores were traversed and their (deleted) media
-    could be converted.
+Only ``.Trash*``, ``Trash`` and ``lost+found`` used to be skipped, so Synology
+``#recycle``, QNAP ``@Recycle``, ``.recycle`` and similar stores were traversed
+and their (deleted) media could be converted.
 
 ``ConvertUtils.is_excluded_directory()`` now centralises the check and
 ``get_candidate_video_files()`` uses it to prune ``os.walk()``.

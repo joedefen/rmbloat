@@ -1,4 +1,4 @@
-"""Regression tests for audit finding C4.
+"""Regression tests for startup input validation.
 
 Startup crashed whenever any argument was not a probeable video: an audio-only
 ``.mp4``, a text file, or a stale saved default path.  ``batch_get_or_probe()``
@@ -93,7 +93,7 @@ class CandidateVideoFileTests(unittest.TestCase):
         self.assertEqual(paths, [movie])
 
     def test_skip_prefixes_apply_to_absolute_directory_scan_paths(self):
-        # Regression for C6: the prefix filter used to run against the full
+        # The prefix filter used to run against the full
         # absolute path, which never starts with 'TEMP.'/'ORIG.'/'SAMPLE.'.
         movie = self.make_file('good.mkv')
         for name in ('ORIG.foo.mkv', 'SAMPLE.foo.mkv', 'TEMP.foo.mkv'):

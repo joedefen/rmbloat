@@ -1,4 +1,4 @@
-"""Regression tests for the Docker acceleration parity fix (H9).
+"""Regression tests for Docker acceleration parity.
 
 The acceleration probe, the 10-bit probe, and real Docker encodes must all
 run with the same ``--user uid:gid`` identity and the same supplementary

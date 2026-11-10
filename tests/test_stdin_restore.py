@@ -1,4 +1,4 @@
-"""Regression tests for audit finding H5: reopening the TTY closed stdin.
+"""Regression tests: reopening the TTY must not close stdin.
 
 ``create_video_file_list()`` closes the piped ``sys.stdin`` before reopening
 ``/dev/tty``.  Closing stdin frees file descriptor 0, and ``os.open('/dev/tty')``

@@ -1,6 +1,6 @@
 """Regression tests for atomic configuration/state writes.
 
-Audit finding: ``PersistentState.save()`` and ``IniManager.write()`` used to
+``PersistentState.save()`` and ``IniManager.write()`` used to
 truncate and rewrite their target file in place.  A crash or power loss midway
 through the write could leave ``state.json``/``config.ini`` truncated or
 corrupt.  Both now write to a temporary file in the same directory and

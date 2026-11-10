@@ -988,7 +988,7 @@ class Converter:
         # sys.argv is the list of command-line arguments. sys.argv[0] is the script name.
         ppps = self.create_video_file_list()
         self.probe_cache.store()
-        # Defensive: a None probe must never reach the sort key (audit C4).
+        # Defensive: a None probe must never reach the sort key.
         ppps.sort(key=lambda ppp: ppp.probe.bloat if ppp.probe else 0, reverse=True)
 
         if not ppps:

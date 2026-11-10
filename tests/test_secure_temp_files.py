@@ -1,4 +1,4 @@
-"""Regression tests for predictable temp/copy paths (audit finding M5).
+"""Regression tests for predictable temp/copy paths.
 
 The probe cache used to write to ``<cache>.json.tmp`` and the History clipboard
 fallback always wrote ``/tmp/rmbloat-export.txt``.  Both names are predictable

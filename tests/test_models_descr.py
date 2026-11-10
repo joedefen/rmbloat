@@ -1,4 +1,4 @@
-"""Regression tests for ``Vid.descr_str()`` (audit finding M3).
+"""Regression tests for ``Vid.descr_str()``.
 
 ``start_new_run()`` creates an ``FfmpegRun`` with ``descr=None``; only later
 does ``JobHandler`` assign ``'initial run'`` or a retry description.  The

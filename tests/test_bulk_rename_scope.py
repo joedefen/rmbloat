@@ -1,4 +1,4 @@
-"""Regression tests for companion-file rename scope (audit low-severity).
+"""Regression tests for companion-file rename scope.
 
 ``bulk_rename()`` must recurse into directories that share the video's
 basename (such as ``movie.cache/``) and rename matching contents there, but it

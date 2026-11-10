@@ -1,4 +1,4 @@
-"""Regression tests for audit finding M12: job startup must not call ``chdir``.
+"""Regression tests: job startup must not call ``chdir``.
 
 ``start_transcode_job()`` used to change the process-wide working directory to
 the source video's folder and never restore it.  Consumers therefore relied on
