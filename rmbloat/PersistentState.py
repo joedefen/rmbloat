@@ -4,6 +4,8 @@ PersistentState class for saving user preferences
 # pylint: disable=invalid-name,broad-exception-caught,line-too-long
 # pylint: disable=consider-using-dict-items
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from .IniManager import IniManager
@@ -62,16 +64,38 @@ class PersistentState:
                 print(f'Warning: Could not load state from {self.config_path}: {e}')
 
     def save(self):
-        """Save state to disk if dirty"""
+        """Save state to disk if dirty
+
+        The new content is written to a temporary file in the same directory
+        and then atomically moved into place with :func:`os.replace`, so a
+        crash or power loss mid-write cannot truncate or corrupt ``state.json``.
+        """
         if not self.dirty:
             return
 
+        temp_path = None
         try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f'.{self.config_path.name}.',
+                suffix='.tmp',
+                dir=self.config_path.parent,
+                text=True)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(self.state, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.config_path)
+            temp_path = None
             self.dirty = False
-        except IOError as e:
+        except OSError as e:
             print(f'Warning: Could not save state to {self.config_path}: {e}')
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
     def sync(self):
         """Save state if dirty (called each loop)"""

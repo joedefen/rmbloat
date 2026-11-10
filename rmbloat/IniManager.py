@@ -4,6 +4,7 @@
 
 import configparser
 import os
+import tempfile
 import types
 from pathlib import Path
 
@@ -173,12 +174,32 @@ class IniManager:
             else:
                 config[self.SECTION][key] = str(value)
 
+        # Write to a temporary file in the same directory and atomically
+        # replace the real file.  A crash mid-write can then never leave a
+        # truncated/corrupt config.ini behind.
+        directory = os.path.dirname(self.config_file_path) or '.'
+        temp_path = None
         try:
-            with open(self.config_file_path, 'w', encoding='utf-8') as configfile:
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f'.{os.path.basename(self.config_file_path)}.',
+                suffix='.tmp',
+                dir=directory,
+                text=True)
+            with os.fdopen(fd, 'w', encoding='utf-8') as configfile:
                 config.write(configfile)
+                configfile.flush()
+                os.fsync(configfile.fileno())
+            os.replace(temp_path, self.config_file_path)
+            temp_path = None
             print(f"Write operation complete. Configuration saved to {self.config_file_path}")
         except Exception as e:
             print(f"ERROR: Failed to write config file to {self.config_file_path}. Error: {e}")
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
 
 # --- Example Usage ---

@@ -20,6 +20,44 @@ VIDEO_EXTENSIONS = {
 # Filename prefixes to skip during processing (treated as non-video files)
 SKIP_PREFIXES = ('TEMP.', 'ORIG.', 'SAMPLE.')
 
+# Directory names that hold deleted files, snapshots, or filesystem metadata.
+# Their contents must never be probed or converted: media found there is either
+# awaiting permanent removal or is system/thumbnail data.  Names are compared
+# case-insensitively (``@eaDir`` vs ``@EADIR``).
+EXCLUDED_DIR_NAMES = frozenset({
+    'trash',                     # generic trash; Linux/Btrfs per-user trash
+    '.trashes',                  # macOS per-volume trash
+    '.recycle',                  # Android/SMB .recycle stores
+    '#recycle',                  # Synology recycle bin
+    '#snapshot',                 # Synology snapshot store
+    '@recycle',                  # QNAP recycle bin
+    '@recently-snapshot',        # QNAP snapshot store
+    '@eadir',                    # Synology metadata/thumbnail cache
+    '.@__thumb',                 # QNAP thumbnail cache
+    '$recycle.bin',              # Windows recycle bin
+    'recycler',                  # legacy Windows recycle bin
+    'system volume information',  # Windows NTFS metadata
+    '.snapshot',                 # generic/Btrfs snapshot store
+    'lost+found',                # ext2/3/4 recovery directory
+})
+
+# Directory name prefixes to skip.  Covers macOS ``.Trash`` and the
+# per-user ``.Trash-1000`` directories created on non-Home mounts.
+EXCLUDED_DIR_PREFIXES = ('.trash',)
+
+
+def is_excluded_directory(dir_name: str) -> bool:
+    """
+    Return True when *dir_name* is a trash/recycle/snapshot/system directory
+    whose contents must not be traversed by rmbloat.
+
+    Comparison is case-insensitive so that ``@Recycle`` (QNAP) and
+    ``$RECYCLE.BIN`` (Windows) are matched regardless of how the share
+    exposes their case.
+    """
+    name = dir_name.lower()
+    return name in EXCLUDED_DIR_NAMES or name.startswith(EXCLUDED_DIR_PREFIXES)
+
 
 def bash_quote(args):
     """
@@ -170,8 +208,9 @@ def get_candidate_video_files(file_args):
         # Recursively walk the directory structure
         for root, dirs, files in os.walk(dir_path):
 
-            # Skip trash and system directories (modify in-place to prevent os.walk from descending)
-            dirs[:] = [d for d in dirs if not (d.startswith('.Trash') or d in ('Trash', 'lost+found'))]
+            # Skip trash/recycle/snapshot/system directories (modify in-place so
+            # os.walk does not descend into them)
+            dirs[:] = [d for d in dirs if not is_excluded_directory(d)]
 
             # Sort the directory names before os.walk processes them (case-insensitive)
             # This ensures predictable traversal order of subdirectories
