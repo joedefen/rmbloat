@@ -39,6 +39,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H7. ffmpeg stderr and serialized job logs grew without bound** — Resolved in two layers. [`TranscodeThread`](rmbloat/TranscodeThread.py:18) now records stderr through [`_record_text()`](rmbloat/TranscodeThread.py:146), which truncates overlong single lines and keeps the live buffer within `MAX_LOG_LINES`/`MAX_LOG_CHARS` by discarding the oldest entries down to a 75% target; the newline-less `partial_line` buffer is capped too. [`_log_job_final()`](rmbloat/rmbloat.py:267) now clears `runs[*].texts` as well as `vid.texts` for successful jobs, and bounds failed-job output with [`_tail_for_log()`](rmbloat/rmbloat.py:259) (last 200 lines plus an omission marker) so `asdict(vid)` can no longer produce unbounded JSON. Regression coverage lives in [`tests/test_log_bounds.py`](tests/test_log_bounds.py).
 
+- **H8. `StructuredLogger.put(data=...)` raised `TypeError`** — Resolved in [`put()`](rmbloat/StructuredLogger.py:386). The method forwarded `data=kwargs.get('data')` and `**kwargs` to [`_create_log_entry()`](rmbloat/StructuredLogger.py:215) at the same time, so any `data=` argument raised `TypeError: ... got multiple values for keyword argument 'data'`. It now does `data = kwargs.pop('data', None)` and passes the single value through, keeping the arbitrary-MESSAGE_TYPE tag and the list-message join intact. Verified with `put('CUSTOM', 'hello', data={'k': 'v'})`, `put('CUSTOM', ['a', 'b'])`, and a plain call; regression coverage lives in [`tests/test_structured_logger_put.py`](tests/test_structured_logger_put.py).
+
 ---
 
 # Critical findings
@@ -102,7 +104,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 7. **Unbounded ffmpeg log capture.** [`run_ffmpeg()`](rmbloat/TranscodeThread.py:124) appended every non-progress stderr line to `info.texts` without limit, and [`_log_job_final()`](rmbloat/rmbloat.py:267) serialized `asdict(vid)` including `runs[*].texts` while clearing only `dumped['texts']`. Corrupt or long-running jobs could therefore exhaust memory and write huge JSON log entries. **Resolved** — see the H7 entry under “Resolved findings”.
 
-8. **`StructuredLogger.put(..., data=...)` raises `TypeError`.** [`put()`](rmbloat/StructuredLogger.py:393) passes `data=kwargs.get('data')` and also `**kwargs`, duplicating `data`. Verified: `TypeError ... got multiple values for keyword argument 'data'`.
+8. **`StructuredLogger.put(..., data=...)` raises `TypeError`.** [`put()`](rmbloat/StructuredLogger.py:386) passed `data=kwargs.get('data')` and also `**kwargs`, duplicating `data`. Verified: `TypeError ... got multiple values for keyword argument 'data'`. **Resolved** — see the H8 entry under “Resolved findings”.
 
 9. **`Job` lacks `is_retry`/`is_software_fallback` defaults.** [`Job.__init__()`](rmbloat/Models.py:89) does not define them, but [`check_job_status()`](rmbloat/JobHandler.py:211) depends on them. It works only because `start_transcode_job()` injects attributes dynamically; any other `Job` construction will raise `AttributeError`.
 

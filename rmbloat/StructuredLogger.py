@@ -395,9 +395,12 @@ class StructuredLogger:
             list_message = '\n'.join(str(item) for item in args[0])
             args = (list_message,) + args[1:]
 
+        # Extract 'data' so it is not passed twice to _create_log_entry()
+        data = kwargs.pop('data', None)
+
         # Create entry with custom level
         entry = self._create_log_entry(str(message_type).upper(), *args,
-                                      data=kwargs.get('data'), **kwargs)
+                                      data=data, **kwargs)
         self._append_log(entry)
 
     def purge_at_or_before(self, timestamp: str, level_filter: Optional[str] = None):
