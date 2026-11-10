@@ -58,7 +58,6 @@ class Probe:
     folder: str = ''  # directory path ending in /
     last_seen: int = 0  # Unix timestamp
     anomaly: Optional[str] = None
-    customs: Optional[Dict[str, Any]] = None
     width: int = 0
     height: int = 0
     codec: str = '---'
@@ -77,7 +76,7 @@ class Probe:
 class ProbeCache:
     """Video probe cache keyed by absolute file path + size_bytes"""
     disk_fields = set(('folder last_seen anomaly width height codec bitrate fps'
-                      ' duration size_bytes color_spt customs pix_fmt streams').split())
+                      ' duration size_bytes color_spt pix_fmt streams').split())
 
     def __init__(self, cache_file_name=DEFAULT_CACHE_FILE_NAME, cache_dir_name=None,
                  chooser=None):
@@ -256,20 +255,6 @@ class ProbeCache:
                 size_bytes=size_bytes,
             )
 
-            # Detect unsafe subtitle streams
-            safe_subtitle_codecs = {'subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'}
-            subtitle_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
-
-            if subtitle_streams:
-                drop_indices = []
-                for idx, sub_stream in enumerate(subtitle_streams):
-                    codec = sub_stream.get('codec_name', '')
-                    if codec and codec not in safe_subtitle_codecs:
-                        drop_indices.append(idx)
-
-                if drop_indices:
-                    meta.customs = {'drop_subs': drop_indices}
-
             # Parse frame rate
             fps_str = video_stream.get('r_frame_rate') or video_stream.get('avg_frame_rate', '0/0')
             meta.fps = 0.0
@@ -383,8 +368,14 @@ class ProbeCache:
                         continue
 
                     # Value must be a mapping of size keys to probe dicts.
+                    # Drop keys from older schemas (such as the removed
+                    # write-only ``customs`` field) so upgrading does not throw
+                    # away an otherwise valid probe cache.
                     valid_sizes = {}
                     for size_key, probe_dict in value.items():
+                        if isinstance(probe_dict, dict):
+                            probe_dict = {k: v for k, v in probe_dict.items()
+                                          if k in self.disk_fields}
                         if size_key.isdigit() and self._is_valid_entry(probe_dict):
                             valid_sizes[size_key] = probe_dict
                     if not valid_sizes:

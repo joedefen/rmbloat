@@ -1738,7 +1738,7 @@ def main(args=None) -> int:
         parser.add_argument('-L', '--logs', action='store_true',
                     help='view the logs')
         parser.add_argument('-T', '--chooser-tests', action='store_true',
-                    help='run tests on ffmpeg choices w 30s cvt of 1st given video')
+                    help='run tests on ffmpeg choices w 120s cvt of 1st given video')
 
         # Build help message for files argument showing defaults if set
         files_help = 'Video files and recursively scanned folders w Video files'

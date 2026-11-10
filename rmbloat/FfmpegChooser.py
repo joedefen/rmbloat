@@ -638,14 +638,9 @@ class FfmpegChooser:
             preset: Encoding preset (default: 'medium')
             codec: Target codec (default: 'hevc')
             use_10bit: Use 10-bit encoding (default: True)
-            scale_opts: Scaling filter options (default: [])
             color_opts: Color space options (default: [])
-            map_opts: Stream mapping options (default: [])
             subtitle_codec: Subtitle codec (default: 'copy')
             thread_count: Thread limit, 0=auto (default: 0)
-            sample_mode: Extract sample clip (default: False)
-            sample_start_secs: Sample start time in seconds (default: None)
-            sample_duration_secs: Sample duration in seconds (default: None)
             use_nice_ionice: Use nice/ionice for low priority (default: True)
             pre_input_opts: Options before -i (default: [])
             post_input_opts: Options after -i (default: [])
@@ -675,19 +670,12 @@ class FfmpegChooser:
             use_10bit=True,
 
             # Filtering/processing
-            scale_opts=[],
             color_opts=[],
-            map_opts=[],
             external_subtitle=None,  # Path to external .srt file to merge
             subtitle_codec='copy',  # Subtitle codec: 'copy', 'srt', 'ass', etc.
 
             # Threading
             thread_count=0,  # 0 = auto
-
-            # Sampling
-            sample_mode=False,
-            sample_start_secs=None,
-            sample_duration_secs=None,
 
             # Priority
             use_nice_ionice=True,
@@ -719,26 +707,6 @@ class FfmpegChooser:
             raise ValueError("output_file is required but was not provided")
 
         return defaults
-
-    def _crf_to_qp(self, crf: int) -> int:
-        """
-        Map CRF (software encoding) to QP (hardware encoding).
-
-        CRF is used by x264/x265, QP is used by hardware encoders.
-        This provides a reasonable quality mapping between the two.
-        """
-        CRF_TO_QP = {
-            18: 20, 19: 21, 20: 22, 21: 23, 22: 24,
-            23: 25, 24: 26, 25: 27, 26: 28, 27: 29,
-            28: 30, 29: 31, 30: 32, 31: 33, 32: 34,
-            33: 35, 34: 36, 35: 37, 36: 38, 37: 39,
-            38: 40, 39: 41, 40: 42,
-        }
-
-        if crf in CRF_TO_QP:
-            return CRF_TO_QP[crf]
-        # Fallback for values outside table
-        return min(51, max(0, crf + 2))
 
     def _get_target_quality(self, base_crf: int, acceleration: bool = True,
                             height: Optional[int] = None) -> int:

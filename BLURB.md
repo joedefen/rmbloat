@@ -31,7 +31,7 @@ So I wrote `rmbloat`. I can fire this up for 10,000 files, park it in tmux, and 
 * And, although there are lots of options, it is very opinionated.
 
 
-Demo GIF: [rmbloat-demo](https://raw.githubusercontent.com/joedefen/rmbloat/main/image/rmbloat-2026-01-09-13-30.gif)
+Demo GIF: [rmbloat-demo](https://raw.githubusercontent.com/joedefen/rmbloat/main/images/rmbloat-2026-01-09-13-30.gif)
 
 
 For more info, I'll refer you to the docs, [rmbloat](https://github.com/joedefen/rmbloat).

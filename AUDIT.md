@@ -74,7 +74,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 9. **`Job` lacks `is_retry`/`is_software_fallback` defaults.** [`Job.__init__()`](rmbloat/Models.py:89) does not define them, but [`check_job_status()`](rmbloat/JobHandler.py:211) depends on them. It works only because `start_transcode_job()` injects attributes dynamically; any other `Job` construction will raise `AttributeError`.
 
-10. ✅ **Declared Python 3.8 support is false.** `requires-python = ">=3.8"` in [`pyproject.toml:13`](pyproject.toml:13), but built-in generic annotations such as `tuple[bool, str]` are evaluated at import time on 3.8 ([`ConvertUtils.py:183`](rmbloat/ConvertUtils.py:183), [`StructuredLogger.py:431`](rmbloat/StructuredLogger.py:431), [`SystemDiscovery.py:100`](rmbloat/SystemDiscovery.py:100), [`rmbloat.py:406`](rmbloat/rmbloat.py:406)). [`shutdown(cancel_futures=True)`](rmbloat/ProbeCache.py:578) also requires 3.9. **Resolved** — the floor is now `requires-python = ">=3.11"`, the `3.8`/`3.9`/`3.10` classifiers were replaced with `3.11`/`3.12`/`3.13`, `[tool.ruff] target-version = "py311"` was added, and the `sys.version_info >= (3, 10)` `slots` fallbacks in [`Models.py`](rmbloat/Models.py:16) and [`ProbeCache.py`](rmbloat/ProbeCache.py:21) were replaced with plain `@dataclass(slots=True)`.
+10. ✅ **Declared Python 3.8 support is false.** `requires-python = ">=3.8"` in [`pyproject.toml:13`](pyproject.toml:13), but built-in generic annotations such as `tuple[bool, str]` are evaluated at import time on 3.8 ([`ConvertUtils.py:183`](rmbloat/ConvertUtils.py:183), [`StructuredLogger.py:431`](rmbloat/StructuredLogger.py:431), [`rmbloat.py:406`](rmbloat/rmbloat.py:406)). [`shutdown(cancel_futures=True)`](rmbloat/ProbeCache.py:578) also requires 3.9. **Resolved** — the floor is now `requires-python = ">=3.11"`, the `3.8`/`3.9`/`3.10` classifiers were replaced with `3.11`/`3.12`/`3.13`, `[tool.ruff] target-version = "py311"` was added, and the `sys.version_info >= (3, 10)` `slots` fallbacks in [`Models.py`](rmbloat/Models.py:16) and [`ProbeCache.py`](rmbloat/ProbeCache.py:21) were replaced with plain `@dataclass(slots=True)`.
 
 11. ✅ **Docker acceleration path never detects 10-bit support and may lack GPU permissions.** `vaapi_supports_10bit` is only set in the system path ([`FfmpegChooser.py:136`](rmbloat/FfmpegChooser.py:136)), so docker-accelerated encodes force `nv12`/8-bit even for 10-bit sources ([`FfmpegChooser.py:729`](rmbloat/FfmpegChooser.py:729)). The acceleration test runs without `--user` ([`FfmpegChooser.py:315`](rmbloat/FfmpegChooser.py:315)), while real encodes use `--user uid:gid` without supplementary render/video groups ([`FfmpegChooser.py:634`](rmbloat/FfmpegChooser.py:634)); the test can pass while real encodes fail. **Resolved** — see the H9 entry under “Resolved findings”.
 
@@ -109,20 +109,20 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 # Low-severity, docs, and packaging
 
-- README/BLURB drift:
-  - `pipx rmbloat` typo at [`README.md:37`](README.md:37).
-  - `[-n]` is listed in usage at [`README.md:189`](README.md:189) but no such option exists.
-  - `--use-trash` is undocumented in the usage block.
-  - `-T` says “30s cvt” while [`main()`](rmbloat/rmbloat.py:1474) uses `duration=120`.
-  - “Conversions are atomic” and “auto mode stops cleanly” are contradicted by C7/C5.
-  - [`BLURB.md:34`](BLURB.md:34) links `image/...` while the repository uses `images/...`.
+- ✅ README/BLURB drift:
+  - `pipx rmbloat` was a typo for `pipx install rmbloat` at [`README.md:37`](README.md:37).
+  - The stale `[-n]` usage entry is gone; no such option exists.
+  - `--use-trash` and its `--no-use-trash` counterpart are documented in the usage block.
+  - `-T` and the README now say “120s cvt”, matching [`main()`](rmbloat/rmbloat.py:1818)'s `duration=120`.
+  - The atomicity claim now describes the transaction (verified install plus rollback), and the auto-mode bullet says the run stops when the time limit expires or the queue drains.
+  - [`BLURB.md:34`](BLURB.md:34) now links `images/...`.
 - [`StructuredLogger.MAX_LOG_SIZE`](rmbloat/StructuredLogger.py:141) has a comment saying “10 MB” but the value is 50 MB.
 - [`linter`](linter) references `../console_window`, which is not present in this checkout; it also passes `$1` unquoted and supports only one argument. `pylint --errors-only` currently reports missing third-party imports plus the duplicate method (H1).
-- Dead code/unused features:
-  - [`SystemDiscovery`](rmbloat/SystemDiscovery.py) is never imported; clipboard support is implemented directly via OSC 52 in [`HistoryScreen`](rmbloat/rmbloat.py:1259). Its detection path also can leave a `wl-copy` process running after timeout.
-  - `_crf_to_qp()`, `scale_opts`, `map_opts`, `sample_start_secs`, and `sample_duration_secs` are unused in [`FfmpegChooser.py`](rmbloat/FfmpegChooser.py:542).
-  - `Probe.customs` is written but never consumed by the encoder mapping.
-  - [`should_use_10bit()`](rmbloat/JobHandler.py:57) has several branches that all return `False`; only 10-bit sources return `True`.
+- ✅ Dead code/unused features:
+  - Removed the unused [`SystemDiscovery`](rmbloat/SystemDiscovery.py) module (and its `wl-copy` timeout leak); clipboard copy is implemented directly via OSC 52 in [`HistoryScreen`](rmbloat/rmbloat.py:1554).
+  - Removed unused `_crf_to_qp()`, `scale_opts`, `map_opts`, `sample_start_secs`, `sample_duration_secs`, and the write-only `sample_mode` namespace field from [`FfmpegChooser.py`](rmbloat/FfmpegChooser.py).
+  - Removed the write-only `Probe.customs` field and its subtitle-index computation from [`ProbeCache.py`](rmbloat/ProbeCache.py).
+  - Simplified [`should_use_10bit()`](rmbloat/JobHandler.py:45) to a single 10-bit-pixel-format test; the codec parameter is retained for call-site compatibility but no longer changes the result.
 - [`is_same_episode()`](rmbloat/VideoParser.py:194) tests `rhs.is_tv_episode` without calling it; the bound method is always truthy.
 - [`check_special()`](rmbloat/VideoParser.py:268) contains a duplicated `specialsdir_pat` branch; the specials regex uses `(:?` at [`VideoParser.py:98`](rmbloat/VideoParser.py:98), likely a typo for `(?:`.
 - [`run_regressions()`](rmbloat/VideoParser.py:429) prints failures but never raises or exits nonzero, so it cannot gate CI.
@@ -158,7 +158,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 8. ✅ Change the probe cache key to include the directory (or inode) (H3 done) and serialize cache mutations with the lock (M1 done).
 9. ✅ ~~Replace the hardcoded sample directory and fix the stdin fd handling~~ (H4/H5 done).
 10. ✅ Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8 done).
-11. ✅ ~~Set `requires-python` to `>=3.9` or add postponed annotations~~ (done: floor raised to `>=3.11`); L1 docs/packaging drift is still pending.
+11. ✅ ~~Set `requires-python` to `>=3.9` or add postponed annotations~~ (done: floor raised to `>=3.11`); the L1 docs drift is resolved (see “Resolved findings”).
 12. ✅ Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, swap failure/rollback, and process exit status (H10 done); CI is still pending.
 
 ## Verification notes
@@ -168,6 +168,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 - `pylint --errors-only rmbloat/*.py` reports only import errors for dependencies not installed here (e.g. `send2trash`); the `E0102` duplicate-method error is gone (H1).
 - Reproduced during the original audit: `-L` `IndexError` (C1), `--chooser-tests` `FileNotFoundError`, `IniManager.write()` ignoring `vals`, `ProbeCache` basename+size collision, `None` probe for audio-only `.mp4`, `TEMP./ORIG./SAMPLE.` inclusion in scans, `StructuredLogger.put(data=...)` `TypeError`, log-trim reordering, and `Vid.descr_str()` `TypeError`.
 - `python3 -m unittest tests.test_main_exit_status` passes (3 tests). Running the `__main__` entry point with a failing startup now terminates with shell status 1 instead of 0 (H10).
+- After the L1/L2 cleanup, `python3 -m py_compile rmbloat/*.py` passes and `python3 -m unittest discover -s tests -t .` runs 124 tests; the only 14 errors are the pre-existing `console_window.appearance` stub import failures.
 
 ---
 
@@ -236,3 +237,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 - ✅ **M11. CLI boolean flags toggled saved defaults instead of forcing a value** — Resolved in [`main()`](rmbloat/rmbloat.py:1664). `-F/--full-speed`, `-B/--keep-backup`, `-M/--merge-subtitles`, and `--use-trash` selected `store_false` when the saved default was true and `store_true` when it was false, so passing a flag inverted the setting. Each positive flag is now always `store_true` with `default=vals.<attr>`, and the new long-only `--no-full-speed`, `--no-keep-backup`, `--no-merge-subtitles`, and `--no-use-trash` options are `store_false` with `default=argparse.SUPPRESS`; both forms share the same dest, so the last one on the command line wins and absent flags keep the saved value. `--save-defaults` continues to work because each dest matches its `vals` attribute, and the README usage/options block documents the new flags and explicit semantics. Regression coverage lives in [`tests/test_exit_cleanup_and_cli_flags.py`](tests/test_exit_cleanup_and_cli_flags.py): positive flags force True with both saved-true and saved-false defaults, negative flags override saved-true defaults, no flags preserve the saved values, and the last flag wins.
 
 - ✅ **M12. `start_transcode_job()` changed the process-wide working directory** — Resolved in [`start_transcode_job()`](rmbloat/JobHandler.py:374). The method previously called `os.chdir(os.path.dirname(vid.filepath))` and never restored the original CWD. It only worked because every later consumer (`make_namespace()`, the ffmpeg command, `_execute_file_swap()`, and the cleanup path) happened to use matching relative names; any concurrent code, signal handler, or TUI operation that resolved a relative path could observe the video directory instead of the launch directory. The method now resolves the source to `video_path`, keeps `video_dir` local, and builds absolute `TEMP.*`/`SAMPLE.*` and `ORIG.*` paths without touching process state. [`_execute_file_swap()`](rmbloat/JobHandler.py:633) likewise derives `original_path`, `video_dir`, and the final destination from `vid.filepath`/`vid.standard_name`, returns a bare filename in `vid.basename1`, and calls [`FileOps.bulk_rename()`](rmbloat/FileOps.py:158) with absolute paths. `bulk_rename()` now roots its walk at the source video's directory instead of `'.'`, so companion renames also work without a global `chdir()`. Regression coverage lives in [`tests/test_job_cwd_isolation.py`](tests/test_job_cwd_isolation.py): job startup leaves `os.getcwd()` unchanged and passes absolute input/output/temp/backup paths to the chooser and thread, and a swap plus companion rename executed from an unrelated CWD updates only the source directory while leaving the unrelated directory empty and current.
+
+- ✅ **L1. README/BLURB documentation drift** — Resolved in [`README.md`](README.md) and [`BLURB.md`](BLURB.md). The install command now reads `pipx install rmbloat`; both the `-T/--chooser-tests` help text and the README usage say `120s cvt` to match [`main()`](rmbloat/rmbloat.py:1818)'s `duration=120`; the `--use-trash`/`--no-use-trash` options are documented in the usage block (the stale `[-n]` entry is not present); the safety section now describes the transactional swap (verify, no-clobber install, restore on failure) instead of claiming “atomic”; the auto-mode bullet says the run stops when the time limit expires or the queue drains; and the BLURB demo link uses the repository's `images/` directory.
+
+- ✅ **L2. Dead code and unused features** — Resolved. Deleted the unimported [`SystemDiscovery`](rmbloat/SystemDiscovery.py) module, whose clipboard probing could also leave a `wl-copy` child running after its timeout; clipboard copy remains implemented in [`HistoryScreen.copy_log_ACTION()`](rmbloat/rmbloat.py:1554) via OSC 52. Removed the unused `_crf_to_qp()` helper and the unused `scale_opts`, `map_opts`, `sample_start_secs`, `sample_duration_secs`, and write-only `sample_mode` fields from [`make_namespace()`](rmbloat/FfmpegChooser.py:621); sample seeking continues to use `pre_input_opts`/`post_input_opts`. Removed the write-only `Probe.customs` field and its subtitle-index calculation from [`ProbeCache`](rmbloat/ProbeCache.py:54); cache loading now drops obsolete keys so an upgrade does not discard valid probes. [`should_use_10bit()`](rmbloat/JobHandler.py:45) now has one condition (10-bit pixel formats) instead of several branches that all returned `False`, while keeping the `codec` parameter for call-site compatibility. Regression coverage lives in [`tests/test_probe_cache_schema.py`](tests/test_probe_cache_schema.py) (a legacy `customs` key no longer invalidates a valid entry) and [`tests/test_should_use_10bit.py`](tests/test_should_use_10bit.py) (10-bit sources are preserved; 8-bit and unknown sources stay 8-bit).

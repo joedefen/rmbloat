@@ -42,49 +42,16 @@ class JobHandler:
     sample_seconds = 30
 
     @staticmethod
-    def should_use_10bit(pix_fmt, codec):
+    def should_use_10bit(pix_fmt, _codec=None):
+        """Return True only when the source is already 10-bit.
+
+        8-bit and exotic pixel formats are intentionally encoded as 8-bit
+        because VAAPI does not reliably convert 8-bit input to 10-bit output.
+        The ``_codec`` argument is retained for call-site compatibility; the
+        codec name no longer changes the decision.
         """
-        Determine whether to use 10-bit encoding based on input pixel format and codec.
-
-        Args:
-            pix_fmt: Input pixel format (e.g., 'yuv420p', 'yuv420p10le', 'p010le')
-            codec: Input codec name
-
-        Returns:
-            bool: True if 10-bit encoding should be used
-
-        Strategy:
-            - Skip 10-bit for problematic codecs (mpeg4) - VAAPI compatibility issues
-            - If source is already 10-bit → use 10-bit (preserve bit depth)
-            - For standard 8-bit (yuv420p) → use 8-bit (VAAPI has issues with 8→10 bit conversion)
-            - For exotic/problematic formats → use 8-bit for safety
-        """
-        # If source is already 10-bit, definitely use 10-bit output
-        # (Even for problematic codecs - preserve the bit depth)
-        if '10le' in pix_fmt or '10be' in pix_fmt or 'p010' in pix_fmt or 'p210' in pix_fmt:
-            return True
-
-        # Skip 10-bit for codecs known to have VAAPI compatibility issues with 8-bit sources
-        # mpeg4 often has corrupt streams, dynamic resolution changes, and poor VAAPI support
-        problematic_codecs = {'mpeg4'}
-        if codec in problematic_codecs:
-            return False
-
-        # Standard 8-bit formats - keep as 8-bit to avoid VAAPI conversion issues
-        safe_8bit_formats = {
-            'yuv420p',    # Standard 8-bit 4:2:0
-            'yuv422p',    # Standard 8-bit 4:2:2
-            'yuv444p',    # Standard 8-bit 4:4:4
-            'nv12',       # NVIDIA/Intel preferred format
-            'nv21',       # Alternative NV format
-        }
-
-        if pix_fmt in safe_8bit_formats:
-            return False  # Keep 8-bit sources as 8-bit (VAAPI has issues with 8->10 bit conversion)
-
-        # For unknown or exotic formats, stay safe with 8-bit
-        # This includes: yuvj420p (JPEG color range), bgr24, rgb24, etc.
-        return False
+        return any(tag in (pix_fmt or '')
+                   for tag in ('10le', '10be', 'p010', 'p210'))
 
     def __init__(self, opts, chooser, probe_cache, auto_mode_enabled=False):
         """
@@ -451,7 +418,6 @@ class JobHandler:
         params.thread_count = self.opts.thread_cnt
 
         if self.opts.sample:
-            params.sample_mode = True
             # Seek 20% into the movie (but at least two minutes in) so the
             # clip is representative. probe.duration is the *full* length;
             # job.duration_secs is only the sample length while sampling.

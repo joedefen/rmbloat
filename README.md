@@ -34,7 +34,7 @@ Your video library is likely filled with bloat: older H.264 (AVC), MPEG-4, or hi
 Since it is designed for mass conversions on a media server, it often makes sense to start `rmbloat` in a tmux or screen session that out-lives a log-in session (e.g., on a headless server).
 
 ## Installation and System Preparation
-To install `rmbloat`, use `pipx rmbloat`. If explanation is needed, see [Install and Execute Python Applications Using pipx](https://realpython.com/python-pipx/).
+To install `rmbloat`, use `pipx install rmbloat`. If explanation is needed, see [Install and Execute Python Applications Using pipx](https://realpython.com/python-pipx/).
 
 So installing `rmbloat` is simple. And if your system has `ffmpeg` installed with HEVC (H.265) encoding support, you are ready to go, however with agonizingly slow software encoding. The bigger your video collection, the less acceptable software encoding will be.
 
@@ -155,7 +155,7 @@ After setup, test what's working:
 # for conversion to hevc)
 rmbloat --chooser-tests
 
-# Full test with a video file (runs 30s encoding tests)
+# Full test with a video file (runs 120s encoding tests)
 rmbloat --chooser-tests /path/to/sample/video.mp4
 ```
 
@@ -258,7 +258,7 @@ options:
                         auto-select [X] files and auto-start conversions
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
   -L, --logs            view the logs
-  -T, --chooser-tests   run tests on ffmpeg choices w 30s cvt of 1st given
+  -T, --chooser-tests   run tests on ffmpeg choices w 120s cvt of 1st given
                         video
   ```
   You can (and should) customize the defaults by setting the desired options and adding the `--save-defaults` option to write the current choices to its .ini file.
@@ -416,7 +416,7 @@ rmbloatd start -- --auto-hr 48
 The auto mode will:
 - Automatically mark files for conversion based on your criteria
 - Start conversions without manual intervention
-- Stop cleanly after the specified time limit
+- Stop cleanly when the time limit expires or the queue drains
 - Use saved defaults for paths if configured with `--save-defaults`
 
 ### Scheduled Runs with Cron
@@ -698,7 +698,7 @@ By default, `rmbloat` **deletes** the original file after successful conversion 
 - **Test mode**: Use `--sample` to create test clips without touching originals
 
 **Safety features:**
-- Conversions are atomic - original is only deleted after successful conversion
+- Conversions are transactional - the original is only replaced after a verified successful conversion, and is restored if installing the replacement fails
 - If conversion fails, original file is untouched
 - Companion files (.srt, thumbnail folders) are automatically renamed to match
 
