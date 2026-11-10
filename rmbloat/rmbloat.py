@@ -107,6 +107,9 @@ class Converter:
         # Auto mode tracking (separate from JobHandler for overall session tracking)
         self.auto_mode_enabled = bool(opts.auto_hr is not None)
         self.auto_mode_hrs_limit = opts.auto_hr if self.auto_mode_enabled else None
+        # Fallback clock anchor for the --auto-hr deadline; the JobHandler's own
+        # auto_mode_start_time wins once one exists (see _auto_mode_elapsed_hrs)
+        self.auto_mode_start_mono = time.monotonic() if self.auto_mode_enabled else None
 
         # Job handler (created when entering convert screen, destroyed when leaving)
         self.job_handler = None
@@ -265,6 +268,34 @@ class Converter:
         lg.put('OK' if clean_label.startswith('OK') else 'ERR',
                f"{title} ", json.dumps(dumped, indent=4))
 
+    def _auto_mode_elapsed_hrs(self):
+        """Hours elapsed since auto mode began converting."""
+        start = None
+        if self.job_handler is not None:
+            start = self.job_handler.auto_mode_start_time
+        if start is None:
+            start = self.auto_mode_start_mono
+        if start is None:
+            return 0.0
+        return (time.monotonic() - start) / 3600
+
+    def _auto_mode_time_exceeded(self):
+        """True once the --auto-hr time budget has been consumed."""
+        if not self.auto_mode_enabled or self.auto_mode_hrs_limit is None:
+            return False
+        return self._auto_mode_elapsed_hrs() >= self.auto_mode_hrs_limit
+
+    def _auto_mode_failure_limit_reached(self):
+        """True when the last 10 conversions all failed."""
+        return bool(self.job_handler
+                    and self.job_handler.consecutive_failures >= 10)
+
+    def _exit_auto_mode(self, reason):
+        """Stop a --auto-hr run cleanly: log the reason, report vitals, exit."""
+        lg.info(f"Auto mode stopping: {reason}")
+        _, stats, _ = self.make_lines()
+        self.print_auto_mode_vitals(stats, reason=reason)
+
     def _manage_queue_and_auto_mode(self):
         """Handles starting the next [X] and checking auto-mode exit"""
         while True:
@@ -277,24 +308,35 @@ class Converter:
                     self.visible_vids = [v for v in self.visible_vids if v != next_vid]
                     continue
 
+                # Auto mode: never start new work once the time budget is spent
+                # or the failure ladder tripped.  A job already running is
+                # allowed to finish; this check runs again before the next one.
+                if self.auto_mode_enabled:
+                    if self._auto_mode_time_exceeded():
+                        self._exit_auto_mode(
+                            f'time limit of {self.auto_mode_hrs_limit} hours reached')
+                    if self._auto_mode_failure_limit_reached():
+                        self._exit_auto_mode('10 consecutive conversion failures')
+
                 # Start the engine
                 self.job = self.job_handler.start_transcode_job(next_vid)
                 next_vid.doit = "IP "
                 return
 
             # 2. Queue is Empty - Handle Auto Mode Exit
-            # We only pop the screen if we are currently LOOKING at the Convert screen.
-            # If we are on History/Help, we just stop the engine but stay on the screen.
-            if not self.auto_mode_enabled:
-                self.vids.sort(key=lambda v: (v.all_ok, v.bloat), reverse=True)
+            # An unattended run has nothing left to do, so terminate instead of
+            # idling on the Convert screen until the process is killed.
+            if self.auto_mode_enabled:
+                self._exit_auto_mode('conversion queue drained')
 
-                if self.stack.curr.num == CONVERT_ST:
-                    self.job_handler = None
-                    self.stack.pop() # Go back to Select screen
-                else:
-                    # We are on History/Help; don't pop, just let the handler stay
-                    # or set it to None if you want to freeze counters.
-                    pass
+            # Interactive mode: We only pop the screen if we are currently
+            # LOOKING at the Convert screen.  If we are on History/Help, we just
+            # stop the engine but stay on the screen.
+            self.vids.sort(key=lambda v: (v.all_ok, v.bloat), reverse=True)
+
+            if self.stack.curr.num == CONVERT_ST:
+                self.job_handler = None
+                self.stack.pop() # Go back to Select screen
 
             return
 
@@ -508,9 +550,13 @@ class Converter:
 
         return None
 
-    def print_auto_mode_vitals(self, stats):
+    def print_auto_mode_vitals(self, stats, reason=None):
         """Print vitals report and exit for auto mode."""
-        runtime_hrs = (time.monotonic() - self.job_handler.auto_mode_start_time) / 3600
+        handler = self.job_handler
+        runtime_hrs = self._auto_mode_elapsed_hrs()
+        ok_count = handler.ok_count if handler else 0
+        error_count = handler.error_count if handler else 0
+        consecutive = handler.consecutive_failures if handler else 0
 
         # Calculate space bloated from remaining TODO items
         space_bloated_gb = 0.0
@@ -522,11 +568,13 @@ class Converter:
         report = "\n" + "=" * 70 + "\n"
         report += "AUTO MODE VITALS REPORT\n"
         report += "=" * 70 + "\n"
+        if reason:
+            report += f"Stop reason:          {reason}\n"
         report += f"Runtime:              {runtime_hrs:.2f} hours\n"
-        report += f"OK conversions:       {self.job_handler.ok_count}\n"
-        report += f"Error conversions:    {self.job_handler.error_count}"
+        report += f"OK conversions:       {ok_count}\n"
+        report += f"Error conversions:    {error_count}"
 
-        if self.job_handler.consecutive_failures >= 10:
+        if consecutive >= 10:
             report += " (early termination: 10 consecutive failures)\n"
         else:
             report += "\n"
@@ -545,7 +593,7 @@ class Converter:
         lg.lg(report)
 
         # Exit with appropriate code
-        exit_code = 1 if self.job_handler.consecutive_failures >= 10 else 0
+        exit_code = 1 if consecutive >= 10 else 0
         sys.exit(exit_code)
 
     def do_window_mode(self):
@@ -680,6 +728,9 @@ class Converter:
                         auto_mode_enabled=self.auto_mode_enabled
                     )
                     self.stack.push(CONVERT_ST, win.pick_pos)
+                else:
+                    # Nothing to convert: an unattended run must exit, not idle
+                    self._exit_auto_mode('no videos selected for conversion')
 
             # Process jobs
             self.advance_jobs()
