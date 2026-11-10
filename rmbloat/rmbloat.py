@@ -23,7 +23,9 @@ import textwrap
 from dataclasses import asdict
 from types import SimpleNamespace
 from console_window import (ConsoleWindow, OptionSpinner, Screen, ScreenStack,
-                            ConsoleWindowOpts, IncrementalSearchBar, Context, Theme)
+                            ConsoleWindowOpts, IncrementalSearchBar, Context,
+                            Theme, appearance)
+from console_window import cli as display_cli
 from .ProbeCache import ProbeCache
 from .VideoParser import Mangler
 from .IniManager import IniManager
@@ -45,6 +47,36 @@ HISTORY_ST = 2
 HELP_ST = 3
 THEME_ST = 4
 SCREEN_NAMES = ('SELECT', 'CONVERT', 'HISTORY', 'HELP', 'THEME')
+
+# The theme picker offers the library palettes plus rmbloat's own "mono"
+# pseudo-theme.  ``mono`` is not a palette: it turns semantic color off for the
+# process (exactly like ``--no-color``) and leaves the installed palette alone.
+# Keeping it last makes ``t`` step from the final palette into mono and wrap
+# back to the first palette.
+MONO_THEME = 'mono'
+THEME_CHOICES = (*Theme.list_all(), MONO_THEME)
+
+
+def settle_appearance(cli_theme=None, no_color=False, saved_theme='',
+                      saved_colors=True):
+    """Turn the color switches and the remembered choice into process state.
+
+    ``resolve_appearance()`` returns the two halves of the decision -- which
+    palette and whether to use it -- from ``--no-color``, ``--theme``, the
+    ``NO_COLOR`` convention and the remembered choice.  This helper applies
+    that decision to the process-wide switch and records the palette the first
+    window should install.  Returns the ``(theme, colors)`` it applied.
+    """
+    theme, colors = appearance.resolve_appearance(
+        cli_theme=cli_theme,
+        no_color=no_color,
+        saved_theme=saved_theme,
+        saved_colors=saved_colors,
+    )
+    appearance.set_colors_enabled(colors)
+    if theme:
+        Theme.set_active(theme)
+    return theme, colors
 
 # File operation functions moved to FileOps.py
 sanitize_file_paths = FileOps.sanitize_file_paths
@@ -126,6 +158,10 @@ class Converter:
         self.stack = None
         self.need_freeze_draw = False
         self.persistent_state = PersistentState()
+        # The preference to write back.  It stays on the remembered palette
+        # when a per-run switch (--no-color / --theme) changes only the display,
+        # and follows the picker when the user chooses a palette or mono.
+        self.remembered_theme = 'default'
 
     def build_options_suffix(self):
         """Build the options suffix string for display."""
@@ -141,6 +177,25 @@ class Converter:
         if self.auto_mode_enabled:
             parts.append(f'Auto={self.opts.auto_hr}hr')
         return ' -- ' + ' '.join(parts)
+
+    def apply_theme_choice(self, choice):
+        """Make a theme-picker choice live.
+
+        ``mono`` is a color mode, not a palette: it flips the process-wide
+        switch and leaves the installed theme where it was (the same way
+        ``--no-color`` keeps ``--theme``).  Choosing a real palette is a request
+        for color, so it lifts the switch again and installs the palette.  This
+        is the one place the choice becomes window state, whichever screen the
+        key was pressed on.
+        """
+        self.opts.theme = choice
+        self.remembered_theme = choice
+        if choice == MONO_THEME:
+            appearance.set_colors_enabled(False)
+            return
+        appearance.set_colors_enabled(True)
+        if self.win:
+            self.win.set_theme(choice)
 
     def make_lines(self, doit_skips=None):
         """Generate display lines and stats for video list"""
@@ -632,6 +687,28 @@ class Converter:
 
     def do_window_mode(self):
         """Main UI loop using Screen-based architecture"""
+        # Capture the explicit switches before the remembered choice is
+        # restored: resolve_appearance() gives --no-color and --theme
+        # precedence over the saved theme.
+        cli_theme = getattr(self.opts, 'theme', None)
+        cli_no_color = bool(getattr(self.opts, 'no_color', False))
+        self.persistent_state.restore_updated_opts(self.opts)
+        saved_theme = getattr(self.opts, 'theme', None) or 'default'
+        saved_mono = saved_theme == MONO_THEME
+        self.remembered_theme = (MONO_THEME if saved_mono
+                                 else Theme.resolve(saved_theme))
+        theme, colors = settle_appearance(
+            cli_theme=cli_theme,
+            no_color=cli_no_color,
+            saved_theme='' if saved_mono else saved_theme,
+            saved_colors=not saved_mono,
+        )
+        # The picker names the choice in effect, so color off means mono even
+        # when a palette stays installed underneath (the SampleApp convention).
+        self.opts.theme = (MONO_THEME if not colors
+                           else (theme or Theme.resolve(
+                               None if saved_mono else saved_theme)))
+
         # Create ConsoleWindow
         win_opts = ConsoleWindowOpts(
             head_line=True,
@@ -639,10 +716,10 @@ class Converter:
             body_rows=max(10+len(self.vids), 10000),
             min_cols_rows=(60,10),
             ctrl_c_terminates=False,
+            theme=(theme or None),
         )
         self.win = win = ConsoleWindow(win_opts)
         # Initialize screens
-        ThemeScreen = Theme.create_picker_screen(RmbloatScreen)
         self.screens = {
             SELECT_ST: SelectScreen(self),
             CONVERT_ST: ConvertScreen(self),
@@ -664,7 +741,10 @@ class Converter:
         spin.add_key('theme_screen', 't - Theme Picker', genre='action',
                      scope=[SELECT_ST, CONVERT_ST])
 
-        spin.add_key('spin_theme', 't - next theme', genre='action', scope=THEME_ST)
+        # On the picker (and HELP) the same key cycles every choice, ending at
+        # mono.  A cycle option keeps the spinner's help list truthful.
+        spin.add_key('theme', 't - next theme', vals=list(THEME_CHOICES),
+                     scope=[THEME_ST, HELP_ST])
 
         spin.add_key('expand', 'e - expand/collapse log entry', genre='action',
                      scope=HISTORY_ST)
@@ -702,10 +782,6 @@ class Converter:
         # self.win.set_handled_keys(spin.keys | other)
 
         self.spins = spins = spin.default_obj
-        self.spins.theme = 'default'  # even if not in the themes, set it for compatibility
-        self.persistent_state.restore_updated_opts(self.spins)
-        # Initialize theme
-        Theme.set(self.spins.theme)
         curses.intrflush(False)
 
 
@@ -739,9 +815,15 @@ class Converter:
                         key = None
 
             was_freeze = self.spins.freeze
+            previous_theme = self.spins.theme
             # Process spinner keys
             if key in spin.keys:
                 spin.do_key(key, win)
+            # A theme cycle commits by assigning the option, so the appearance
+            # is applied from the committed value here (the seam the library's
+            # SampleApp uses for both the picker and HELP).
+            if self.spins.theme != previous_theme:
+                self.apply_theme_choice(self.spins.theme)
 
             if self.spins.freeze and not was_freeze:
                 self.need_freeze_draw = True
@@ -768,9 +850,10 @@ class Converter:
 
             # Process jobs
             self.advance_jobs()
-            # Save any persistent state changes
-            self.spins.theme = Theme.get_current()
-            self.persistent_state.save_updated_opts(self.spins)
+            # Persist only the remembered choice, not a per-run override such
+            # as --no-color (which displays mono but must not become the saved
+            # preference).  The picker updates it through apply_theme_choice().
+            self.persistent_state.set('theme', self.remembered_theme)
             self.persistent_state.sync()
 
             # Clear screen for next render
@@ -858,19 +941,21 @@ class RmbloatScreen(Screen):
             self.app.job = None
 
     def get_color_pair(self, line):
-        """  TBD  """
+        """Attribute for one status row, honoring the no-color switch."""
         wds = line.lstrip().split(maxsplit=1)
+        if not wds:
+            return None
         word0 = wds[0]
         if word0.startswith('OK') or word0 == 'DUN':
-            return curses.color_pair(Theme.OLD_SUCCESS)
+            return appearance.semantic_attr(Theme.OLD_SUCCESS)
         if word0 == 'IP':
-            return curses.color_pair(Theme.HOTSWAP)
+            return appearance.semantic_attr(Theme.HOTSWAP)
         if word0.startswith('Er') or word0 == 'ERR':
-            return curses.color_pair(Theme.ERROR)
+            return appearance.semantic_attr(Theme.ERROR)
         if word0 == '[X]':
-            return curses.color_pair(Theme.INFO)
+            return appearance.semantic_attr(Theme.INFO)
         if word0 == '---':
-            return curses.color_pair(Theme.PROGRESS)
+            return appearance.semantic_attr(Theme.PROGRESS)
         return None
 
 
@@ -922,7 +1007,8 @@ class SelectScreen(RmbloatScreen):
             search_display = self.search_bar.get_display_string(prefix=' /', suffix='')
             head += search_display
             # Use plain header (no fancy parsing) with HOTSWAP color for entire line
-            win.add_header(head, attr=curses.color_pair(Theme.HOTSWAP) | curses.A_BOLD)
+            win.add_header(head,
+                           attr=appearance.semantic_attr(Theme.HOTSWAP) | curses.A_BOLD)
         else:
             # Add static search pattern if present
             if app.search_re:
@@ -1112,6 +1198,22 @@ class HelpScreen(RmbloatScreen):
                 win.add_body(f'  ● {key}: {clis[key]}')
 
 
+class ThemeScreen(Theme.create_picker_screen(RmbloatScreen, cycle_key='t')):
+    """Theme picker that also offers rmbloat's ``mono`` pseudo-theme.
+
+    The generated picker draws the library palettes and paints its swatches
+    through the appearance layer.  rmbloat adds ``mono`` to the cycle on the
+    picker itself (the ``theme`` spinner option), so selecting it turns color
+    off exactly like ``--no-color`` while the header names that choice instead
+    of the palette still installed underneath it.
+    """
+
+    def theme_label(self, theme_name):
+        if not appearance.colors_enabled():
+            return MONO_THEME
+        return super().theme_label(theme_name)
+
+
 class HistoryScreen(RmbloatScreen):
     """History screen showing log entries with expand/collapse functionality"""
     prompt_timeout = 60.0  # Slower refresh for reading/copying logs
@@ -1275,9 +1377,9 @@ class HistoryScreen(RmbloatScreen):
 
             # Choose color based on log level
             if level == 'ERR':
-                level_attr = curses.color_pair(Theme.ERROR) | curses.A_BOLD
+                level_attr = appearance.semantic_attr(Theme.ERROR) | curses.A_BOLD
             elif level == 'WARN':
-                level_attr = curses.color_pair(Theme.WARNING) | curses.A_BOLD
+                level_attr = appearance.semantic_attr(Theme.WARNING) | curses.A_BOLD
             else:
                 level_attr = curses.A_BOLD
 
@@ -1439,6 +1541,9 @@ def main(args=None):
         vals = ini.vals
         parser = argparse.ArgumentParser(
             description="CLI/curses bulk Video converter for media servers")
+        # Standard display switches: --ascii/--glyphs, --theme and --no-color.
+        # apply_display_arguments() below acts on them before any window exists.
+        display_cli.add_display_arguments(parser, prog='rmbloat')
         # config options
         parser.add_argument('-a', '--allowed-codecs',
                     default=vals.allowed_codecs,
@@ -1506,6 +1611,11 @@ def main(args=None):
             files_help += f' [dflt: {", ".join(vals.files)}]'
         parser.add_argument('files', nargs='*', help=files_help)
         opts = parser.parse_args(args)
+        # Decide the glyph mode, seed an explicit --theme and honor an explicit
+        # --no-color before anything is drawn.  The remembered theme/color
+        # decision is settled later in do_window_mode(), where the saved state
+        # is available and can be combined with these switches.
+        display_cli.apply_display_arguments(opts, prog='rmbloat')
             # Fake as option ... if this needs tuning (which I doubt)
             # then make it an actual option.  It is the max time allowed
             # between progress updates when converting a video

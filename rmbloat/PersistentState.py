@@ -28,6 +28,12 @@ class PersistentState:
         self.dirty = False
         self.load()
 
+    def set(self, key, value):
+        """Set one state value, marking the file dirty when it changed."""
+        if self.state.get(key) != value:
+            self.state[key] = value
+            self.dirty = True
+
     def save_updated_opts(self, opts):
         """Save updated option variables from opts to state"""
         for key in self.state:
