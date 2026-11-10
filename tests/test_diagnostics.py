@@ -9,8 +9,7 @@ Each class pins one defect:
   go to stderr, like the batch summary.
 * ``TranscodeThread`` hid the real exception text behind a literal ``str(...)``
   wrapper, and dropped a final stderr line that arrived without a newline.
-* Dead attributes, a no-op branch, and an unused helper named by the audit
-  must not reappear.
+* Dead attributes, a no-op branch, and an unused helper must not reappear.
 """
 
 import contextlib

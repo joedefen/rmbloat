@@ -78,7 +78,7 @@ class NegativeProbeCacheTests(unittest.TestCase):
         return result, invocations
 
     def test_repeated_get_probes_an_audio_only_file_once(self):
-        """The audit's case: two `get()` calls, one ffprobe invocation."""
+        """Two `get()` calls over an audio-only file, one ffprobe invocation."""
         song = self.write('song.mp4')
         first, first_calls = self.run_ffprobe(
             AUDIO_ONLY, lambda: self.cache.get(song))

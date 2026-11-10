@@ -1,6 +1,6 @@
 """Regression tests: documentation must describe what the code actually does.
 
-Two drifts were found in the baseline audit:
+Two drifts must not come back:
 
 * ``IniManager.default_config_dir()`` called itself the single source of truth
   for the probe cache and its lock file, although both live in
