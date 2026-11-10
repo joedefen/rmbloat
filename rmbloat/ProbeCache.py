@@ -19,13 +19,11 @@ from typing import Optional, Dict, Any, List
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 
-_dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
-
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60
 
 
-@dataclass(**_dataclass_kwargs)
+@dataclass(slots=True)
 class Probe:
     """Video metadata probe results"""
     # Fields stored on disk

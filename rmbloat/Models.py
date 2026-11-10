@@ -3,7 +3,6 @@
 Data models for rmbloat video conversion
 """
 import os
-import sys
 import time
 import math
 from dataclasses import dataclass, field
@@ -14,10 +13,7 @@ from .TranscodeThread import TranscodeThread
 # pylint: disable=import-outside-toplevel,too-many-instance-attributes
 # pylint: disable=invalid-name,too-many-positional-arguments,too-many-arguments
 
-# Dataclass configuration for Python 3.10+ slots support
-_dataclass_kwargs = {'slots': True} if sys.version_info >= (3, 10) else {}
-
-@dataclass(**_dataclass_kwargs)
+@dataclass(slots=True)
 class PathProbePair:
     """ Pairs a video file path with its probe metadata """
     video_file: str
@@ -33,7 +29,7 @@ class FfmpegRun:
     return_code: Optional[int] = None
     texts: List[str] = field(default_factory=list)
 
-@dataclass(**_dataclass_kwargs)
+@dataclass(slots=True)
 class Vid:
     """ Our main object for the list of video entries """
     # Fields set from init parameters (via post_init)

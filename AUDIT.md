@@ -108,7 +108,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 9. **`Job` lacks `is_retry`/`is_software_fallback` defaults.** [`Job.__init__()`](rmbloat/Models.py:89) does not define them, but [`check_job_status()`](rmbloat/JobHandler.py:211) depends on them. It works only because `start_transcode_job()` injects attributes dynamically; any other `Job` construction will raise `AttributeError`.
 
-10. **Declared Python 3.8 support is false.** `requires-python = ">=3.8"` in [`pyproject.toml:13`](pyproject.toml:13), but built-in generic annotations such as `tuple[bool, str]` are evaluated at import time on 3.8 ([`ConvertUtils.py:183`](rmbloat/ConvertUtils.py:183), [`StructuredLogger.py:431`](rmbloat/StructuredLogger.py:431), [`SystemDiscovery.py:100`](rmbloat/SystemDiscovery.py:100), [`rmbloat.py:406`](rmbloat/rmbloat.py:406)). [`shutdown(cancel_futures=True)`](rmbloat/ProbeCache.py:578) also requires 3.9. Set the minimum to 3.9 (or add `from __future__ import annotations` and avoid 3.9-only APIs).
+10. **Declared Python 3.8 support is false.** `requires-python = ">=3.8"` in [`pyproject.toml:13`](pyproject.toml:13), but built-in generic annotations such as `tuple[bool, str]` are evaluated at import time on 3.8 ([`ConvertUtils.py:183`](rmbloat/ConvertUtils.py:183), [`StructuredLogger.py:431`](rmbloat/StructuredLogger.py:431), [`SystemDiscovery.py:100`](rmbloat/SystemDiscovery.py:100), [`rmbloat.py:406`](rmbloat/rmbloat.py:406)). [`shutdown(cancel_futures=True)`](rmbloat/ProbeCache.py:578) also requires 3.9. **Resolved** — the floor is now `requires-python = ">=3.11"`, the `3.8`/`3.9`/`3.10` classifiers were replaced with `3.11`/`3.12`/`3.13`, `[tool.ruff] target-version = "py311"` was added, and the `sys.version_info >= (3, 10)` `slots` fallbacks in [`Models.py`](rmbloat/Models.py:16) and [`ProbeCache.py`](rmbloat/ProbeCache.py:21) were replaced with plain `@dataclass(slots=True)`.
 
 11. **Docker acceleration path never detects 10-bit support and may lack GPU permissions.** `vaapi_supports_10bit` is only set in the system path ([`FfmpegChooser.py:136`](rmbloat/FfmpegChooser.py:136)), so docker-accelerated encodes force `nv12`/8-bit even for 10-bit sources ([`FfmpegChooser.py:729`](rmbloat/FfmpegChooser.py:729)). The acceleration test runs without `--user` ([`FfmpegChooser.py:315`](rmbloat/FfmpegChooser.py:315)), while real encodes use `--user uid:gid` without supplementary render/video groups ([`FfmpegChooser.py:634`](rmbloat/FfmpegChooser.py:634)); the test can pass while real encodes fail.
 
@@ -192,7 +192,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 8. Change the probe cache key to include the directory (or inode) and lock all cache mutations (H3/M1).
 9. ~~Replace the hardcoded sample directory and fix the stdin fd handling~~ (H4/H5 done).
 10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8); H6/H7 done.
-11. Set `requires-python` to `>=3.9` or add postponed annotations; fix packaging/docs (H10/L1).
+11. ~~Set `requires-python` to `>=3.9` or add postponed annotations~~ (done: floor raised to `>=3.11`); fix remaining packaging/docs items (H10/L1).
 12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, and swap failure/rollback. Add CI to run `pylint`/tests.
 
 ## Verification notes
