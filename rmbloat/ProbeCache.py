@@ -16,7 +16,7 @@ import atexit
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
-from threading import Lock
+from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
 
 from .IniManager import IniManager
@@ -87,7 +87,10 @@ class ProbeCache:
         self.lock_path = self.cache_path + ".lock"
         self.cache_data: Dict[str, Dict[str, Any]] = {}  # abs_path -> {size_str -> probe_dict}
         self._dirty_count = 0
-        self._cache_lock = Lock()
+        # Reentrant: callers such as batch_get_or_probe() already hold this lock
+        # when they invoke store()/_set_cache(), while worker threads take it
+        # themselves via _increment_probe_failure().  RLock keeps both safe.
+        self._cache_lock = RLock()
         self.chooser = chooser  # FfmpegChooser instance for building ffprobe commands
         self._lock_file = None
 
@@ -264,29 +267,32 @@ class ProbeCache:
             size_bytes = 0
         size_str = str(size_bytes)
 
-        # Check for existing probe failure
-        current_anomaly = None
-        if key in self.cache_data and size_str in self.cache_data[key]:
-            current_anomaly = self.cache_data[key][size_str].get('anomaly')
+        # Worker threads may call this concurrently; the read-check-write of the
+        # anomaly counter must be atomic (RLock is reentrant for _set_cache).
+        with self._cache_lock:
+            # Check for existing probe failure
+            current_anomaly = None
+            if key in self.cache_data and size_str in self.cache_data[key]:
+                current_anomaly = self.cache_data[key][size_str].get('anomaly')
 
-        # Determine new probe failure number
-        if current_anomaly and current_anomaly.startswith('?P'):
-            try:
-                num = int(current_anomaly[2])
-                new_num = min(num + 1, 9)
-            except (ValueError, IndexError):
+            # Determine new probe failure number
+            if current_anomaly and current_anomaly.startswith('?P'):
+                try:
+                    num = int(current_anomaly[2])
+                    new_num = min(num + 1, 9)
+                except (ValueError, IndexError):
+                    new_num = 1
+            else:
                 new_num = 1
-        else:
-            new_num = 1
 
-        meta = Probe(
-            folder=os.path.dirname(key) + '/',
-            last_seen=int(time.time()),
-            anomaly=f'?P{new_num}',
-            size_bytes=size_bytes
-        )
+            meta = Probe(
+                folder=os.path.dirname(key) + '/',
+                last_seen=int(time.time()),
+                anomaly=f'?P{new_num}',
+                size_bytes=size_bytes
+            )
 
-        self._set_cache(filepath, meta)
+            self._set_cache(filepath, meta)
         return meta
 
     @staticmethod
@@ -327,38 +333,45 @@ class ProbeCache:
             # Older releases keyed the outer mapping by basename, which made
             # same-named, same-sized files in different folders collide. Those
             # entries are re-keyed here using their stored ``folder`` field.
-            self.cache_data = {}
-            for key, value in raw_data.items():
-                if not isinstance(value, dict):
-                    # Legacy flat ``full path -> probe_dict`` entries are discarded.
-                    continue
-
-                # Value must be a mapping of size keys to probe dicts.
-                valid_sizes = {}
-                for size_key, probe_dict in value.items():
-                    if size_key.isdigit() and self._is_valid_entry(probe_dict):
-                        valid_sizes[size_key] = probe_dict
-                if not valid_sizes:
-                    continue
-
-                if os.path.isabs(key):
-                    # Already path-keyed; normalize so lookups match exactly.
-                    bucket = self.cache_data.setdefault(os.path.normpath(key), {})
-                    bucket.update(valid_sizes)
-                    continue
-
-                # Legacy basename-keyed format: rebuild the full path from the
-                # stored folder so distinct files no longer share an entry.
-                for size_key, probe_dict in valid_sizes.items():
-                    folder = probe_dict.get('folder') or ''
-                    if not folder:
+            with self._cache_lock:
+                self.cache_data = {}
+                for key, value in raw_data.items():
+                    if not isinstance(value, dict):
+                        # Legacy flat ``full path -> probe_dict`` entries are discarded.
                         continue
-                    path_key = self._cache_key(os.path.join(folder, key))
-                    self.cache_data.setdefault(path_key, {})[size_key] = probe_dict
+
+                    # Value must be a mapping of size keys to probe dicts.
+                    valid_sizes = {}
+                    for size_key, probe_dict in value.items():
+                        if size_key.isdigit() and self._is_valid_entry(probe_dict):
+                            valid_sizes[size_key] = probe_dict
+                    if not valid_sizes:
+                        continue
+
+                    if os.path.isabs(key):
+                        # Already path-keyed; normalize so lookups match exactly.
+                        bucket = self.cache_data.setdefault(os.path.normpath(key), {})
+                        bucket.update(valid_sizes)
+                        continue
+
+                    # Legacy basename-keyed format: rebuild the full path from the
+                    # stored folder so distinct files no longer share an entry.
+                    for size_key, probe_dict in valid_sizes.items():
+                        folder = probe_dict.get('folder') or ''
+                        if not folder:
+                            continue
+                        path_key = self._cache_key(os.path.join(folder, key))
+                        self.cache_data.setdefault(path_key, {})[size_key] = probe_dict
 
     def store(self):
         """Writes the current cache data atomically if dirty, pruning old entries."""
-        if self._dirty_count > 0:
+        # Hold the lock for the whole prune+serialize pass so worker threads
+        # cannot mutate self.cache_data mid-iteration ("dictionary changed size
+        # during iteration") and cannot have an in-flight _set_cache() dropped.
+        with self._cache_lock:
+            if self._dirty_count <= 0:
+                return
+
             # Prune entries older than 4 weeks
             now = int(time.time())
             cutoff = now - EXPIRY_SECONDS
@@ -408,10 +421,11 @@ class ProbeCache:
         probe_dict.pop('gb', None)
         probe_dict.pop('bloat', None)
 
-        if key not in self.cache_data:
-            self.cache_data[key] = {}
-        self.cache_data[key][size_str] = probe_dict
-        self._dirty_count += 1
+        with self._cache_lock:
+            if key not in self.cache_data:
+                self.cache_data[key] = {}
+            self.cache_data[key][size_str] = probe_dict
+            self._dirty_count += 1
 
     def _get_valid_entry(self, filepath: str) -> Optional[Probe]:
         """
@@ -428,43 +442,44 @@ class ProbeCache:
 
         size_str = str(current_size)
 
-        if key not in self.cache_data:
-            return None
+        with self._cache_lock:
+            if key not in self.cache_data:
+                return None
 
-        if size_str not in self.cache_data[key]:
-            return None
+            if size_str not in self.cache_data[key]:
+                return None
 
-        entry = self.cache_data[key][size_str]
+            entry = self.cache_data[key][size_str]
 
-        # Validate entry has correct fields
-        if not self._is_valid_entry(entry):
-            del self.cache_data[key][size_str]
-            if not self.cache_data[key]:
-                del self.cache_data[key]
+            # Validate entry has correct fields
+            if not self._is_valid_entry(entry):
+                del self.cache_data[key][size_str]
+                if not self.cache_data[key]:
+                    del self.cache_data[key]
+                self._dirty_count += 1
+                return None
+
+            # Check for retryable probe failure (?P1 through ?P8)
+            cached_anomaly = entry.get('anomaly')
+            if cached_anomaly and cached_anomaly.startswith('?P'):
+                try:
+                    num = int(cached_anomaly[2])
+                    if num < 9:
+                        return None  # Retry the probe
+                except (ValueError, IndexError):
+                    pass
+
+            # Keep the stored folder in sync with the key's directory.
+            folder = os.path.dirname(key) + '/'
+            if entry.get('folder') != folder:
+                entry['folder'] = folder
+                self._dirty_count += 1
+
+            # Update last_seen
+            entry['last_seen'] = int(time.time())
             self._dirty_count += 1
-            return None
 
-        # Check for retryable probe failure (?P1 through ?P8)
-        cached_anomaly = entry.get('anomaly')
-        if cached_anomaly and cached_anomaly.startswith('?P'):
-            try:
-                num = int(cached_anomaly[2])
-                if num < 9:
-                    return None  # Retry the probe
-            except (ValueError, IndexError):
-                pass
-
-        # Keep the stored folder in sync with the key's directory.
-        folder = os.path.dirname(key) + '/'
-        if entry.get('folder') != folder:
-            entry['folder'] = folder
-            self._dirty_count += 1
-
-        # Update last_seen
-        entry['last_seen'] = int(time.time())
-        self._dirty_count += 1
-
-        return self._load_probe_data(key, size_str)
+            return self._load_probe_data(key, size_str)
 
     def get(self, filepath: str) -> Optional[Probe]:
         """
@@ -500,29 +515,30 @@ class ProbeCache:
 
         size_str = str(current_size)
 
-        if key not in self.cache_data or size_str not in self.cache_data[key]:
-            print(f"Warning: set_anomaly({anomaly}) - no cache entry for {filepath}")
-            return None
+        with self._cache_lock:
+            if key not in self.cache_data or size_str not in self.cache_data[key]:
+                print(f"Warning: set_anomaly({anomaly}) - no cache entry for {filepath}")
+                return None
 
-        entry = self.cache_data[key][size_str]
+            entry = self.cache_data[key][size_str]
 
-        if anomaly and anomaly.startswith('Er'):
-            current_anomaly = entry.get('anomaly')
-            if not current_anomaly:
-                anomaly = 'Er1'
-            else:
-                mat = re.match(r'^\bEr(\d)\b', current_anomaly, re.IGNORECASE)
-                if mat:
-                    num = int(mat.group(1))
-                    anomaly = f'Er{min(num + 1, 9)}'
+            if anomaly and anomaly.startswith('Er'):
+                current_anomaly = entry.get('anomaly')
+                if not current_anomaly:
+                    anomaly = 'Er1'
+                else:
+                    mat = re.match(r'^\bEr(\d)\b', current_anomaly, re.IGNORECASE)
+                    if mat:
+                        num = int(mat.group(1))
+                        anomaly = f'Er{min(num + 1, 9)}'
 
-        if entry.get('anomaly') != anomaly:
-            entry['anomaly'] = anomaly
-            self._dirty_count += 1
-            if anomaly != '---':
-                self.store()
+            if entry.get('anomaly') != anomaly:
+                entry['anomaly'] = anomaly
+                self._dirty_count += 1
+                if anomaly != '---':
+                    self.store()
 
-        return self._load_probe_data(key, size_str)
+            return self._load_probe_data(key, size_str)
 
     def move_entry(self, old_path: str, new_path: str) -> bool:
         """
@@ -532,34 +548,35 @@ class ProbeCache:
         old_key = self._cache_key(old_path)
         new_key = self._cache_key(new_path)
 
-        if old_key not in self.cache_data:
-            return False
+        with self._cache_lock:
+            if old_key not in self.cache_data:
+                return False
 
-        entries = self.cache_data[old_key]
-        if not entries:
-            del self.cache_data[old_key]
-            return False
+            entries = self.cache_data[old_key]
+            if not entries:
+                del self.cache_data[old_key]
+                return False
 
-        now = int(time.time())
+            now = int(time.time())
 
-        if old_key == new_key:
-            for entry in entries.values():
+            if old_key == new_key:
+                for entry in entries.values():
+                    entry['last_seen'] = now
+                self._dirty_count += 1
+                self.store()
+                return True
+
+            new_folder = os.path.dirname(new_key) + '/'
+            target = self.cache_data.setdefault(new_key, {})
+            for size_str, entry in entries.items():
+                entry['folder'] = new_folder
                 entry['last_seen'] = now
+                target[size_str] = entry
+            del self.cache_data[old_key]
+
             self._dirty_count += 1
             self.store()
             return True
-
-        new_folder = os.path.dirname(new_key) + '/'
-        target = self.cache_data.setdefault(new_key, {})
-        for size_str, entry in entries.items():
-            entry['folder'] = new_folder
-            entry['last_seen'] = now
-            target[size_str] = entry
-        del self.cache_data[old_key]
-
-        self._dirty_count += 1
-        self.store()
-        return True
 
     def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Probe]:
         """
