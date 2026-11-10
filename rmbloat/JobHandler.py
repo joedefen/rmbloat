@@ -30,13 +30,6 @@ def _unique_path(path):
     raise FileExistsError(f"could not find a free filename for {path!r}")
 
 
-def emergency_cleanup(self):
-    """Call this on crash or KeyboardInterrupt"""
-    if self.temp_file:
-        if os.path.exists(self.temp_file):
-            print(f"Cleaning up orphaned temp file: {self.temp_file}")
-            os.unlink(self.temp_file)
-
 class JobHandler:
     """Handles video transcoding job execution and monitoring"""
 
@@ -117,7 +110,35 @@ class JobHandler:
         self.consecutive_failures = 0
         self.ok_count = 0
         self.error_count = 0
-        self.temp_file = None # her, for easy atexit cleanup
+        self.temp_file = None  # absolute path, for atexit signal cleanup
+        self.job = None  # active Job, so exit cleanup can abort ffmpeg
+
+    def emergency_cleanup(self):
+        """Abort the active transcode and remove its temp file on exit.
+
+        Wired to ``atexit`` and the SIGTERM/SIGHUP handlers by the
+        application.  Aborting first lets ffmpeg release the file before it is
+        unlinked, so a partially written ``TEMP.*``/``SAMPLE.*`` file cannot be
+        left behind.  Safe to call more than once.
+        """
+        job = self.job
+        if job is not None:
+            try:
+                job.abort()
+            except Exception as exc:  # noqa: BLE001 - cleanup must never raise
+                print(f"Warning: could not abort active job: {exc}")
+            self.job = None
+
+        temp_file = self.temp_file
+        if temp_file:
+            try:
+                if os.path.exists(temp_file):
+                    print(f"Cleaning up orphaned temp file: {temp_file}")
+                    os.unlink(temp_file)
+            except OSError as exc:
+                print(f"Warning: could not remove temp file {temp_file}: {exc}")
+            finally:
+                self.temp_file = None
 
     def validate_srt_file(self, filepath, min_captions=12):
         """
@@ -369,7 +390,10 @@ class JobHandler:
         # so --sample works on any machine instead of relying on a developer's
         # hardcoded /heap/samples directory.
         prefix = f'SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        self.temp_file = temp_file = f"{prefix}.{vid.standard_name}"
+        temp_file = f"{prefix}.{vid.standard_name}"
+        # Keep the cleanup path absolute: an exit handler may run after the
+        # working directory used for the encode has changed.
+        self.temp_file = os.path.abspath(temp_file)
         orig_backup_file = f"ORIG.{basename}"
 
         if os.path.exists(temp_file):
@@ -394,6 +418,7 @@ class JobHandler:
         job = Job(vid, orig_backup_file, temp_file, duration_secs, self.opts)
         job.is_retry = retry_with_error_tolerance
         job.is_software_fallback = force_software
+        self.job = job
 
         # 2. Determine encoding strategy
         original_use_acceleration = None
@@ -562,7 +587,9 @@ class JobHandler:
         if not swap_ok:
             probe = None
 
-        self.temp_file = None # so ataxit does not see it
+        # The job is fully reaped: atexit/signal cleanup has nothing to do.
+        self.job = None
+        self.temp_file = None
 
         return probe
 

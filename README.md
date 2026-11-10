@@ -191,11 +191,12 @@ The output will show which strategies work and recommend the best one. `rmbloat`
 ```
 usage: rmbloat.py [-h] [--ascii [BOOL]] [--glyphs {auto,ascii,unicode}]
                   [--theme {dark-mono,light-mono,default,solarized-dark,solarized-light,gruvbox,nord}]
-                  [--no-color] [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F] [-B]
-                  [-M] [-H MAX_HEIGHT] [-m MIN_SHRINK_PCT]
+                  [--no-color] [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F]
+                  [--no-full-speed] [-B] [--no-keep-backup] [-M]
+                  [--no-merge-subtitles] [-H MAX_HEIGHT] [-m MIN_SHRINK_PCT]
                   [-p {auto,system_accel,docker_accel,system_cpu,docker_cpu}]
-                  [-q QUALITY] [-t THREAD_CNT] [-S] [--auto-hr AUTO_HR]
-                  [-s] [-L] [-T]
+                  [-q QUALITY] [-t THREAD_CNT] [--use-trash]
+                  [--no-use-trash] [-S] [--auto-hr AUTO_HR] [-s] [-L] [-T]
                   [files ...]
 
 CLI/curses bulk Video converter for media servers
@@ -221,13 +222,19 @@ options:
                         allowed codecs [dflt=x265]
   -b BLOAT_THRESH, --bloat-thresh BLOAT_THRESH
                         bloat threshold to convert [dflt=1600,min=500]
-  -F, --full-speed      if true, do NOT set nice -n19 and ionice -c3
+  -F, --full-speed      force full speed (do NOT set nice -n19 and ionice
+                        -c3) [dflt=False]
+  --no-full-speed       force nice/ionice even if full speed is the saved
+                        default
+  -B, --keep-backup     force keeping backups (rename to ORIG.{videofile})
                         [dflt=False]
-  -B, --keep-backup     if true, rename to ORIG.{videofile} rather than
-                        recycle [dflt=False]
+  --no-keep-backup      force recycling the original even if backups are the
+                        saved default
   -M, --merge-subtitles
-                        Merge external .en.srt subtitle files into output
-                        [dflt=False]
+                        force merging external .en.srt subtitle files into
+                        output [dflt=False]
+  --no-merge-subtitles  force ignoring external subtitles even if merging is
+                        the saved default
   -H MAX_HEIGHT, --max-height MAX_HEIGHT
                         Maximum video height in pixels; videos taller than
                         this will be scaled down [dflt=65536]
@@ -241,8 +248,12 @@ options:
                         output quality (CRF) [dflt=28]
   -t THREAD_CNT, --thread-cnt THREAD_CNT
                         thread count for ffmpeg conversions [dflt=4]
-  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M options and file
-                        paths as defaults
+  --use-trash           force using the trashcan for converted videos
+                        [dflt=False]
+  --no-use-trash        force deleting the original even if use-trash is the
+                        saved default
+  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M/--use-trash
+                        options and file paths as defaults
   --auto-hr AUTO_HR     Auto mode: run unattended for specified hours,
                         auto-select [X] files and auto-start conversions
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
@@ -251,6 +262,7 @@ options:
                         video
   ```
   You can (and should) customize the defaults by setting the desired options and adding the `--save-defaults` option to write the current choices to its .ini file.
+  * Boolean switches are explicit: `-F`, `-B`, `-M`, and `--use-trash` always force the feature on, while the matching `--no-*` flags force it off, regardless of the saved default. When both forms are given, the last one on the command line wins.
   * Setting the default for `--prefer-strategy` will speed startup once you have tested and found the best strategy.
   * `--save-defaults` includes saving your video collection root paths, so you don't need to specify them every time you run `rmbloat`. File paths are automatically sanitized: converted to absolute paths, non-existing paths removed, and redundant paths (subdirectories of other saved paths) eliminated. Non-video files in the given files and directories are simply ignored.
   * Press `t` on the SELECT/CONVERT screen to open the theme picker, then `t` again to cycle themes. The last choice, `mono`, turns color off exactly like `--no-color` (and `NO_COLOR`) while leaving the palette selected underneath it.

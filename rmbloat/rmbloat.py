@@ -16,6 +16,7 @@ import argparse
 import traceback
 import re
 import atexit
+import signal
 import time
 import json
 import curses
@@ -91,6 +92,28 @@ def store_cache_on_exit():
         if Converter.singleton.probe_cache:
             Converter.singleton.probe_cache.store()
 
+
+def install_exit_handlers(cleanup):
+    """Run *cleanup* on normal exit and on service-stop signals.
+
+    ``atexit`` covers normal termination, ``sys.exit()`` and an uncaught
+    ``KeyboardInterrupt``; SIGTERM/SIGHUP cover systemd, cron, and ``kill``.
+    The cleanup callable must be idempotent because both paths can run.
+    """
+    atexit.register(cleanup)
+
+    def _handle_termination(signum, _frame):
+        cleanup()
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(signum, _handle_termination)
+        except (OSError, ValueError):
+            # Not the main thread, or the platform lacks the signal: the
+            # atexit registration still handles normal exits.
+            pass
+
 # Data models moved to Models.py
 # TranscodeThread class moved to TranscodeThread.py
 # Job class moved to Models.py
@@ -140,6 +163,11 @@ class Converter:
         self.cpu = CpuStatus()
         # self.cgroup_prefix = set_cgroup_cpu_limit(opts.thread_cnt*100)
         atexit.register(store_cache_on_exit)
+        # Abort an in-flight transcode and remove TEMP.*/SAMPLE.* files on
+        # normal exit and on SIGTERM/SIGHUP.  The transcode thread is a daemon
+        # so it cannot perform this cleanup by itself during interpreter
+        # shutdown.
+        install_exit_handlers(self.emergency_cleanup)
 
         # Auto mode tracking (separate from JobHandler for overall session tracking)
         self.auto_mode_enabled = bool(opts.auto_hr is not None)
@@ -199,6 +227,26 @@ class Converter:
         if self.win:
             self.win.set_theme(choice)
 
+    def emergency_cleanup(self):
+        """Abort an in-flight conversion and remove its temp file.
+
+        Registered with ``atexit`` and the SIGTERM/SIGHUP handlers.  The
+        handler owns the active job and its temp path, so delegate to it when
+        present; ``self.job`` is aborted as a fallback when the handler was
+        torn down first.  Safe to call more than once.
+        """
+        handler = getattr(self, 'job_handler', None)
+        if handler is not None:
+            handler.emergency_cleanup()
+
+        job = getattr(self, 'job', None)
+        if job is not None:
+            try:
+                job.abort()
+            except Exception as exc:  # noqa: BLE001 - cleanup must never raise
+                print(f"Warning: could not abort active job: {exc}")
+            self.job = None
+
     def make_lines(self, doit_skips=None):
         """Generate display lines and stats for video list"""
         lines, self.visible_vids, short_list = [], [], []
@@ -221,7 +269,9 @@ class Converter:
             if vid.doit != 'IP ' and filter_mode:
                 doit = vid.doit if is_convert else vid.doit_auto
                 is_err = bool(doit in ('ERR',) or doit.startswith('Er'))
-                is_dun = bool(doit == 'DUN' or doit.startswith('OK'))
+                # Successful conversions are stored as ' OK' (leading space)
+                # and retries as 'OK2'/'OK3', so compare after stripping.
+                is_dun = bool(doit == 'DUN' or doit.strip().startswith('OK'))
                 is_unchk = vid.doit_auto == '[ ]'
 
                 if filter_mode == '-DUN' and is_dun:
@@ -1289,6 +1339,32 @@ class HistoryScreen(RmbloatScreen):
         self._filter_entries(original_text)
         self.app.win.passthrough_mode = False
 
+    def _refresh_entries(self):
+        """Refresh cached log entries and re-apply the active search.
+
+        New entries must be filtered as they arrive.  Previously only the
+        unfiltered ``entries`` list was refreshed, so an active search kept
+        showing a stale ``filtered_entries`` window until the search text was
+        edited.
+        """
+        if self.window_of_logs is None:
+            self.window_of_logs, self.window_state = lg.get_window_of_entries(
+                window_size=1000)
+        else:
+            # Refresh window with any new entries
+            self.window_of_logs, self.window_state = lg.refresh_window(
+                self.window_of_logs, self.window_state, window_size=1000)
+
+        # Convert to list in reverse order (newest first for display)
+        self.entries = list(reversed(list(self.window_of_logs.values())))
+
+        # Clean up self.expands: drop timestamps no longer in the window
+        valid_timestamps = {entry.timestamp for entry in self.entries}
+        self.expands = {ts: state for ts, state in self.expands.items()
+                        if ts in valid_timestamps}
+
+        self._filter_entries(self.search_bar.text)
+
     def _filter_entries(self, search_text):
         """Filter entries based on search text (shallow or deep)."""
         if not search_text:
@@ -1343,24 +1419,9 @@ class HistoryScreen(RmbloatScreen):
         win = app.win
         win.set_pick_mode(True)
 
-        # Get window of log entries (chronological order - eldest to youngest)
-        if self.window_of_logs is None:
-            self.window_of_logs, self.window_state = lg.get_window_of_entries(window_size=1000)
-        else:
-            # Refresh window with any new entries
-            self.window_of_logs, self.window_state = lg.refresh_window(self.window_of_logs, self.window_state, window_size=1000)
-
-        # Convert to list in reverse order (newest first for display)
-        self.entries = list(reversed(list(self.window_of_logs.values())))
-
-        # Clean up self.expands: remove any timestamps that are no longer in entries
-        valid_timestamps = {entry.timestamp for entry in self.entries}
-        self.expands = {ts: state for ts, state in self.expands.items() if ts in valid_timestamps}
-
-        # Apply search filter if active
-        if not self.search_bar.text:
-            self.filtered_entries = self.entries
-            self.search_matches = set()
+        # Refresh the window, cached entries, and the active filter together so
+        # a new log entry cannot leave stale search results on screen.
+        self._refresh_entries()
 
         # Count errors vs others in filtered results
         err_count = sum(1 for e in self.filtered_entries if e.level == 'ERR')
@@ -1596,18 +1657,43 @@ def main(args=None) -> int:
                     default=vals.bloat_thresh, type=int,
                     help='bloat threshold to convert'
                         + f' [dflt={vals.bloat_thresh},min=500]')
+        # Positive flags always force True (they never toggle a saved default).
+        # The paired --no-* flags allow forcing False when the saved default is
+        # True; when both forms are given, the last one on the command line
+        # wins because both write the same dest.
         parser.add_argument('-F', '--full-speed',
-                    action='store_false' if vals.full_speed else 'store_true',
-                    help='if true, do NOT set nice -n19 and ionice -c3'
+                    dest='full_speed',
+                    action='store_true',
+                    default=vals.full_speed,
+                    help='force full speed: do NOT set nice -n19 and ionice -c3'
                         + f' [dflt={vals.full_speed}]')
+        parser.add_argument('--no-full-speed',
+                    dest='full_speed',
+                    action='store_false',
+                    default=argparse.SUPPRESS,
+                    help='force nice/ionice even if full speed is the saved default')
         parser.add_argument('-B', '--keep-backup',
-                    action='store_false' if vals.keep_backup else 'store_true',
-                    help='if true, rename to ORIG.{videofile} rather than recycle'
+                    dest='keep_backup',
+                    action='store_true',
+                    default=vals.keep_backup,
+                    help='force keeping backups: rename to ORIG.{videofile}'
                          + f' [dflt={vals.keep_backup}]')
+        parser.add_argument('--no-keep-backup',
+                    dest='keep_backup',
+                    action='store_false',
+                    default=argparse.SUPPRESS,
+                    help='force recycling the original even if backups are the saved default')
         parser.add_argument('-M', '--merge-subtitles',
-                    action='store_false' if vals.merge_subtitles else 'store_true',
-                    help='Merge external .en.srt subtitle files into output'
+                    dest='merge_subtitles',
+                    action='store_true',
+                    default=vals.merge_subtitles,
+                    help='force merging external .en.srt subtitle files into output'
                     + f' [dflt={vals.merge_subtitles}]')
+        parser.add_argument('--no-merge-subtitles',
+                    dest='merge_subtitles',
+                    action='store_false',
+                    default=argparse.SUPPRESS,
+                    help='force ignoring external subtitles even if merging is the saved default')
         parser.add_argument('-H', '--max-height',
                     default=vals.max_height, type=int,
                     help='Maximum video height in pixels; videos taller than this will be scaled down'
@@ -1629,10 +1715,16 @@ def main(args=None) -> int:
                     help='thread count for ffmpeg conversions'
                         + f' [dflt={vals.thread_cnt}]')
         parser.add_argument('--use-trash',
-                    action='store_false' if vals.use_trash else 'store_true',
+                    dest='use_trash',
+                    action='store_true',
                     default=vals.use_trash,
-                    help='if set, use trashcan for converted videos'
+                    help='force using the trashcan for converted videos'
                         + f' [dflt={vals.use_trash}]')
+        parser.add_argument('--no-use-trash',
+                    dest='use_trash',
+                    action='store_false',
+                    default=argparse.SUPPRESS,
+                    help='force deleting the original even if use-trash is the saved default')
 
         # run-time options
         parser.add_argument('-S', '--save-defaults', action='store_true',
