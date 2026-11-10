@@ -167,9 +167,28 @@ class FfmpegChooser:
 
         return False
 
-    def _detect_vaapi_10bit_support(self) -> bool:
+    def _vaapi_10bit_test_args(self, render_device: str) -> List[str]:
+        """Return the ffmpeg arguments for a short 10-bit VAAPI test encode."""
+        return [
+            '-y',
+            '-init_hw_device', f'vaapi=va:{render_device}',
+            '-filter_hw_device', 'va',
+            '-f', 'lavfi', '-i', 'nullsrc=s=128x128:d=1',
+            '-vf', 'format=p010le,hwupload',
+            '-c:v', 'hevc_vaapi',
+            '-profile:v', 'main10',
+            '-frames:v', '1',
+            '-f', 'null', '-'
+        ]
+
+    def _detect_vaapi_10bit_support(self, container: bool = False) -> bool:
         """
         Detect if VAAPI supports 10-bit HEVC encoding.
+
+        Args:
+            container: When True, run the fallback encode through the
+                configured container runtime using the same user/group/device
+                arguments as a real encode. When False, test the host ffmpeg.
 
         Returns:
             bool: True if VAAPI supports main10 profile
@@ -177,8 +196,10 @@ class FfmpegChooser:
         if not self.render_device:
             return False
 
-        # Try using vainfo first (fastest and most reliable)
-        if shutil.which('vainfo'):
+        # vainfo is only used on the host. The container image may not ship
+        # the tool, and its view of the device is exactly what the fallback
+        # encode below already verifies.
+        if not container and shutil.which('vainfo'):
             result = self._run_command(
                 ['vainfo', '--display', 'drm', '--device', self.render_device],
                 timeout=self.DOCKER_INFO_TIMEOUT,
@@ -197,18 +218,20 @@ class FfmpegChooser:
 
         # Fallback: test encode with 10-bit
         # This is slower but works if vainfo isn't available
-        test_cmd = [
-            'ffmpeg',
-            '-y',
-            '-init_hw_device', f'vaapi=va:{self.render_device}',
-            '-filter_hw_device', 'va',
-            '-f', 'lavfi', '-i', 'nullsrc=s=128x128:d=1',
-            '-vf', 'format=p010le,hwupload',
-            '-c:v', 'hevc_vaapi',
-            '-profile:v', 'main10',
-            '-frames:v', '1',
-            '-f', 'null', '-'
-        ]
+        args = self._vaapi_10bit_test_args(self.render_device)
+
+        if container:
+            if not self.runtime:
+                return False
+            test_cmd = [
+                self.runtime, 'run', '--rm',
+                '--device=/dev/dri:/dev/dri',
+                *self._docker_user_and_group_args(self.render_device),
+                self.image,
+                *args,
+            ]
+        else:
+            test_cmd = ['ffmpeg', *args]
 
         result = self._run_command(test_cmd, timeout=self.VAAPI_TEST_TIMEOUT, text_output=True)
         if result:
@@ -290,6 +313,78 @@ class FfmpegChooser:
 
         return None
 
+    def _docker_gpu_groups(self, render_device: Optional[str] = None) -> List[str]:
+        """
+        Return numeric group ids that grant access to /dev/dri.
+
+        ``docker run`` executes the container process as ``uid:gid`` and does
+        not inherit the caller's supplementary groups. The render (and often
+        video) group must therefore be re-added explicitly with
+        ``--group-add``; otherwise a probe that ran as root can pass while a
+        real encode running as the invoking user fails with permission errors.
+        """
+        gids = set()
+
+        try:
+            import grp  # pylint: disable=import-outside-toplevel
+        except ImportError:  # pragma: no cover - non-Unix platforms
+            grp = None
+
+        if grp is not None:
+            for name in ('render', 'video'):
+                try:
+                    gids.add(grp.getgrnam(name).gr_gid)
+                except KeyError:
+                    pass
+
+        # The group that owns the actual render node is authoritative even if
+        # the conventional names above are missing or remapped.
+        if render_device:
+            try:
+                gids.add(os.stat(render_device).st_gid)
+            except OSError:
+                pass
+
+        return [str(gid) for gid in sorted(gids)]
+
+    def _docker_user_and_group_args(self, render_device: Optional[str] = None) -> List[str]:
+        """
+        Build the container identity arguments shared by probes and encodes.
+
+        Keeping a single helper ensures the acceleration/10-bit probes run
+        with exactly the same user and supplementary GPU groups as real
+        encodes, so a successful probe implies a working encode.
+        """
+        args = ['--user', f'{os.getuid()}:{os.getgid()}']
+        for gid in self._docker_gpu_groups(render_device):
+            args.extend(['--group-add', gid])
+        return args
+
+    def _docker_accel_will_be_used(self) -> bool:
+        """
+        Predict whether strategy selection will end on ``docker_accel``.
+
+        Used to avoid paying for the extra container 10-bit probe when a
+        system strategy (or CPU-only Docker) will win instead.
+        """
+        if not self.has_docker_acceleration:
+            return False
+
+        if self.prefer_strategy == 'docker_accel':
+            return True
+        if self.prefer_strategy == 'system_accel' and self.has_system_acceleration:
+            return False
+        if self.prefer_strategy == 'system_cpu' and self.system_ffmpeg_path:
+            return False
+        if self.prefer_strategy == 'docker_cpu':
+            return False
+
+        # 'auto', or an unavailable preference that falls back to auto: the
+        # system ffmpeg is preferred whenever it exists (with or without
+        # acceleration), so docker_accel only wins when there is no system
+        # ffmpeg at all.
+        return not self.system_ffmpeg_path
+
     def _test_docker_acceleration(self) -> None:
         """Test if Docker/Podman can use hardware acceleration."""
         if not self.runtime:
@@ -311,10 +406,13 @@ class FfmpegChooser:
         if not self.quiet:
             print(f"  → Testing hardware acceleration with {render_device}...")
 
-        # Test command
+        # Test command. It runs with the same user and supplementary GPU
+        # groups as real encodes; running it as root without --user previously
+        # let the probe pass while real encodes failed on device permissions.
         test_cmd = [
             self.runtime, 'run', '--rm',
             '--device=/dev/dri:/dev/dri',
+            *self._docker_user_and_group_args(render_device),
             self.image,
             '-y',
             '-init_hw_device', f'vaapi=va:{render_device}',
@@ -333,6 +431,13 @@ class FfmpegChooser:
                 self.render_device = render_device
                 if not self.quiet:
                     print(f"  ✓ Hardware acceleration working in {self.runtime}")
+
+                # Detect 10-bit support with the same container identity a
+                # real encode will use. Skip the extra probe when the system
+                # path already established it and docker will not be chosen.
+                if self._docker_accel_will_be_used():
+                    self.vaapi_supports_10bit = self._detect_vaapi_10bit_support(
+                        container=True)
             else:
                 if not self.quiet:
                     print(f"  ✗ Hardware acceleration test failed in {self.runtime}")
@@ -636,9 +741,12 @@ class FfmpegChooser:
 
         # 2. Docker Wrapper logic
         if self.use_docker:
+            # Use the same identity/group arguments as the acceleration probe
+            # so a probe that passed predicts a working real encode.
             cmd.extend([
                 self.runtime, 'run', '--rm',
-                '--user', f'{os.getuid()}:{os.getgid()}',
+                *self._docker_user_and_group_args(
+                    self.render_device if self.use_acceleration else None),
                 '--net=host', '--ipc=host',
                 '-v', f'{workdir}:{workdir}',
                 '-w', workdir,
