@@ -246,17 +246,15 @@ def standard_name(pathname: str, height: int, quality: int) -> tuple[bool, str]:
     name = corename
 
     # Regular expressions for the codecs/resolutions to be replaced.
-    # The groups will capture the exact string for case-checking later.
+    # The leading separator is included in the match so that purging
+    # e.g. ".x264" or ".1080p" doesn't leave a stray delimiter behind.
     purges = r'[xh]\.?264|avc|xvid|divx'
     purges += r'|\d+[pik]|UHD'
-    pattern = r'([^a-z0-9]' + purges + r')\b'
+    pattern = r'[^a-z0-9](?:' + purges + r')\b'
     regex = re.compile(pattern, re.IGNORECASE)
-    end = 0
-    while True:
-        match = re.search(regex, name[end:])
-        if not match:
-            break
-        start, end = match.span(1)
-        name = name[:start] + name[end:]
+    # Remove every match in one pass. Manually slicing with offsets relative
+    # to a sub-string while mutating the full string corrupted positions and
+    # left later codec/resolution tokens behind.
+    name = regex.sub('', name)
 
     return finish_name(name, corename)
