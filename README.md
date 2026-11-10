@@ -238,10 +238,10 @@ options:
                         the saved default
   -H MAX_HEIGHT, --max-height MAX_HEIGHT
                         Maximum video height in pixels; videos taller than
-                        this will be scaled down [dflt=65536]
+                        this will be scaled down [dflt=65536,range=1-65536]
   -m MIN_SHRINK_PCT, --min-shrink-pct MIN_SHRINK_PCT
                         minimum conversion reduction percent for
-                        replacement [dflt=10]
+                        replacement [dflt=10,range=0-100]
   -p {auto,system_accel,system_cpu,docker_accel,docker_cpu},
       --prefer-strategy {auto,system_accel,system_cpu,docker_accel,docker_cpu}
                         FFmpeg strategy preference [dflt=auto]
@@ -249,9 +249,11 @@ options:
                         isolation for local ffmpeg/ffprobe: auto, container,
                         bwrap, systemd, or none [dflt=auto]
   -q QUALITY, --quality QUALITY
-                        output quality (CRF) [dflt=28]
+                        output quality (CRF, 0-51) [dflt=28]
   -t THREAD_CNT, --thread-cnt THREAD_CNT
-                        thread count for ffmpeg conversions [dflt=4]
+                        thread count for ffmpeg conversions (0 = let ffmpeg
+                        decide); applies to the software encoders only, the
+                        VAAPI hardware path ignores it [dflt=4,range=0-256]
   --use-trash           force using the trashcan for converted videos
                         [dflt=False]
   --no-use-trash        force deleting the original even if use-trash is the

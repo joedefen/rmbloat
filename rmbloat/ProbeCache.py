@@ -138,8 +138,11 @@ class ProbeCache:
     def _acquire_instance_lock(self):
         """Acquire exclusive lock - only one rmbloat instance can run"""
         try:
+            # O_CREAT only: the lock file carries no data (the ``flock`` is the
+            # lock), so there is no reason to truncate a file another instance
+            # may still hold open.
             fd = os.open(self.lock_path,
-                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                         os.O_WRONLY | os.O_CREAT, 0o600)
             try:
                 os.fchmod(fd, 0o600)
             except OSError:
@@ -151,19 +154,36 @@ class ProbeCache:
             # Ensure cache is saved on exit
             atexit.register(self.store)
         except IOError:
+            # Do not leak the descriptor just opened on the way out.
+            if self._lock_file is not None:
+                try:
+                    self._lock_file.close()
+                except OSError:
+                    pass
+                self._lock_file = None
             print(f"ERROR: Another rmbloat instance is already running (lock: {self.lock_path})")
             sys.exit(1)
 
     def _release_instance_lock(self):
-        """Release the instance lock"""
+        """Release the instance lock, leaving the lock file in place.
+
+        Unlinking the lock path used to open a race: a process that had already
+        opened the same inode could take a lock on the now-unlinked file while a
+        third process created a fresh lock file and locked *that*, so two
+        instances could run at once despite the documented single-instance
+        policy.  The file itself is not the lock -- the ``flock`` is -- so it is
+        left behind unlocked, which is also the state the ``rmbloatd`` staleness
+        check expects (an unlocked file means no instance is running).
+        """
         if self._lock_file:
             try:
                 fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
                 self._lock_file.close()
-                if os.path.exists(self.lock_path):
-                    os.remove(self.lock_path)
             except Exception:
                 pass
+            finally:
+                # Release becomes idempotent: atexit and the tests both call it.
+                self._lock_file = None
 
     @staticmethod
     def _cache_key(filepath: str) -> str:

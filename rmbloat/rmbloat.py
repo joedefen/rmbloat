@@ -1653,6 +1653,30 @@ class HistoryScreen(RmbloatScreen):
         self.app.win.passthrough_mode = True
 
 
+def bounded_int(low, high, label):
+    """Build an ``argparse`` ``type=`` converter with an inclusive range.
+
+    Numeric options used to be plain ``int``, so a value that only the encoder
+    objects to (``-t 1000``) was accepted and later raised ``ValueError`` inside
+    ``FfmpegChooser.make_ffmpeg_cmd()`` -- after the queue had started, where
+    the exception tears down the curses session instead of reporting the bad
+    option.  Validating during parsing reports the problem and exits with
+    argparse's status 2 before any job or window exists.
+    """
+    def convert(text):
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f'{label}: expected an integer, got {text!r}') from None
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(
+                f'{label} must be between {low} and {high} (got {value})')
+        return value
+
+    return convert
+
+
 def main(args=None) -> int:
     """
     Convert video files to desired form.
@@ -1730,21 +1754,24 @@ def main(args=None) -> int:
                     default=argparse.SUPPRESS,
                     help='force ignoring external subtitles even if merging is the saved default')
         parser.add_argument('-H', '--max-height',
-                    default=vals.max_height, type=int,
+                    default=vals.max_height,
+                    type=bounded_int(1, 65536, 'max height'),
                     help='Maximum video height in pixels; videos taller than this will be scaled down'
-                    + f' [dflt={vals.max_height}]')
+                    + f' [dflt={vals.max_height},range=1-65536]')
         parser.add_argument('-m', '--min-shrink-pct',
-                    default=vals.min_shrink_pct, type=int,
+                    default=vals.min_shrink_pct,
+                    type=bounded_int(0, 100, 'minimum shrink percent'),
                     help='minimum conversion reduction percent for replacement'
-                    + f' [dflt={vals.min_shrink_pct}]')
+                    + f' [dflt={vals.min_shrink_pct},range=0-100]')
         parser.add_argument('-p', '--prefer-strategy',
                     choices=FfmpegChooser.STRATEGIES,
                     default=vals.prefer_strategy,
                     help='FFmpeg strategy preference'
                         + f' [dflt={vals.prefer_strategy}]')
         parser.add_argument('-q', '--quality',
-                    default=vals.quality, type=int,
-                    help=f'output quality (CRF) [dflt={vals.quality}]')
+                    default=vals.quality,
+                    type=bounded_int(0, 51, 'quality (CRF)'),
+                    help=f'output quality (CRF, 0-51) [dflt={vals.quality}]')
         saved_sandbox = getattr(vals, 'sandbox', 'auto')
         parser.add_argument('--sandbox',
                     choices=Sandbox.SANDBOX_CHOICES,
@@ -1753,9 +1780,12 @@ def main(args=None) -> int:
                          'bwrap, systemd, or none'
                         + f' [dflt={saved_sandbox}]')
         parser.add_argument('-t', '--thread-cnt',
-                    default=vals.thread_cnt, type=int,
-                    help='thread count for ffmpeg conversions'
-                        + f' [dflt={vals.thread_cnt}]')
+                    default=vals.thread_cnt,
+                    type=bounded_int(0, 256, 'thread count'),
+                    help='thread count for ffmpeg conversions (0 = let ffmpeg'
+                         ' decide); applies to the software encoders only, the'
+                         ' VAAPI hardware path ignores it'
+                        + f' [dflt={vals.thread_cnt},range=0-256]')
         parser.add_argument('--use-trash',
                     dest='use_trash',
                     action='store_true',
@@ -1819,7 +1849,12 @@ def main(args=None) -> int:
                 else:
                     print(f'- {key} {new_value}')
                 setattr(vals, key, new_value)
-            ini.write()
+            if not ini.write():
+                # IniManager already explained the cause on stderr.  Without a
+                # non-zero status a script (or cron/CI) could not tell that the
+                # defaults it just saw printed were never persisted.
+                print('Error: the new defaults were not saved.', file=sys.stderr)
+                sys.exit(1)
             sys.exit(0)
 
         if opts.logs:

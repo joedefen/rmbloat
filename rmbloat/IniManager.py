@@ -4,6 +4,7 @@
 
 import configparser
 import os
+import sys
 import tempfile
 import types
 from pathlib import Path
@@ -152,6 +153,12 @@ class IniManager:
         """
         Writes configuration values FROM the object attributes (self.vals) TO the INI file.
         This saves the object's current state to disk.
+
+        Returns ``True`` when the new configuration was durably installed and
+        ``False`` when it could not be written (full disk, read-only config
+        directory, a failed ``os.replace``).  Callers such as
+        ``--save-defaults`` propagate that failure into the process exit
+        status, so a script can tell whether the defaults were persisted.
         """
         config = configparser.ConfigParser()
         config[self.SECTION] = {}
@@ -192,8 +199,13 @@ class IniManager:
             os.replace(temp_path, self.config_file_path)
             temp_path = None
             print(f"Write operation complete. Configuration saved to {self.config_file_path}")
+            return True
         except Exception as e:
-            print(f"ERROR: Failed to write config file to {self.config_file_path}. Error: {e}")
+            # stderr: a failed save is a diagnostic, not part of the CLI's
+            # normal output, and callers may be piping stdout.
+            print(f"ERROR: Failed to write config file to {self.config_file_path}. Error: {e}",
+                  file=sys.stderr)
+            return False
         finally:
             if temp_path is not None:
                 try:
