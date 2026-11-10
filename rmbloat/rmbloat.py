@@ -66,6 +66,9 @@ class Converter:
     # --- Conversion Criteria Constants (Customize these) ---
     TARGET_CODECS = ['h265', 'hevc']
     MAX_BITRATE_KBPS = 2100 # about 15MB/min (or 600MB for 40m)
+    # Cap ffmpeg output serialized into the job log, independent of the
+    # TranscodeThread live buffer.
+    MAX_LOGGED_RUN_LINES = 200
 
     # Constants moved to ConvertUtils.py
     VIDEO_EXTENSIONS = ConvertUtils.VIDEO_EXTENSIONS
@@ -252,13 +255,34 @@ class Converter:
         elif not vid.doit.startswith('?') and not self.dont_doit(vid):
             vid.doit = '[X]'
 
+    @staticmethod
+    def _tail_for_log(texts, limit):
+        """Return at most *limit* trailing lines, with an omission marker."""
+        texts = list(texts or [])
+        if len(texts) <= limit:
+            return texts
+        omitted = len(texts) - limit
+        return [f"... {omitted} earlier line(s) omitted ..."] + texts[-limit:]
+
     def _log_job_final(self, job, status_label):
         """Standardized logging for finished jobs"""
         clean_label = status_label.strip() # Remove the leading space from " OK"
         dumped = asdict(job.vid)
+        runs = dumped.get('runs') or []
 
         if clean_label.startswith('OK'):
-            dumped['texts'] = [] # Clean up logs for successful runs
+            # Clean up logs for successful runs, including each run's ffmpeg
+            # output (asdict embedded runs[*].texts even though vid.texts was
+            # cleared).
+            dumped['texts'] = []
+            for run in runs:
+                run['texts'] = []
+        else:
+            # Failed jobs keep their output for diagnosis, but bounded.
+            limit = self.MAX_LOGGED_RUN_LINES
+            dumped['texts'] = self._tail_for_log(dumped.get('texts'), limit)
+            for run in runs:
+                run['texts'] = self._tail_for_log(run.get('texts'), limit)
 
         title = 'RE-ENCODE-TO-H265'
         if clean_label == 'OK2': title += '-RETRY'

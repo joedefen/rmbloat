@@ -37,6 +37,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H6. Log trimming wrote entries out of chronological order** — Resolved in [`_trim_log_file()`](rmbloat/StructuredLogger.py:258). Survivors are still chosen by effective age (so `ERR` entries age slower and are kept longer), but the file is now re-sorted by the real timestamp (with the original file index as a stable tie-breaker) before being written. The old `kept.reverse()` produced reverse-effective-age order, so old `ERR` lines could follow newer `OK` lines; [`get_window_of_entries()`](rmbloat/StructuredLogger.py:490) and [`refresh_window()`](rmbloat/StructuredLogger.py:534) then saw a non-chronological window. Regression coverage lives in [`tests/test_log_trim.py`](tests/test_log_trim.py): the oldest entry is an `ERR`, a newer `OK` is evicted by the size target, the retained file stays timestamp-sorted, and the resulting window remains chronological.
 
+- **H7. ffmpeg stderr and serialized job logs grew without bound** — Resolved in two layers. [`TranscodeThread`](rmbloat/TranscodeThread.py:18) now records stderr through [`_record_text()`](rmbloat/TranscodeThread.py:146), which truncates overlong single lines and keeps the live buffer within `MAX_LOG_LINES`/`MAX_LOG_CHARS` by discarding the oldest entries down to a 75% target; the newline-less `partial_line` buffer is capped too. [`_log_job_final()`](rmbloat/rmbloat.py:267) now clears `runs[*].texts` as well as `vid.texts` for successful jobs, and bounds failed-job output with [`_tail_for_log()`](rmbloat/rmbloat.py:259) (last 200 lines plus an omission marker) so `asdict(vid)` can no longer produce unbounded JSON. Regression coverage lives in [`tests/test_log_bounds.py`](tests/test_log_bounds.py).
+
 ---
 
 # Critical findings
@@ -98,7 +100,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 6. **Log trimming scrambled chronological order.** [`_trim_log_file()`](rmbloat/StructuredLogger.py:258) sorted by weighted age, kept newest, then `reverse()`d the effective-age order, which is not the timestamp order: old `ERR` lines ended up after newer `OK` lines, and [`get_window_of_entries()`](rmbloat/StructuredLogger.py:490)/[`refresh_window()`](rmbloat/StructuredLogger.py:534) assume chronology. **Resolved** — see the H6 entry under “Resolved findings”.
 
-7. **Unbounded ffmpeg log capture.** [`run_ffmpeg()`](rmbloat/TranscodeThread.py:114) appends every non-progress stderr line to `info.texts` without limit. Corrupt media can emit enormous repeated logs, growing memory during a single job. [`_log_job_final()`](rmbloat/rmbloat.py:252) then serializes `asdict(vid)` including `runs[*].texts`; it clears only `dumped['texts']`, not the run logs, so successful jobs can also produce huge JSON log entries.
+7. **Unbounded ffmpeg log capture.** [`run_ffmpeg()`](rmbloat/TranscodeThread.py:124) appended every non-progress stderr line to `info.texts` without limit, and [`_log_job_final()`](rmbloat/rmbloat.py:267) serialized `asdict(vid)` including `runs[*].texts` while clearing only `dumped['texts']`. Corrupt or long-running jobs could therefore exhaust memory and write huge JSON log entries. **Resolved** — see the H7 entry under “Resolved findings”.
 
 8. **`StructuredLogger.put(..., data=...)` raises `TypeError`.** [`put()`](rmbloat/StructuredLogger.py:393) passes `data=kwargs.get('data')` and also `**kwargs`, duplicating `data`. Verified: `TypeError ... got multiple values for keyword argument 'data'`.
 
@@ -187,7 +189,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 7. ~~Remove the duplicate `start_transcode_job()`~~ (H1 done) and fix the `standard_name()` purge loop (H2).
 8. Change the probe cache key to include the directory (or inode) and lock all cache mutations (H3/M1).
 9. ~~Replace the hardcoded sample directory and fix the stdin fd handling~~ (H4/H5 done).
-10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8); H6 done.
+10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8); H6/H7 done.
 11. Set `requires-python` to `>=3.9` or add postponed annotations; fix packaging/docs (H10/L1).
 12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, and swap failure/rollback. Add CI to run `pylint`/tests.
 

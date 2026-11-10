@@ -17,6 +17,14 @@ from typing import Optional
 
 class TranscodeThread(threading.Thread):
     """ TBD """
+    # Bound retained ffmpeg stderr so corrupt media cannot exhaust memory.
+    # When a limit is crossed the oldest ~25% is discarded (amortized O(1)).
+    MAX_LOG_LINES = 2000
+    MAX_LOG_CHARS = 512 * 1024
+    LOG_TRIM_TARGET = 0.75
+    # A single stderr "line" without a newline can also grow arbitrarily.
+    MAX_MESSAGE_CHARS = 4096
+
     def __init__(self, cmd, run_info, job, progress_secs_max, temp_file=None):
         super().__init__(daemon=True)
         self.cmd = cmd
@@ -113,11 +121,16 @@ class TranscodeThread(threading.Thread):
                     # Real messages (headers, mappings, errors)
                     msg = line_bytes.decode('utf-8', errors='ignore').strip()
                     if msg:
-                        self.info.texts.append(msg)
+                        self._record_text(msg)
+
+                # Do not let a newline-less stream grow the partial buffer
+                # without bound either.
+                if len(partial_line) > self.MAX_MESSAGE_CHARS:
+                    partial_line = partial_line[-self.MAX_MESSAGE_CHARS:]
 
             # Timeout Watchdog
             if now - self.last_activity_mono > self.progress_secs_max:
-                self.info.texts.append('PROGRESS TIMEOUT')
+                self._record_text('PROGRESS TIMEOUT')
                 self.abort(return_code=254)
                 break
 
@@ -129,6 +142,30 @@ class TranscodeThread(threading.Thread):
                 time.sleep(0.10)
 
         self.is_finished = True
+
+    def _record_text(self, msg):
+        """Append a stderr line, keeping ``info.texts`` within bounded size."""
+        if len(msg) > self.MAX_MESSAGE_CHARS:
+            msg = msg[:self.MAX_MESSAGE_CHARS] + '... [truncated]'
+
+        texts = self.info.texts
+        texts.append(msg)
+
+        if (len(texts) <= self.MAX_LOG_LINES
+                and sum(len(text) for text in texts) <= self.MAX_LOG_CHARS):
+            return
+
+        # Discard the oldest entries down to the trim targets in one slice so
+        # steady-state appends stay cheap.
+        target_lines = max(1, int(self.MAX_LOG_LINES * self.LOG_TRIM_TARGET))
+        target_chars = max(1, int(self.MAX_LOG_CHARS * self.LOG_TRIM_TARGET))
+        drop = max(0, len(texts) - target_lines)
+        kept_chars = sum(len(text) for text in texts[drop:])
+        while kept_chars > target_chars and drop < len(texts) - 1:
+            kept_chars -= len(texts[drop])
+            drop += 1
+        if drop:
+            del texts[:drop]
 
     def _generate_display_string(self, ns):
         """ Processes SimpleNamespace(frame, fps, bitrate, out_time, speed) """
