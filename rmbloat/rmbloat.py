@@ -810,7 +810,11 @@ class Converter:
         win_opts = ConsoleWindowOpts(
             head_line=True,
             head_rows=4,
-            body_rows=max(10+len(self.vids), 10000),
+            # console-window 2.2.2 treats body_rows as an advisory hint only:
+            # the body grows on demand up to max_rows (32767 by default) and
+            # the curses pads stay viewport-sized.  A small hint is enough for
+            # collections with several thousand videos.
+            body_rows=128,
             min_cols_rows=(60,10),
             ctrl_c_terminates=False,
             theme=(theme or None),
