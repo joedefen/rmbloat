@@ -155,15 +155,46 @@ def apply_timestamps(filepath, timestamps):
         return False
 
 
+def _rename_no_clobber(source_path: str, target_path: str, is_dir: bool) -> None:
+    """Rename ``source_path`` without replacing an existing destination.
+
+    ``os.rename()`` overwrites existing files on POSIX.  Companion renaming
+    must never destroy an unrelated file, so regular files are installed with
+    a hard link first and directories are renamed only after an existence
+    check.  Filesystems without hard-link support fall back to a checked
+    ``os.rename()``.
+    """
+    if os.path.lexists(target_path):
+        raise FileExistsError(f'destination already exists: {target_path}')
+
+    if is_dir:
+        os.rename(source_path, target_path)
+        return
+
+    try:
+        os.link(source_path, target_path, follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except (NotImplementedError, OSError):
+        # Cross-device or no-hard-link filesystems: re-check and rename.
+        if os.path.lexists(target_path):
+            raise FileExistsError(
+                f'destination already exists: {target_path}') from None
+        os.rename(source_path, target_path)
+    else:
+        os.unlink(source_path)
+
+
 def bulk_rename(old_file_name: str, new_file_name: str, trashes: set):
     """
     Renames companion files and directories beside ``old_file_name``.
 
-    It finds all items whose non-extension part matches the non-extension part
-    of `old_file_name`, and renames them using the non-extension part of
-    `new_file_name`, preserving the original file extensions.  The search is
-    rooted at the old file's directory rather than the process working
-    directory, so callers never need a global ``os.chdir()``.
+    It finds items whose non-extension part matches the non-extension part of
+    `old_file_name` and renames them using the non-extension part of
+    `new_file_name`, preserving the original extensions.  The search starts in
+    the old file's directory, recurses only into directories whose own name
+    matches the old basename (for example ``movie.cache/``), and never renames
+    items in unrelated subdirectories.  Destinations are never overwritten.
 
     Args:
         old_file_name: A sample filename (e.g., 'oldie.mp4') used to define
@@ -182,55 +213,65 @@ def bulk_rename(old_file_name: str, new_file_name: str, trashes: set):
 
     # Define the special suffix to look for (case-insensitive search)
     special_ext = ".REFERENCE.srt"
-    # 2. Walk the source video's directory tree.
-    for root, dirs, files in os.walk(old_dir, topdown=False):
+    special_ext_lower = special_ext.lower()
+    skip_names = set(trashes or ())
 
-        # Combine files and directories for unified processing.
-        items_to_check = files + dirs
+    def renamed_name(item_name):
+        """Return the target name for a companion item, or ``None``."""
+        current_base, extension = os.path.splitext(item_name)
+        current_base2, extension2 = os.path.splitext(current_base)
+        extension2 = extension2 + extension
 
-        for item_name in items_to_check:
-            # Skip if the item is a special directory reference
-            if item_name in ('.', '..'):
+        # Full name match (often a directory such as ``movie.cache``).
+        if item_name == old_base_name:
+            return new_base_name
+
+        # Reference-subtitle suffix match.
+        if (item_name.lower().endswith(special_ext_lower)
+                and item_name[:-len(special_ext)] == old_base_name):
+            return new_base_name + special_ext
+
+        # Multi-part suffix such as ``movie.EMBEDDED.srt``.
+        if current_base2 == old_base_name:
+            return new_base_name + extension2
+
+        # General case: ``movie.en.srt``, ``movie.mkv``, ``movie.cache``.
+        if current_base == old_base_name:
+            return new_base_name + extension
+        return None
+
+    def walk(directory):
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            ops.append(f"ERROR: cannot scan {directory!r}: {exc}")
+            return
+
+        for entry in entries:
+            item_name = entry.name
+            if item_name in skip_names:
                 continue
-
-            full_old_path = os.path.join(root, item_name)
-            current_base, extension = os.path.splitext(item_name)
-            current_base2, extension2 = os.path.splitext(current_base)
-            extension2 = extension2 + extension
-
-            new_item_name = None
-
-            # --- Rule 1: Special Case - Full Name Match (item_name == old_base_name) ---
-            if item_name == old_base_name:
-                new_item_name = new_base_name
-
-            # --- Rule 2: Special Case - Reference SRT Suffix Match ---
-            # Requires the item to end with ".reference.srt" AND the base part to match old_base_name
-            elif (item_name.lower().endswith(special_ext.lower())
-                  and item_name[:-len(special_ext)] == old_base_name):
-                new_item_name = new_base_name + special_ext
-
-            elif current_base2 == old_base_name:
-                new_item_name = new_base_name + extension2
-
-            # --- Rule 3: General Case - Base Name Match ---
-            # Applies if the non-extension part matches the intended old base name,
-            # and was not caught by the specific rules above.
-            elif current_base == old_base_name:
-                # General Case: New name is new_base_name + original extension
-                new_item_name = new_base_name + extension
-
-            # 4. If no matching rule was triggered, skip this one
+            new_item_name = renamed_name(item_name)
             if not new_item_name:
                 continue
 
-            # 5. Perform the rename operation
-            full_new_path = os.path.join(root, new_item_name)
+            full_old_path = entry.path
+            full_new_path = os.path.join(directory, new_item_name)
+            is_dir = entry.is_dir(follow_symlinks=False)
             try:
-                if os.path.basename(item_name) not in trashes:
-                    os.rename(full_old_path, full_new_path)
-                    ops.append(f"rename {full_old_path!r} {full_new_path!r}")
-            except Exception as e:
-                # Handle potential errors (e.g., permission errors, file in use)
-                ops.append(f"ERR: rename '{full_old_path}' '{full_new_path}': {e}")
+                _rename_no_clobber(full_old_path, full_new_path, is_dir)
+            except FileExistsError:
+                ops.append(
+                    f"ERROR: refusing to overwrite existing {full_new_path!r}")
+                continue
+            except OSError as exc:
+                ops.append(
+                    f"ERROR: rename {full_old_path!r} {full_new_path!r}: {exc}")
+                continue
+
+            ops.append(f"rename {full_old_path!r} {full_new_path!r}")
+            if is_dir:
+                walk(full_new_path)
+
+    walk(old_dir)
     return ops

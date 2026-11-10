@@ -745,7 +745,7 @@ So, the metadata is technically accurate per the encoding strategy.
 
 For those video files for which the needed components cannot be determined, it changes resolution or codec if those parts are both found and are now wrong.
 
-Companion files, like .srt files, and folders who share the same basename w/o the extension(s), will be renamed also if the video file was renamed.
+Companion files, like .srt files, and folders that share the same basename without the extension(s), are renamed too when the video file is renamed. Renaming descends into those matching folders (for example `Show.S01E01.cache/`) so embedded/reference subtitles follow the video, but unrelated subdirectories are left untouched and existing files are never overwritten.
 
 ### Intelligent Quality Adjustment
 
