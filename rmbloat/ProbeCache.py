@@ -19,8 +19,35 @@ from typing import Optional, Dict, Any, List
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 
+from .IniManager import IniManager
+
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60
+
+# Default probe-cache filename.  Exposed so CLI wrappers (rmbloatd) can derive
+# the instance-lock path without duplicating the string.
+DEFAULT_CACHE_FILE_NAME = "video_probes.json"
+
+
+def default_cache_dir():
+    """
+    Returns the directory rmbloat uses for its probe cache.
+
+    The application passes the directory holding ``config.ini``
+    (``~/.config/rmbloat``), so the cache and its ``.lock`` file live next to
+    the rest of the per-user state rather than in the shared ``/tmp``.
+    """
+    return str(IniManager.default_config_dir("rmbloat"))
+
+
+def default_lock_path(cache_file_name=DEFAULT_CACHE_FILE_NAME):
+    """
+    Returns the path of the single-instance lock used by :class:`ProbeCache`.
+
+    This is the exact path the application acquires, so external tools such as
+    ``rmbloatd`` can detect a running instance without hardcoding it.
+    """
+    return os.path.join(default_cache_dir(), cache_file_name) + ".lock"
 
 
 @dataclass(slots=True)
@@ -51,7 +78,11 @@ class ProbeCache:
     disk_fields = set(('folder last_seen anomaly width height codec bitrate fps'
                       ' duration size_bytes color_spt customs pix_fmt streams').split())
 
-    def __init__(self, cache_file_name="video_probes.json", cache_dir_name="/tmp", chooser=None):
+    def __init__(self, cache_file_name=DEFAULT_CACHE_FILE_NAME, cache_dir_name=None,
+                 chooser=None):
+        if cache_dir_name is None:
+            cache_dir_name = default_cache_dir()
+            os.makedirs(cache_dir_name, exist_ok=True)
         self.cache_path = os.path.join(cache_dir_name, cache_file_name)
         self.lock_path = self.cache_path + ".lock"
         self.cache_data: Dict[str, Dict[str, Any]] = {}  # abs_path -> {size_str -> probe_dict}

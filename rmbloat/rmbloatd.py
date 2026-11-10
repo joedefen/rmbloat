@@ -4,6 +4,14 @@ import os
 import sys
 import shlex
 
+if __package__ in (None, ""):
+    # Executed directly (``python rmbloat/rmbloatd.py``): make the package
+    # importable so the lock path stays in sync with the application.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from rmbloat.ProbeCache import default_lock_path
+else:
+    from .ProbeCache import default_lock_path
+
 BASH_SCRIPT_CONTENT = """#!/usr/bin/env bash
 # rmbloatd.sh
 # A dedicated tmux wrapper script to manage a persistent, long-running
@@ -105,10 +113,11 @@ d_stop() {
 }
 
 is_daemon_running_anywhere() {
-    # Check if rmbloat is running anywhere (including outside tmux)
-    # by checking for the existence of its lock file
-    # Lock file location: /tmp/video_probes.json.lock (ProbeCache default)
-    local LOCK_FILE="/tmp/video_probes.json.lock"
+    # Check if rmbloat is running anywhere (including outside tmux) by testing
+    # the ProbeCache single-instance lock.  The Python wrapper injects the
+    # authoritative path (ProbeCache.default_lock_path) via RMBLOAT_LOCK_FILE;
+    # the fallback matches the app default (config dir), not /tmp.
+    local LOCK_FILE="${RMBLOAT_LOCK_FILE:-$HOME/.config/rmbloat/video_probes.json.lock}"
 
     if [ -f "$LOCK_FILE" ]; then
         # Lock file exists - check if it's actually locked (not stale)
@@ -218,6 +227,10 @@ def main():
         env['RMBLOAT_ARGS'] = ' '.join(shlex.quote(arg) for arg in rmbloat_args)
     else:
         env['RMBLOAT_ARGS'] = ''
+
+    # The app acquires its probe-cache lock in the config directory; pass the
+    # same path to the shell script so duplicate-instance detection works.
+    env['RMBLOAT_LOCK_FILE'] = default_lock_path()
 
     # Replace the current process with the new command
     try:

@@ -6,6 +6,8 @@ PersistentState class for saving user preferences
 import json
 from pathlib import Path
 
+from .IniManager import IniManager
+
 
 class PersistentState:
     """Manages persistent state for user preferences"""
@@ -17,7 +19,7 @@ class PersistentState:
             config_path: Path to config file (default: ~/.config/rmbloat/state.json)
         """
         if config_path is None:
-            config_dir = Path.home() / '.config' / 'rmbloat'
+            config_dir = IniManager.default_config_dir('rmbloat')
             config_dir.mkdir(parents=True, exist_ok=True)
             config_path = config_dir / 'state.json'
 

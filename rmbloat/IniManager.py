@@ -71,11 +71,22 @@ class IniManager:
         if is_file_missing_or_mismatch:
             self.write()
 
+    @staticmethod
+    def default_config_dir(app_name):
+        """
+        Returns the conventional per-user configuration directory for ``app_name``.
+
+        This is the single source of truth for where rmbloat keeps its
+        ``config.ini``, ``state.json``, and probe cache (and therefore the
+        probe-cache lock file).  Callers that need to locate those files
+        without constructing an :class:`IniManager` (e.g. the ``rmbloatd``
+        wrapper) should use this helper too.
+        """
+        return Path.home() / ".config" / app_name
+
     def _determine_config_path(self):
         """Calculates the full path to the config.ini file."""
-        home_dir = Path.home()
-        app_dir = home_dir / ".config" / self.app_name
-        return app_dir / 'config.ini'
+        return self.default_config_dir(self.app_name) / 'config.ini'
 
     def _ensure_directory_exists(self):
         """Creates the application configuration directory if it doesn't exist."""

@@ -107,7 +107,7 @@ class Converter:
     SKIP_PREFIXES = ConvertUtils.SKIP_PREFIXES
     singleton = None
 
-    def __init__(self, opts, cache_dir='/tmp', ini=None):
+    def __init__(self, opts, cache_dir=None, ini=None):
         assert Converter.singleton is None
         Converter.singleton = self
         self.win = None
