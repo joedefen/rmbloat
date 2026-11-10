@@ -12,6 +12,7 @@ import tempfile
 import time
 import shutil
 import argparse
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from types import SimpleNamespace
@@ -113,7 +114,13 @@ class FfmpegChooser:
             )
         except subprocess.TimeoutExpired:
             return None
-        except FileNotFoundError:
+        except OSError as exc:
+            # A missing executable, a permission error (EACCES), or any other
+            # OS-level failure (ENOMEM, EMFILE, ...) must be treated like an
+            # unusable command, not allowed to abort startup detection.
+            if not self.quiet:
+                command = cmd[0] if cmd else 'command'
+                print(f"  ✗ Could not run {command}: {exc}")
             return None
 
     def _detect_system_ffmpeg(self) -> None:
@@ -1008,16 +1015,18 @@ class FfmpegChooser:
                 quiet=True
             )
 
-            # Build output filename
-            # For Docker, output must be in the same dir as input (mounted workdir)
-            # For system, can use output_dir
+            # Build a unique output filename.  Never reuse (or unlink) a
+            # ``test_<strategy>.mkv`` in the source directory: that name can
+            # belong to a user file or a previous run, so deleting it would
+            # destroy data.  Docker encodes must stay in the input directory
+            # because only that directory is mounted into the container;
+            # system encodes can use ``output_dir``.
             if strategy.startswith('docker'):
-                output_file = video_path.parent / f"test_{strategy}.mkv"
+                test_dir = video_path.parent
             else:
-                output_file = Path(output_dir) / f"test_{strategy}.mkv"
-
-            if output_file.exists():
-                output_file.unlink()
+                test_dir = Path(output_dir)
+            output_file = test_dir / (
+                f".rmbloat-test-{strategy}-{os.getpid()}-{uuid.uuid4().hex[:8]}.mkv")
 
             # Create encoding parameters
             try:
@@ -1062,10 +1071,6 @@ class FfmpegChooser:
                     }
                     print(f"  ✗ Failed: {error_msg[:100]}...")
 
-                # Clean up output file
-                if output_file.exists():
-                    output_file.unlink()
-
             except subprocess.TimeoutExpired:
                 results[strategy] = {
                     'success': False,
@@ -1082,6 +1087,14 @@ class FfmpegChooser:
                     'error': str(e)
                 }
                 print(f"  ✗ Error: {e}")
+            finally:
+                # Remove only the file this test created (including a partial
+                # file left behind by a timeout).  Pre-existing files, such as
+                # a user's own ``test_<strategy>.mkv``, are never touched.
+                try:
+                    output_file.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"  ✗ Could not remove test output {output_file}: {exc}")
 
         # Print summary
         print("\n" + "="*60)
