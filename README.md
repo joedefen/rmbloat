@@ -261,7 +261,7 @@ options:
   --auto-hr AUTO_HR     Auto mode: run unattended for specified hours,
                         auto-select [X] files and auto-start conversions
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
-  -L, --logs            view the logs
+  -L, --logs            view the logs (requires 'less')
   -T, --chooser-tests   run tests on ffmpeg choices w 120s cvt of 1st given
                         video
   ```
@@ -794,7 +794,7 @@ Software and hardware encoders use different quality scales:
 - A 4K video with `-q 28` using hardware acceleration would encode at approximately QP 32 (28 + 2 for resolution + 2 for hardware mapping), efficiently compressing the high pixel count while maintaining excellent visual quality.
 
 ### Logging (--logs)
-When a conversion completes successfully or not, details are logged into private files in your `$XDG_STATE_HOME/rmbloat` folder (`~/.local/state/rmbloat` by default). The log directory is mode 0700 and `events.jsonl` is mode 0600 because log entries contain media paths and ffmpeg output. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
+When a conversion completes successfully or not, details are logged into private files in your `$XDG_STATE_HOME/rmbloat` folder (`~/.local/state/rmbloat` by default). The log directory is mode 0700 and `events.jsonl` is mode 0600 because log entries contain media paths and ffmpeg output. `rmbloat --logs` pages that file with `less -R +F` (escape sequences rendered, new entries followed), so `less` must be installed; if it is missing the command says so and exits non-zero instead of failing obscurely. Without `less` you can still read the raw JSON Lines file directly, or pipe it through any pager: `less -R "$XDG_STATE_HOME/rmbloat/events.jsonl"` (defaulting to `~/.local/state`).
 
 ### Performance and Server Impact
 By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering its priority. This will (in our experience) allow the server to run rather well.  But, your experience may vary.

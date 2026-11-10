@@ -54,7 +54,10 @@ class LogsCommandRegressionTests(unittest.TestCase):
         self.assertEqual(paths, [str(self.rmbloat.lg.log_file)])
         self.assertTrue(os.path.isfile(paths[0]))
 
-        with mock.patch('os.execvp', side_effect=SystemExit(0)) as execvp:
+        # Pretend `less` is installed so the test does not depend on the host.
+        with mock.patch.object(self.rmbloat.shutil, 'which',
+                               return_value='/usr/bin/less'), \
+                mock.patch('os.execvp', side_effect=SystemExit(0)) as execvp:
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     self.rmbloat.main(['--logs'])
@@ -90,7 +93,10 @@ class LogsCommandRegressionTests(unittest.TestCase):
                 self.rmbloat.StructuredLogger, 'log_paths',
                 new_callable=mock.PropertyMock,
                 return_value=[existing, missing]):
-            with mock.patch('os.execvp', side_effect=SystemExit(0)) as execvp:
+            with mock.patch.object(self.rmbloat.shutil, 'which',
+                                   return_value='/usr/bin/less'), \
+                    mock.patch('os.execvp',
+                               side_effect=SystemExit(0)) as execvp:
                 with contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaises(SystemExit):
                         self.rmbloat.main(['--logs'])
@@ -98,6 +104,26 @@ class LogsCommandRegressionTests(unittest.TestCase):
         # The missing second path must be filtered out, not indexed blindly.
         execvp.assert_called_once_with(
             'less', ['less', '-R', '+F', existing])
+
+    def test_logs_requires_less_and_says_so(self):
+        """A missing `less` must be reported clearly, not exec-attempted."""
+        self.rmbloat.lg.info('entry that must not be paged')
+        log_path = str(self.rmbloat.lg.log_file)
+
+        stderr = io.StringIO()
+        with mock.patch.object(self.rmbloat.shutil, 'which',
+                               return_value=None), \
+                mock.patch('os.execvp') as execvp, \
+                contextlib.redirect_stderr(stderr), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                self.rmbloat.main(['--logs'])
+
+        self.assertEqual(raised.exception.code, 1)
+        execvp.assert_not_called()
+        self.assertIn("'less' is required to view the logs", stderr.getvalue())
+        self.assertIn('sudo apt install less', stderr.getvalue())
+        self.assertIn(log_path, stderr.getvalue())
 
 
 if __name__ == '__main__':

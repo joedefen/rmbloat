@@ -17,6 +17,7 @@ import traceback
 import re
 import atexit
 import signal
+import shutil
 import time
 import json
 import curses
@@ -1789,7 +1790,7 @@ def main(args=None) -> int:
                     help='produce 30s samples named SAMPLE.<crf>.<output> '
                          'next to each input file')
         parser.add_argument('-L', '--logs', action='store_true',
-                    help='view the logs')
+                    help="view the logs (requires 'less')")
         parser.add_argument('-T', '--chooser-tests', action='store_true',
                     help='run tests on ffmpeg choices w 120s cvt of 1st given video')
 
@@ -1838,6 +1839,18 @@ def main(args=None) -> int:
             if not files:
                 print(f"No log file found at: {lg.log_file}", file=sys.stderr)
                 sys.exit(1)
+            # `less` is the viewer: it renders the ANSI sequences embedded in
+            # ffmpeg output and can follow appended entries.  Check for it
+            # before exec-ing so the requirement is stated plainly instead of
+            # surfacing as a bare "Executable ... not found" from the attempt.
+            if shutil.which('less') is None:
+                print(
+                    "Error: 'less' is required to view the logs but was not "
+                    "found on PATH.\n"
+                    "Install it (for example 'sudo apt install less') or read "
+                    f"the log directly: {files[0]}",
+                    file=sys.stderr)
+                sys.exit(1)
             # -R renders ANSI escape sequences (e.g. ffmpeg output) instead of
             # showing their raw bytes; +F follows appended entries.
             cmd = ['less', '-R', '+F'] + files
@@ -1845,11 +1858,8 @@ def main(args=None) -> int:
                 program = cmd[0]
                 # This call replaces the current Python process
                 os.execvp(program, cmd)
-            except FileNotFoundError:
-                print(f"Error: Executable '{program}' not found.", file=sys.stderr)
-                sys.exit(1)
             except Exception as e:
-                # Catch any other execution errors
+                # Catch any execution error that survives the PATH check
                 print(f"An error occurred during exec: {e}", file=sys.stderr)
                 sys.exit(1)
         if opts.chooser_tests:
