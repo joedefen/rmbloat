@@ -9,12 +9,26 @@ Job handling for video conversion - manages transcoding jobs and progress monito
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 import send2trash
 from .Models import Job, Vid
 from .ConvertUtils import bash_quote
 from . import FileOps
 from .TranscodeThread import TranscodeThread
+
+
+def _unique_path(path):
+    """Return *path*, or a numbered variant if that name is already taken."""
+    if not os.path.lexists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    for index in range(1, 10000):
+        candidate = f"{root}.{index}{ext}"
+        if not os.path.lexists(candidate):
+            return candidate
+    raise FileExistsError(f"could not find a free filename for {path!r}")
+
 
 def emergency_cleanup(self):
     """Call this on crash or KeyboardInterrupt"""
@@ -596,7 +610,21 @@ class JobHandler:
                     success = False
                     vid.doit = 'ERR'
 
-        # 3. Handle Vitals for Auto Mode
+        # 3. File Swaps or Cleanup
+        # A failed swap means the transcode itself was fine but we could not
+        # safely install the result. Never report that as success, and never
+        # delete the temp output in that case (it may be the only copy of the
+        # newly encoded data).
+        swap_ok = True
+        if success and not self.opts.sample:
+            swap_ok = self._execute_file_swap(vid, job)
+            if not swap_ok:
+                success = False
+                vid.doit = 'ERR'
+        elif success and self.opts.sample:
+            vid.basename1 = job.temp_file
+
+        # 4. Handle Vitals for Auto Mode
         if self.auto_mode_enabled:
             if success and not self.opts.sample:
                 self.ok_count += 1
@@ -605,17 +633,16 @@ class JobHandler:
                 self.error_count += 1
                 self.consecutive_failures += 1
 
-        # 4. File Swaps or Cleanup
-        if success and not self.opts.sample:
-            self._execute_file_swap(vid, job) # Moved to helper for clarity
-        elif success and self.opts.sample:
-            vid.basename1 = job.temp_file
-        elif not success:
+        if not success and swap_ok:
             if os.path.exists(job.temp_file):
                 os.remove(job.temp_file)
                 if not vid.ops:
                     vid.ops.append(f"CLEANUP: Deleted {job.temp_file} - Job failed or rejected.")
             self.probe_cache.set_anomaly(vid.filepath, 'Err')
+
+        if not swap_ok:
+            probe = None
+
         self.temp_file = None # so ataxit does not see it
 
         return probe
@@ -662,6 +689,11 @@ class JobHandler:
         Handles the actual file system dance:
         Original -> ORIG backup/Trash
         TEMP -> Original Filename
+
+        The operation is transactional: the original is moved aside first and
+        restored if the new file cannot be installed. Returns True only when
+        the output is safely in place. A failed swap leaves the original (or a
+        uniquely named rollback copy) and the transcoded temp file intact.
         """
         def finalize_standard_name(vid, job):
             """
@@ -695,55 +727,134 @@ class JobHandler:
             if placeholder in vid.standard_name:
                 vid.standard_name = vid.standard_name.replace(placeholder, new_tag)
 
+        def restore_original(rollback_file, basename):
+            """Put the original back in place after a failed installation."""
+            try:
+                os.rename(rollback_file, basename)
+                vid.ops.append(f"ROLLBACK: restored {rollback_file!r} to {basename!r}")
+            except OSError as why:
+                vid.ops.append(
+                    f"CRITICAL: could not restore original from {rollback_file!r}: {why}")
+
         #######################
 
-        trashes = set()
         basename = os.path.basename(vid.filepath)
 
         # 1. Preserve timestamps from the original file
         timestamps = FileOps.preserve_timestamps(basename)
 
+        # 2. Verify the output *before* touching the original. A zero-byte or
+        #    missing temp file must never cost us the original.
+        if not os.path.isfile(job.temp_file):
+            vid.ops.append(f"ERROR: transcoded temp file missing: {job.temp_file!r}")
+            return False
         try:
-            # 2. Handle the Original File (Move to ORIG or Trash)
-            if self.opts.keep_backup:
-                os.rename(basename, job.orig_backup_file)
-                vid.ops.append(f"rename {basename!r} {job.orig_backup_file!r}")
-            else:
-                try:
-                    trashes.add(basename)
-                    if self.opts.use_trash:
-                        send2trash.send2trash(basename)
-                        vid.ops.append(f"trash {basename!r}")
-                    else:
-                        os.unlink(basename)
-                        vid.ops.append(f"unlink {basename!r}")
-                except Exception as why:
-                    if self.opts.use_trash:
-                        vid.ops.append(f"ERROR during send2trash of {basename!r}: {why}")
-                        vid.ops.append("ERROR: using os.unlink() instead")
-                        os.unlink(basename)
-                        vid.ops.append(f"unlink {basename!r}")
-
-            # finalize the standard name
-            finalize_standard_name(vid, job)
-            # 3. Move the Transcoded TEMP file to the final name
-            os.rename(job.temp_file, vid.standard_name)
-            vid.ops.append(f"rename {job.temp_file!r} {vid.standard_name!r}")
-
-            # 4. Move probe cache entry to final path so it doesn't need re-probing
-            final_path = os.path.abspath(vid.standard_name)
-            self.probe_cache.move_entry(job.temp_file, final_path)
-
-            # 5. Handle bulk rename if needed (e.g., matching subtitle files)
-            if vid.do_rename:
-                vid.ops += FileOps.bulk_rename(basename, vid.standard_name, trashes)
-
-            # 6. Restore original timestamps to the new file
-            FileOps.apply_timestamps(vid.standard_name, timestamps)
-
-            # 7. Update Vid object for UI reference
-            vid.basename1 = vid.standard_name
-
+            if os.path.getsize(job.temp_file) <= 0:
+                vid.ops.append(f"ERROR: transcoded temp file is empty: {job.temp_file!r}")
+                return False
         except OSError as e:
+            vid.ops.append(f"ERROR: cannot inspect temp file {job.temp_file!r}: {e}")
+            return False
+
+        # 3. Compute the final name and refuse to overwrite a pre-existing file.
+        finalize_standard_name(vid, job)
+        final_name = vid.standard_name
+        same_path = os.path.abspath(final_name) == os.path.abspath(basename)
+
+        if not same_path and os.path.lexists(final_name):
+            vid.ops.append(
+                f"ERROR: refusing to overwrite existing destination {final_name!r}")
+            return False
+
+        # 4. Move the original aside. This is our rollback record and happens
+        #    before the new file is installed, so a later failure cannot lose it.
+        try:
+            if self.opts.keep_backup:
+                rollback_file = _unique_path(job.orig_backup_file)
+            else:
+                rollback_file = _unique_path(
+                    f".rmbloat-rollback-{uuid.uuid4().hex}.{basename}")
+            os.rename(basename, rollback_file)
+            vid.ops.append(f"rename {basename!r} {rollback_file!r}")
+        except OSError as e:
+            vid.ops.append(f"ERROR: could not move original {basename!r} aside: {e}")
+            return False
+
+        # 5. Install the transcoded file. Prefer a hard link so an existing
+        #    destination can never be silently replaced (os.rename overwrites
+        #    on POSIX). Fall back to rename on filesystems without hard links;
+        #    the destination was already checked above.
+        try:
+            installed_via_link = True
+            try:
+                os.link(job.temp_file, final_name)
+            except FileExistsError:
+                raise
+            except (OSError, NotImplementedError):
+                installed_via_link = False
+
+            if installed_via_link:
+                vid.ops.append(f"link {job.temp_file!r} {final_name!r}")
+                try:
+                    os.unlink(job.temp_file)
+                except OSError as why:
+                    vid.ops.append(
+                        f"WARNING: could not remove temp name {job.temp_file!r}: {why}")
+            else:
+                os.rename(job.temp_file, final_name)
+                vid.ops.append(f"rename {job.temp_file!r} {final_name!r}")
+        except FileExistsError:
+            restore_original(rollback_file, basename)
+            vid.ops.append(
+                f"ERROR: destination {final_name!r} appeared during the swap; refusing to overwrite")
+            vid.ops.append(f"Transcoded output kept at {job.temp_file!r}")
+            return False
+        except OSError as e:
+            restore_original(rollback_file, basename)
             vid.ops.append(f"ERROR during swap of {vid.filepath}: {e}")
-            vid.ops.append(f"Original: {job.orig_backup_file}, New: {job.temp_file}. Manual cleanup required.")
+            vid.ops.append(
+                f"Transcoded output kept at {job.temp_file!r}; original preserved")
+            return False
+
+        # 6. The destination is safely in place; now dispose of the original.
+        if self.opts.keep_backup:
+            if rollback_file != job.orig_backup_file:
+                vid.ops.append(
+                    f"NOTE: backup already existed; saved original as {rollback_file!r}")
+        elif self.opts.use_trash:
+            try:
+                send2trash.send2trash(rollback_file)
+                vid.ops.append(f"trash {rollback_file!r}")
+            except Exception as why:
+                # Never permanently delete a file after the user asked for the
+                # trash. Keep the rollback copy and make the problem visible.
+                vid.ops.append(f"ERROR during send2trash of {rollback_file!r}: {why}")
+                vid.ops.append(
+                    f"Original preserved at {rollback_file!r}; not permanently deleted")
+        else:
+            try:
+                os.unlink(rollback_file)
+                vid.ops.append(f"unlink {rollback_file!r}")
+            except OSError as why:
+                vid.ops.append(f"ERROR unlinking original {rollback_file!r}: {why}")
+                vid.ops.append(f"Original preserved at {rollback_file!r}")
+
+        # 7. Move probe cache entry to final path so it doesn't need re-probing
+        try:
+            final_path = os.path.abspath(final_name)
+            self.probe_cache.move_entry(job.temp_file, final_path)
+        except Exception as why:
+            vid.ops.append(f"WARNING: could not move probe-cache entry: {why}")
+
+        # 8. Handle bulk rename if needed (e.g., matching subtitle files)
+        if vid.do_rename:
+            trashes = {os.path.basename(rollback_file)}
+            vid.ops += FileOps.bulk_rename(basename, final_name, trashes)
+
+        # 9. Restore original timestamps to the new file
+        if not FileOps.apply_timestamps(final_name, timestamps):
+            vid.ops.append(f"WARNING: could not restore timestamps on {final_name!r}")
+
+        # 10. Update Vid object for UI reference
+        vid.basename1 = final_name
+        return True

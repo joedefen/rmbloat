@@ -365,13 +365,18 @@ class Converter:
                 # 3. Job is finally finished (Final Success or Final Error)
                 # 'report' here is the final status code string (e.g., ' OK', 'ERR', 'OK2')
                 vid = self.job.vid
-                vid.doit = vid.doit_auto = report
 
                 # Final Reap: Clean up files, analyze logs, apply probes
                 # success is calculated inside finish_transcode_job now
                 probe = self.job_handler.finish_transcode_job(self.job)
                 if probe:
                     self.job.vid.probe1 = self.apply_probe(self.job.vid, probe)
+
+                # finish_transcode_job() can downgrade an FFmpeg success to an
+                # error (e.g. the original could not be replaced safely).
+                if vid.doit == 'ERR':
+                    report = 'ERR'
+                vid.doit = vid.doit_auto = report
 
                 # Final Logging (moved from old_advance_jobs)
                 self._log_job_final(self.job, report)

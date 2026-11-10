@@ -67,12 +67,17 @@ def human_readable_size(size_bytes: int) -> str:
 def is_valid_video_file(filename):
     """
     Checks if a file meets all the criteria:
-    1. Does not start with 'TEMP.' or 'ORIG.'.
+    1. Its basename does not start with one of SKIP_PREFIXES
+       ('TEMP.', 'ORIG.' or 'SAMPLE.').
     2. Has a common video file extension (case-insensitive).
+
+    Callers pass full/absolute paths, so the prefix check must be applied to
+    the basename only.  Checking the whole path (as an absolute path never
+    starts with 'TEMP.' etc.) silently disabled the filter.
     """
 
-    # 1. Check for prefixes to skip
-    if filename.startswith(SKIP_PREFIXES):
+    # 1. Check for prefixes to skip, using the file name without directories
+    if os.path.basename(filename).startswith(SKIP_PREFIXES):
         return False
 
     # Get the file extension and convert to lowercase for case-insensitive check

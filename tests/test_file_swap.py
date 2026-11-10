@@ -1,0 +1,311 @@
+"""Regression tests for audit finding C7: the original-file swap must be safe.
+
+Previously ``_execute_file_swap()`` trashed or unlinked the original *before*
+renaming the transcoded temp file into place. A failing final rename therefore
+destroyed the only copy of the original, while the caller still logged the job
+as ``OK``. ``send2trash`` failures also silently degraded to a permanent
+``os.unlink()``.
+
+These tests exercise the filesystem transaction directly (no ffmpeg/curses) and
+verify that:
+
+* a missing/empty temp file and a pre-existing destination abort untouched;
+* a failed installation restores the original and keeps the temp output;
+* a trash failure never permanently deletes the original;
+* ``finish_transcode_job()`` downgrades a failed swap to ``ERR``.
+"""
+
+import contextlib
+import importlib
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+class _Dummy:
+    """Minimal stand-in for console_window classes."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+@contextlib.contextmanager
+def stubbed_runtime_dependencies():
+    """Install fake third-party modules for the duration of the import."""
+    previous = {}
+
+    def install(name, **attributes):
+        previous[name] = sys.modules.get(name)
+        module = types.ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        sys.modules[name] = module
+        return module
+
+    console_window = install('console_window')
+    for name in ('ConsoleWindow', 'OptionSpinner', 'Screen', 'ScreenStack',
+                 'ConsoleWindowOpts', 'IncrementalSearchBar', 'Context',
+                 'Theme'):
+        setattr(console_window, name, type(name, (_Dummy,), {}))
+
+    ruamel = install('ruamel')
+    ruamel_yaml = install('ruamel.yaml', YAML=_Dummy)
+    ruamel.yaml = ruamel_yaml
+
+    install('send2trash', send2trash=lambda *args, **kwargs: None)
+
+    try:
+        yield
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+with stubbed_runtime_dependencies():
+    from rmbloat import JobHandler as JobHandlerModule
+    from rmbloat import rmbloat as RmbloatModule
+
+
+def purge_rmbloat_modules():
+    """Drop cached rmbloat modules so tests never share mutable state."""
+    for name in list(sys.modules):
+        if name == 'rmbloat' or name.startswith('rmbloat.'):
+            sys.modules.pop(name, None)
+
+
+class FileSwapTests(unittest.TestCase):
+    """The swap must preserve data and report failure instead of losing files."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+        os.chdir(self.root)
+
+        self.opts = types.SimpleNamespace(
+            keep_backup=False,
+            use_trash=False,
+            sample=False,
+            quality=28,
+            allowed_codecs='x265',
+            min_shrink_pct=10,
+        )
+        self.probe_cache = mock.Mock()
+        self.handler = JobHandlerModule.JobHandler(
+            self.opts, chooser=None, probe_cache=self.probe_cache,
+            auto_mode_enabled=False)
+
+        self.original_name = 'movie.mkv'
+        self.temp_name = 'TEMP.movie.crf28.recode.mkv'
+        self.final_name = 'movie.crf28.recode.mkv'
+
+    # ------------------------------------------------------------------ helpers
+    def write_file(self, name, payload):
+        path = self.root / name
+        path.write_bytes(payload)
+        return path
+
+    def make_vid(self):
+        return types.SimpleNamespace(
+            filepath=str(self.root / self.original_name),
+            standard_name=self.final_name,
+            basename1=None,
+            do_rename=False,
+            ops=[],
+            runs=[types.SimpleNamespace(command='-crf 28', return_code=0, texts=[])],
+        )
+
+    def make_job(self):
+        return types.SimpleNamespace(
+            temp_file=self.temp_name,
+            orig_backup_file='ORIG.movie.mkv',
+            is_software_fallback=False,
+        )
+
+    def rollback_files(self):
+        return list(self.root.glob('.rmbloat-rollback-*'))
+
+    # ------------------------------------------------------------------- tests
+    def test_success_replaces_original_and_removes_temp(self):
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+
+        ok = self.handler._execute_file_swap(self.make_vid(), self.make_job())
+
+        self.assertTrue(ok)
+        self.assertEqual((self.root / self.final_name).read_bytes(), b'new-data')
+        self.assertFalse((self.root / self.original_name).exists())
+        self.assertFalse((self.root / self.temp_name).exists())
+        self.assertEqual(self.rollback_files(), [])
+
+    def test_keep_backup_uses_unique_name_without_clobbering(self):
+        self.opts.keep_backup = True
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+        # A previous backup already occupies the normal name.
+        self.write_file('ORIG.movie.mkv', b'older-backup')
+
+        ok = self.handler._execute_file_swap(self.make_vid(), self.make_job())
+
+        self.assertTrue(ok)
+        self.assertEqual((self.root / self.final_name).read_bytes(), b'new-data')
+        self.assertEqual((self.root / 'ORIG.movie.mkv').read_bytes(), b'older-backup')
+        self.assertEqual((self.root / 'ORIG.movie.1.mkv').read_bytes(), b'original')
+
+    def test_existing_destination_aborts_without_touching_original(self):
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+        self.write_file(self.final_name, b'occupied')
+
+        ok = self.handler._execute_file_swap(self.make_vid(), self.make_job())
+
+        self.assertFalse(ok)
+        self.assertEqual((self.root / self.original_name).read_bytes(), b'original')
+        self.assertEqual((self.root / self.temp_name).read_bytes(), b'new-data')
+        self.assertEqual((self.root / self.final_name).read_bytes(), b'occupied')
+        self.assertEqual(self.rollback_files(), [])
+
+    def test_missing_or_empty_temp_aborts_without_touching_original(self):
+        self.write_file(self.original_name, b'original')
+
+        vid = self.make_vid()
+        self.assertFalse(self.handler._execute_file_swap(vid, self.make_job()))
+        self.assertEqual((self.root / self.original_name).read_bytes(), b'original')
+
+        self.write_file(self.temp_name, b'')
+        vid = self.make_vid()
+        self.assertFalse(self.handler._execute_file_swap(vid, self.make_job()))
+        self.assertEqual((self.root / self.original_name).read_bytes(), b'original')
+
+    def test_failed_install_restores_original_and_keeps_temp(self):
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+        real_rename = os.rename
+
+        def failing_rename(src, dst):
+            if src == self.temp_name:
+                raise OSError('simulated disk full')
+            return real_rename(src, dst)
+
+        vid = self.make_vid()
+        with mock.patch.object(JobHandlerModule.os, 'rename',
+                               side_effect=failing_rename), \
+                mock.patch.object(JobHandlerModule.os, 'link',
+                                  side_effect=OSError('hard links unavailable')):
+            ok = self.handler._execute_file_swap(vid, self.make_job())
+
+        self.assertFalse(ok)
+        self.assertEqual((self.root / self.original_name).read_bytes(), b'original')
+        self.assertEqual((self.root / self.temp_name).read_bytes(), b'new-data')
+        self.assertFalse((self.root / self.final_name).exists())
+        self.assertEqual(self.rollback_files(), [])
+        self.assertTrue(any('ROLLBACK' in op for op in vid.ops))
+        self.assertTrue(any('Transcoded output kept' in op for op in vid.ops))
+
+    def test_destination_race_is_not_overwritten(self):
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+
+        def racing_link(src, dst):
+            Path(dst).write_bytes(b'racer')
+            raise FileExistsError(dst)
+
+        vid = self.make_vid()
+        with mock.patch.object(JobHandlerModule.os, 'link',
+                               side_effect=racing_link):
+            ok = self.handler._execute_file_swap(vid, self.make_job())
+
+        self.assertFalse(ok)
+        self.assertEqual((self.root / self.original_name).read_bytes(), b'original')
+        self.assertEqual((self.root / self.final_name).read_bytes(), b'racer')
+        self.assertEqual((self.root / self.temp_name).read_bytes(), b'new-data')
+
+    def test_send2trash_failure_never_permanently_deletes_original(self):
+        self.opts.use_trash = True
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+
+        vid = self.make_vid()
+        with mock.patch.object(JobHandlerModule.send2trash, 'send2trash',
+                               side_effect=RuntimeError('trash unavailable')):
+            ok = self.handler._execute_file_swap(vid, self.make_job())
+
+        self.assertTrue(ok)
+        self.assertEqual((self.root / self.final_name).read_bytes(), b'new-data')
+        preserved = self.rollback_files()
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].read_bytes(), b'original')
+        self.assertTrue(any('ERROR during send2trash' in op for op in vid.ops))
+        self.assertTrue(any('not permanently deleted' in op for op in vid.ops))
+
+    def test_finish_transcode_job_marks_failed_swap_as_error(self):
+        vid = types.SimpleNamespace(
+            filepath=str(self.root / self.original_name),
+            standard_name=self.final_name,
+            basename1=None,
+            do_rename=False,
+            ops=[],
+            gb=1.0,
+            net='  - ',
+            doit=' OK',
+            doit_auto=' OK',
+            probe0=types.SimpleNamespace(codec='h264'),
+            runs=[types.SimpleNamespace(
+                command='-crf 28', return_code=0, texts=[], descr='initial run')],
+        )
+        job = types.SimpleNamespace(
+            vid=vid,
+            temp_file=self.temp_name,
+            thread=types.SimpleNamespace(is_alive=lambda: False),
+        )
+        self.probe_cache.get.return_value = types.SimpleNamespace(gb=0.5)
+        self.handler._execute_file_swap = mock.Mock(return_value=False)
+
+        probe = self.handler.finish_transcode_job(job)
+
+        self.assertIsNone(probe)
+        self.assertEqual(vid.doit, 'ERR')
+
+    def test_advance_jobs_logs_a_failed_swap_as_error(self):
+        vid = types.SimpleNamespace(
+            filepath=str(self.root / self.original_name),
+            doit=' OK',
+            doit_auto=' OK',
+            probe1=None,
+        )
+        job = types.SimpleNamespace(vid=vid)
+        converter = object.__new__(RmbloatModule.Converter)
+        converter.job = job
+        converter.job_handler = mock.Mock()
+        converter.job_handler.check_job_status.return_value = (None, ' OK', True)
+
+        def finish_failed_swap(_job):
+            vid.doit = 'ERR'
+            return None
+
+        converter.job_handler.finish_transcode_job.side_effect = finish_failed_swap
+        converter._log_job_final = mock.Mock()
+        converter._manage_queue_and_auto_mode = mock.Mock()
+        converter.stack = types.SimpleNamespace(
+            curr=types.SimpleNamespace(num=RmbloatModule.CONVERT_ST))
+
+        converter.advance_jobs()
+
+        converter._log_job_final.assert_called_once()
+        self.assertEqual(converter._log_job_final.call_args[0][1], 'ERR')
+        self.assertEqual(vid.doit, 'ERR')
+        self.assertEqual(vid.doit_auto, 'ERR')
+
+
+if __name__ == '__main__':
+    unittest.main()

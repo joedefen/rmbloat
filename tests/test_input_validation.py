@@ -137,6 +137,40 @@ class CandidateVideoFileTests(unittest.TestCase):
         paths, _ = ConvertUtils.get_candidate_video_files([str(self.root)])
         self.assertEqual(paths, [movie])
 
+    def test_skip_prefixes_apply_to_absolute_directory_scan_paths(self):
+        # Regression for C6: the prefix filter used to run against the full
+        # absolute path, which never starts with 'TEMP.'/'ORIG.'/'SAMPLE.'.
+        movie = self.make_file('good.mkv')
+        for name in ('ORIG.foo.mkv', 'SAMPLE.foo.mkv', 'TEMP.foo.mkv'):
+            self.make_file(name)
+        paths, _ = ConvertUtils.get_candidate_video_files([str(self.root)])
+        self.assertEqual(paths, [movie])
+
+    def test_skip_prefixes_apply_to_absolute_file_arguments(self):
+        movie = self.make_file('good.mkv')
+        skipped = [self.make_file(name)
+                   for name in ('ORIG.foo.mkv', 'SAMPLE.foo.mkv',
+                                'TEMP.foo.mkv')]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            paths, _ = ConvertUtils.get_candidate_video_files(
+                skipped + [movie])
+        self.assertEqual(paths, [movie])
+        self.assertIn('skipping non-video file', stderr.getvalue())
+
+    def test_skip_prefix_check_uses_basename(self):
+        self.assertFalse(ConvertUtils.is_valid_video_file(
+            os.path.join(self.root, 'TEMP.foo.mkv')))
+        self.assertFalse(ConvertUtils.is_valid_video_file(
+            os.path.join(self.root, 'ORIG.foo.mkv')))
+        self.assertFalse(ConvertUtils.is_valid_video_file(
+            os.path.join(self.root, 'SAMPLE.foo.mkv')))
+        self.assertTrue(ConvertUtils.is_valid_video_file(
+            os.path.join(self.root, 'good.mkv')))
+        # Prefixes only matter at the start of the basename.
+        self.assertTrue(ConvertUtils.is_valid_video_file(
+            os.path.join(self.root, 'TEMP', 'good.mkv')))
+
 
 class BatchProbeNoneTests(unittest.TestCase):
     """`batch_get_or_probe()` must never hand callers a `None` probe."""
