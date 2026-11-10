@@ -281,34 +281,40 @@ class StructuredLogger:
                         except (json.JSONDecodeError, KeyError, ValueError):
                             pass  # Skip malformed entries
 
-            # Calculate effective age for each entry
+            # Calculate effective age for each entry.  ``index`` preserves the
+            # original file order for stable tie-breaking between equal ages.
             now = datetime.now()
-            weighted = []  # (effective_age_seconds, line, line_size)
-            for timestamp, level, line, line_size in entries:
+            weighted = []  # (effective_age_seconds, timestamp, index, line, line_size)
+            for index, (timestamp, level, line, line_size) in enumerate(entries):
                 age_seconds = (now - timestamp).total_seconds()
                 # ERRs age slower (kept longer)
                 effective_age = age_seconds / self.ERR_AGE_WEIGHT if level == 'ERR' else age_seconds
-                weighted.append((effective_age, line, line_size))
+                weighted.append((effective_age, timestamp, index, line, line_size))
 
-            # Sort by effective age (newest first = lowest age)
-            weighted.sort(key=lambda x: x[0])
+            # Sort by effective age (newest first = lowest age).  This order is
+            # only used to decide which entries survive; it is NOT chronological
+            # because ERR entries age slower than everything else.
+            weighted.sort(key=lambda item: item[0])
 
             # Target: keep newest entries until total size <= MAX_LOG_SIZE * TRIM_TO_RATIO
             target_size = int(self.MAX_LOG_SIZE * self.TRIM_TO_RATIO)
-            kept = []
+            kept = []  # (timestamp, index, line)
             total_size = 0
 
             # Keep newest entries (lowest effective age) until we hit target
-            for effective_age, line, line_size in weighted:
+            for _age, timestamp, index, line, line_size in weighted:
                 if total_size + line_size <= target_size:
-                    kept.append(line)
+                    kept.append((timestamp, index, line))
                     total_size += line_size
                 # else: discard (too old with weighted age)
 
-            # Write back (reverse to restore chronological order)
-            kept.reverse()
+            # Write back in real chronological order.  Reversing the weighted
+            # order (the old behaviour) put retained ERR lines after newer
+            # entries, so get_window_of_entries()/refresh_window() saw a
+            # non-chronological file.
+            kept.sort(key=lambda item: (item[0], item[1]))
             with open(self.log_file, 'w', encoding='utf-8') as f:
-                f.writelines(kept)
+                f.writelines(line for _timestamp, _index, line in kept)
 
             self.stats['last_trim'] = datetime.now()
 

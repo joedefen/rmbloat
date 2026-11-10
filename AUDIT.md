@@ -35,6 +35,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H5. Piped `-` input closed stdin when restoring the TTY** — Resolved in [`create_video_file_list()`](rmbloat/rmbloat.py:486). Closing the pipe frees fd 0, so `os.open('/dev/tty', os.O_RDONLY)` usually returns fd 0 itself. The old code then called `os.close(tty_fd)` unconditionally, closing fd 0 right after `sys.stdin = os.fdopen(0, 'r')` and leaving the interactive session with a closed descriptor. The restore path now skips `os.dup2()` and the cleanup `os.close()` when the TTY already landed on fd 0, and still duplicates-then-closes when it received a distinct descriptor. Regression coverage lives in [`tests/test_stdin_restore.py`](tests/test_stdin_restore.py): fd 0 is never closed in the reuse case, and a distinct fd is duplicated to 0 and then closed.
 
+- **H6. Log trimming wrote entries out of chronological order** — Resolved in [`_trim_log_file()`](rmbloat/StructuredLogger.py:258). Survivors are still chosen by effective age (so `ERR` entries age slower and are kept longer), but the file is now re-sorted by the real timestamp (with the original file index as a stable tie-breaker) before being written. The old `kept.reverse()` produced reverse-effective-age order, so old `ERR` lines could follow newer `OK` lines; [`get_window_of_entries()`](rmbloat/StructuredLogger.py:490) and [`refresh_window()`](rmbloat/StructuredLogger.py:534) then saw a non-chronological window. Regression coverage lives in [`tests/test_log_trim.py`](tests/test_log_trim.py): the oldest entry is an `ERR`, a newer `OK` is evicted by the size target, the retained file stays timestamp-sorted, and the resulting window remains chronological.
+
 ---
 
 # Critical findings
@@ -94,7 +96,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 5. **Stdin/TTY reopen closed the new stdin.** In [`create_video_file_list()`](rmbloat/rmbloat.py:486), `sys.stdin.close()` frees fd 0, so `os.open('/dev/tty')` typically returns fd 0 itself; the old code then closed fd 0 again, leaving `sys.stdin` backed by a closed descriptor and breaking piped `-` input after startup. **Resolved** — see the H5 entry under “Resolved findings”.
 
-6. **Log trimming scrambles chronological order.** [`_trim_log_file()`](rmbloat/StructuredLogger.py:293) sorts by weighted age, keeps newest, then `reverse()`s the effective-age order, which is not the timestamp order. Reproduced: all old `ERR` lines ended up after newer `OK` lines. [`get_window_of_entries()`](rmbloat/StructuredLogger.py:484) and [`refresh_window()`](rmbloat/StructuredLogger.py:528) assume chronology, so the History screen and incremental reads become incorrect after a trim.
+6. **Log trimming scrambled chronological order.** [`_trim_log_file()`](rmbloat/StructuredLogger.py:258) sorted by weighted age, kept newest, then `reverse()`d the effective-age order, which is not the timestamp order: old `ERR` lines ended up after newer `OK` lines, and [`get_window_of_entries()`](rmbloat/StructuredLogger.py:490)/[`refresh_window()`](rmbloat/StructuredLogger.py:534) assume chronology. **Resolved** — see the H6 entry under “Resolved findings”.
 
 7. **Unbounded ffmpeg log capture.** [`run_ffmpeg()`](rmbloat/TranscodeThread.py:114) appends every non-progress stderr line to `info.texts` without limit. Corrupt media can emit enormous repeated logs, growing memory during a single job. [`_log_job_final()`](rmbloat/rmbloat.py:252) then serializes `asdict(vid)` including `runs[*].texts`; it clears only `dumped['texts']`, not the run logs, so successful jobs can also produce huge JSON log entries.
 
@@ -185,7 +187,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 7. ~~Remove the duplicate `start_transcode_job()`~~ (H1 done) and fix the `standard_name()` purge loop (H2).
 8. Change the probe cache key to include the directory (or inode) and lock all cache mutations (H3/M1).
 9. ~~Replace the hardcoded sample directory and fix the stdin fd handling~~ (H4/H5 done).
-10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8).
+10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8); H6 done.
 11. Set `requires-python` to `>=3.9` or add postponed annotations; fix packaging/docs (H10/L1).
 12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, and swap failure/rollback. Add CI to run `pylint`/tests.
 
