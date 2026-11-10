@@ -43,6 +43,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H9. Docker acceleration path skipped 10-bit detection and ran probes with a different identity than encodes** — Resolved in [`FfmpegChooser`](rmbloat/FfmpegChooser.py). A single [`_docker_user_and_group_args()`](rmbloat/FfmpegChooser.py:350) helper now builds `--user uid:gid` plus a `--group-add` for each numeric GPU group (the host `render`/`video` groups and the group owning the render node, via [`_docker_gpu_groups()`](rmbloat/FfmpegChooser.py:316)). Both the acceleration probe ([`_test_docker_acceleration()`](rmbloat/FfmpegChooser.py:388)) and real encodes ([`make_ffmpeg_cmd()`](rmbloat/FfmpegChooser.py:727)) use it, so a probe that passes predicts a working encode instead of passing as root while the user-context encode hits a `/dev/dri` permission error. [`_detect_vaapi_10bit_support()`](rmbloat/FfmpegChooser.py:184) gained a `container` mode that runs the `p010le`/`main10` test through the container with those same arguments, and it is invoked from the Docker acceleration path only when [`_docker_accel_will_be_used()`](rmbloat/FfmpegChooser.py:363) predicts that `docker_accel` will actually be selected, so the extra probe does not slow down system-ffmpeg or CPU-only setups. Docker-accelerated encodes now select `p010le`/`main10` for 10-bit sources instead of always forcing `nv12`. Regression coverage lives in [`tests/test_chooser_docker_accel.py`](tests/test_chooser_docker_accel.py) (identity/group args, 10-bit real encode, container 10-bit probe, and probe/encode parity).
 
+- **H10. Fatal errors exited with status 0** — Resolved in [`main()`](rmbloat/rmbloat.py:1522). The function now returns an `int` exit status: `0` after a successful [`main_loop()`](rmbloat/rmbloat.py:1690) and `1` in the `except Exception` handler, which also writes the exception and traceback to stderr instead of stdout. The `__main__` block calls `sys.exit(main())`, and the packaged `rmbloat` console script ([`pyproject.toml:37`](pyproject.toml:37)) runs through setuptools’ `sys.exit(main())` wrapper, so cron, systemd, shells, and CI see a real failure code in both invocation styles. Deliberate early exits inside the `try` block still use `sys.exit()` (`SystemExit` is not caught by `except Exception`), so their existing statuses are unchanged. Regression coverage lives in [`tests/test_main_exit_status.py`](tests/test_main_exit_status.py) (success returns 0, an unexpected exception returns 1 with a traceback on stderr, and curses is stopped on the failure path).
+
 ---
 
 # Critical findings
@@ -114,7 +116,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 11. **Docker acceleration path never detects 10-bit support and may lack GPU permissions.** `vaapi_supports_10bit` is only set in the system path ([`FfmpegChooser.py:136`](rmbloat/FfmpegChooser.py:136)), so docker-accelerated encodes force `nv12`/8-bit even for 10-bit sources ([`FfmpegChooser.py:729`](rmbloat/FfmpegChooser.py:729)). The acceleration test runs without `--user` ([`FfmpegChooser.py:315`](rmbloat/FfmpegChooser.py:315)), while real encodes use `--user uid:gid` without supplementary render/video groups ([`FfmpegChooser.py:634`](rmbloat/FfmpegChooser.py:634)); the test can pass while real encodes fail. **Resolved** — see the H9 entry under “Resolved findings”.
 
-12. **Fatal errors exit with status 0.** [`main()`](rmbloat/rmbloat.py:1482) catches all `Exception`, prints a traceback, and returns normally. `pylint`, cron, systemd, and shell scripts cannot distinguish success from a failed initialization.
+12. **Fatal errors exit with status 0.** [`main()`](rmbloat/rmbloat.py:1522) used to catch all `Exception`, print a traceback, and return normally, so `pylint`, cron, systemd, and shell scripts could not distinguish success from a failed initialization. **Resolved** — see the H10 entry under “Resolved findings”.
 
 13. **Conversions can silently restart after quitting the Convert screen.** [`ConvertScreen.quit_ACTION()`](rmbloat/rmbloat.py:988) pops the screen but leaves `job_handler` set. [`advance_jobs()`](rmbloat/rmbloat.py:343) starts queued jobs whenever the stack is not on Select, so visiting History/Help afterward can resume conversions unintentionally.
 
@@ -195,7 +197,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 9. ~~Replace the hardcoded sample directory and fix the stdin fd handling~~ (H4/H5 done).
 10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8); H6/H7 done.
 11. ~~Set `requires-python` to `>=3.9` or add postponed annotations~~ (done: floor raised to `>=3.11`); fix remaining packaging/docs items (H10/L1).
-12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, and swap failure/rollback. Add CI to run `pylint`/tests.
+12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, swap failure/rollback, and process exit status (H10 done). Add CI to run `pylint`/tests.
 
 ## Verification notes
 - `python3 -m py_compile rmbloat/*.py` passes.
@@ -203,3 +205,4 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 - `python3 -m unittest discover -s tests -v` passes (26 regression tests, including the C4 input-validation/probe-filtering and C5 auto-mode stop suites).
 - `pylint --errors-only rmbloat/*.py` reports only import errors for dependencies not installed here (e.g. `send2trash`); the `E0102` duplicate-method error is gone (H1).
 - Reproduced during the original audit: `-L` `IndexError` (C1), `--chooser-tests` `FileNotFoundError`, `IniManager.write()` ignoring `vals`, `ProbeCache` basename+size collision, `None` probe for audio-only `.mp4`, `TEMP./ORIG./SAMPLE.` inclusion in scans, `StructuredLogger.put(data=...)` `TypeError`, log-trim reordering, and `Vid.descr_str()` `TypeError`.
+- `python3 -m unittest tests.test_main_exit_status` passes (3 tests). Running the `__main__` entry point with a failing startup now terminates with shell status 1 instead of 0 (H10).

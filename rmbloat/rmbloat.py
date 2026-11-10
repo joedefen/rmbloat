@@ -1519,9 +1519,13 @@ class HistoryScreen(RmbloatScreen):
         self.app.win.passthrough_mode = True
 
 
-def main(args=None):
+def main(args=None) -> int:
     """
-    Convert video files to desired form
+    Convert video files to desired form.
+
+    Returns the process exit status: 0 on success, 1 when initialization or the
+    main loop raises an unexpected exception.  Callers (cron, systemd, shell
+    scripts) can therefore distinguish a successful run from a failed one.
     """
     try:
         ini = IniManager(app_name='rmbloat',
@@ -1688,18 +1692,19 @@ def main(args=None):
         opts.bloat_thresh = max(500, opts.bloat_thresh)
 
         Converter(opts, os.path.dirname(ini.config_file_path), ini).main_loop()
+        return 0
     except Exception as exc:
         # Note: We no longer call Window.exit_handler(), as ConsoleWindow handles it
         # and there is no guarantee the Window class was ever initialized.
         if Converter.singleton and Converter.singleton.win:
             Converter.singleton.win.stop_curses()
 
-        print("exception:", str(exc))
-        print(traceback.format_exc())
+        print("exception:", str(exc), file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':
-    # When the script is run directly, call main
-    # Pass sys.argv[1:] to main, but it's cleaner to let argparse
-    # handle reading from sys.argv directly, as done above.
-    main()
+    # When the script is run directly, call main and propagate its exit status
+    # so failures are visible to shells, cron, systemd, and CI.
+    sys.exit(main())
