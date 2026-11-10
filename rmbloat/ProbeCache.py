@@ -508,13 +508,18 @@ class ProbeCache:
 
         return False
 
-    def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Optional[Probe]]:
+    def batch_get_or_probe(self, filepaths: List[str], max_workers: int = 8) -> Dict[str, Probe]:
         """
         Batch process a list of file paths. Checks cache first, then runs ffprobe
         concurrently for all cache misses.
+
+        Files that produce no metadata (missing, audio-only, or otherwise not a
+        probeable video) are omitted from the returned mapping and reported on
+        stderr, so callers never have to handle a ``None`` probe.
         """
         exit_please = False
-        results: Dict[str, Optional[Probe]] = {}
+        results: Dict[str, Probe] = {}
+        failed_paths: List[str] = []
         probe_needed_paths: List[str] = []
 
         # 1. First Pass: Check Cache for all files
@@ -552,7 +557,9 @@ class ProbeCache:
                             if meta:
                                 self._set_cache(filepath, meta)
                                 self._compute_fields(meta)
-                            results[filepath] = meta
+                                results[filepath] = meta
+                            else:
+                                failed_paths.append(filepath)
 
                             if self._dirty_count >= 100:
                                 self.store()
@@ -583,11 +590,13 @@ class ProbeCache:
                         try:
                             meta = future.result()
                             with self._cache_lock:
-                                if filepath not in results:
+                                if filepath not in results and filepath not in failed_paths:
                                     if meta:
                                         self._set_cache(filepath, meta)
                                         self._compute_fields(meta)
-                                    results[filepath] = meta
+                                        results[filepath] = meta
+                                    else:
+                                        failed_paths.append(filepath)
                         except Exception:
                             pass
 
@@ -599,6 +608,14 @@ class ProbeCache:
         self.store()
         if total_files > 0:
             sys.stderr.write("\n")
+            sys.stderr.flush()
+
+        if failed_paths:
+            sys.stderr.write(
+                f"Skipped {len(failed_paths)} file(s) with no video stream"
+                " or that could not be probed:\n")
+            for filepath in failed_paths:
+                sys.stderr.write(f"  {filepath}\n")
             sys.stderr.flush()
 
         return results

@@ -423,6 +423,8 @@ class Converter:
     def process_one_ppp(self, ppp):
         """ Handle just one """
         input_file = ppp.video_file
+        if ppp.probe is None:
+            return  # Cannot evaluate a file that failed to probe
         if not self.is_valid_video_file(input_file):
             return  # Skip to the next file in the loop
 
@@ -475,6 +477,10 @@ class Converter:
 
         results = self.probe_cache.batch_get_or_probe(paths_to_probe)
         for file_path, probe in results.items():
+            # batch_get_or_probe() omits files it could not probe (missing,
+            # audio-only, ...); never build a PathProbePair with a None probe.
+            if probe is None:
+                continue
             ppp = PathProbePair(file_path, probe)
             ppps.append(ppp)
 
@@ -691,10 +697,14 @@ class Converter:
         # sys.argv is the list of command-line arguments. sys.argv[0] is the script name.
         ppps = self.create_video_file_list()
         self.probe_cache.store()
-        ppps.sort(key=lambda vid: vid.probe.bloat, reverse=True)
+        # Defensive: a None probe must never reach the sort key (audit C4).
+        ppps.sort(key=lambda ppp: ppp.probe.bloat if ppp.probe else 0, reverse=True)
 
         if not ppps:
-            print("Usage: rmbloat {options} {video_file}...")
+            if self.opts.files:
+                print("No probeable video files found in the given paths.",
+                      file=sys.stderr)
+            print("Usage: rmbloat {options} {video_file}...", file=sys.stderr)
             sys.exit(1)
 
         # --- The main loop change is here ---

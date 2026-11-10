@@ -17,6 +17,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **C3. `--save-defaults` never saved the new values** — Resolved in [`write()`](rmbloat/IniManager.py:139). Serialization now reads the live [`self.vals`](rmbloat/IniManager.py:45) attributes instead of the constructor-supplied defaults, preserving list/int/bool/float round-tripping and appending attributes added at runtime. This also fixes the schema-mismatch rewrite in the constructor, which previously reset every existing user setting to its constructor default when a new field was introduced; it now writes the values read from disk plus defaults for the newly added fields. Verified with `vals.beta='CHANGED'` + `write()` (file now contains `beta = CHANGED`) and with a simulated schema upgrade that retained existing values while adding the new key. Regression coverage lives in [`tests/test_ini_manager.py`](tests/test_ini_manager.py).
 
+- **C4. Any non-video, audio-only, or stale path crashed startup** — Resolved across three layers. [`batch_get_or_probe()`](rmbloat/ProbeCache.py:511) now returns `Dict[str, Probe]`, omitting files that yield no metadata instead of storing `None`, and prints a `Skipped N file(s)…` summary on stderr. [`create_video_file_list()`](rmbloat/rmbloat.py:439) still guards against a `None` probe before building a [`PathProbePair`](rmbloat/Models.py:20), [`process_one_ppp()`](rmbloat/rmbloat.py:423) returns early for one, and the [`main_loop()`](rmbloat/rmbloat.py:695) sort key is defensive (`ppp.probe.bloat if ppp.probe else 0`). Immediate file arguments and stdin entries are now existence/type/extension filtered in [`get_candidate_video_files()`](rmbloat/ConvertUtils.py:89) with one warning per skipped path, and an empty result set reports “No probeable video files found…” plus usage on stderr before exiting 1. Verified with a generated audio-only `.mp4`, a `notes.txt` argument, and a deleted path: the candidate list kept only the audio-only file, the probe batch returned `{}` with a clear warning, and sorting by `probe.bloat` succeeded instead of raising `AttributeError`. Regression coverage lives in [`tests/test_input_validation.py`](tests/test_input_validation.py).
+
 ---
 
 # Critical findings
@@ -173,6 +175,6 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 ## Verification notes
 - `python3 -m py_compile rmbloat/*.py` passes.
-- `python3 -m unittest discover -s tests -v` passes (3 `--logs` regression tests).
+- `python3 -m unittest discover -s tests -v` passes (19 regression tests, including the C4 input-validation/probe-filtering suite).
 - `pylint --errors-only rmbloat/*.py` reports `E0102` for the duplicate method, plus import errors for dependencies not installed here.
 - Reproduced during the original audit: `-L` `IndexError` (C1), `--chooser-tests` `FileNotFoundError`, `IniManager.write()` ignoring `vals`, `ProbeCache` basename+size collision, `None` probe for audio-only `.mp4`, `TEMP./ORIG./SAMPLE.` inclusion in scans, `StructuredLogger.put(data=...)` `TypeError`, log-trim reordering, and `Vid.descr_str()` `TypeError`.

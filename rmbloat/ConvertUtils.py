@@ -132,8 +132,21 @@ def get_candidate_video_files(file_args):
 
         if os.path.isdir(path):
             directories.append(path)
-        else:
-            immediate_files.append(path)
+            continue
+
+        # Immediate file arguments (including paths read from stdin) must
+        # exist and look like a video.  Otherwise probing yields no metadata
+        # and startup would build a PathProbePair with a None probe.
+        if not os.path.exists(path):
+            print(f"Warning: skipping missing path: {path}", file=sys.stderr)
+            continue
+        if not os.path.isfile(path):
+            print(f"Warning: skipping non-regular file: {path}", file=sys.stderr)
+            continue
+        if not is_valid_video_file(path):
+            print(f"Warning: skipping non-video file: {path}", file=sys.stderr)
+            continue
+        immediate_files.append(path)
 
     # Sort the list of directories to be processed (case-insensitively)
     directories.sort(key=str.lower)
