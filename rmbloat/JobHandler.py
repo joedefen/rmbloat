@@ -418,7 +418,9 @@ class JobHandler:
 
         if self.opts.sample:
             params.sample_mode = True
-            # Assuming job.duration_secs is already set or use probe.duration
+            # Seek 20% into the movie (but at least two minutes in) so the
+            # clip is representative. probe.duration is the *full* length;
+            # job.duration_secs is only the sample length while sampling.
             start_secs = max(120, probe.duration) * 0.20
             params.pre_input_opts = ['-ss', job.duration_spec(start_secs)]
             params.post_input_opts = ['-t', str(self.sample_seconds)]
@@ -433,6 +435,9 @@ class JobHandler:
 
         params.color_opts = self.make_color_opts(probe.color_spt)
         params.external_subtitle = merged_external_subtitle
+        # Copy a merged external SRT as-is; otherwise re-encode the internal
+        # text subtitles that survived the mapping to SRT.
+        params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
 
         # 4. Finalize Command and Launch Thread
         # All the "Magic" (Scaling filters, Subtitle pruning, HW vs SW mapping)
@@ -449,114 +454,6 @@ class JobHandler:
         job.thread.start()
 
         return job
-
-
-
-
-    def start_transcode_job(self, vid: Vid, retry_with_error_tolerance=False,
-                            force_software=False):
-        """Start a transcoding job using the Threaded TranscodeThread."""
-        os.chdir(os.path.dirname(vid.filepath))
-        basename = os.path.basename(vid.filepath)
-        probe = vid.probe0
-
-        # ... [Subtitle and Path Logic] ...
-        merged_external_subtitle = None
-        if self.opts.merge_subtitles:
-            subtitle_path = Path(vid.filepath).with_suffix('.en.srt')
-            if subtitle_path.exists() and self.validate_srt_file(subtitle_path):
-                merged_external_subtitle = str(subtitle_path)
-                vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
-
-        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        self.temp_file = temp_file = f"{prefix}.{vid.standard_name}"
-        orig_backup_file = f"ORIG.{basename}"
-
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-
-        duration_secs = self.sample_seconds if self.opts.sample else probe.duration
-
-        # 1. Initialize the Run and the Job
-        if not retry_with_error_tolerance and not force_software:
-            vid.runs = []
-
-        vid.start_new_run()
-        run = vid.runs[-1]
-
-        if retry_with_error_tolerance and not force_software:
-            run.descr = 'redo w err tolerance'
-        elif force_software:
-            run.descr = 'retry w S/W convert'
-        else:
-            run.descr = 'initial run'
-
-        job = Job(vid, orig_backup_file, temp_file, duration_secs, self.opts)
-        job.is_retry = retry_with_error_tolerance
-        job.is_software_fallback = force_software
-
-        # 2. Determine encoding strategy
-        original_use_acceleration = None
-        if force_software:
-            original_use_acceleration = self.chooser.use_acceleration
-            self.chooser.use_acceleration = False
-
-        # 3. Build FFmpeg Parameters
-        params = self.chooser.make_namespace(
-            input_file=basename,
-            output_file=temp_file,
-            use_10bit=self.should_use_10bit(probe.pix_fmt, probe.codec),
-            error_tolerant=retry_with_error_tolerance
-        )
-        params.crf = self.opts.quality
-        params.use_nice_ionice = not self.opts.full_speed
-        params.thread_count = self.opts.thread_cnt
-
-        # REQUIRED: Pass the streams so the mapper can find unsafe subtitles
-        params.streams = probe.streams
-        # REQUIRED: Pass height so the quality calculation works
-        params.height = probe.height
-
-        if self.opts.sample:
-            params.sample_mode = True
-            start_secs = max(120, job.duration_secs) * 0.20
-            params.pre_input_opts = ['-ss', job.duration_spec(start_secs)]
-            params.post_input_opts = ['-t', str(self.sample_seconds)]
-
-        # Scaling and Color
-        if probe.height > self.opts.max_height:
-            # Just pass the target dimensions, let make_ffmpeg_cmd build the filter
-            params.target_width = self.opts.max_height * probe.width // probe.height
-            params.target_height = self.opts.max_height
-        else:
-            params.target_width = None
-            params.target_height = None
-
-
-        params.color_opts = self.make_color_opts(vid.probe0.color_spt)
-
-#       params.map_opts = map_opts
-        params.external_subtitle = merged_external_subtitle
-        params.subtitle_codec = 'srt' if not merged_external_subtitle else 'copy'
-
-        # 4. Finalize Command and Launch Thread
-        ffmpeg_cmd = self.chooser.make_ffmpeg_cmd(params)
-        run.command = bash_quote(ffmpeg_cmd)
-
-        if force_software and original_use_acceleration is not None:
-            self.chooser.use_acceleration = original_use_acceleration
-
-        job.thread = TranscodeThread(cmd=ffmpeg_cmd, run_info=run, job=job,
-                    progress_secs_max=self.opts.progress_secs_max, temp_file=temp_file)
-        job.thread.start()
-
-        return job
-
-
-
-
-
-
 
     def get_job_progress(self, job):
         """ If the thread says it's done, return the return code (the 'int') """

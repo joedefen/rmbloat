@@ -25,6 +25,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **C7. The original-file swap was not atomic and could lose data / overwrite outputs** — Resolved in [`_execute_file_swap()`](rmbloat/JobHandler.py:687). The swap is now transactional: it verifies the temp file exists and is non-empty, refuses to replace a pre-existing destination, moves the original to a unique rollback name ([`_unique_path()`](rmbloat/JobHandler.py:21)), installs the output with a no-clobber `os.link()` (falling back to `os.rename()` only on filesystems without hard links), and restores the original if installation fails. A trash failure now leaves the rollback copy in place instead of falling back to permanent `os.unlink()`. The method returns `False` on any failure; [`finish_transcode_job()`](rmbloat/JobHandler.py:572) then sets `vid.doit='ERR'`, preserves the temp output, returns no probe, and [`advance_jobs()`](rmbloat/rmbloat.py:343) rewrites the final report to `ERR` so the UI/history no longer logs `OK`. Regression coverage lives in [`tests/test_file_swap.py`](tests/test_file_swap.py) (successful swap, unique backup, destination collision, missing/empty temp, failed-install rollback, destination race, trash failure, and swap-failure status).
 
+- **H1. Duplicate `start_transcode_job()` definition** — Resolved in [`start_transcode_job()`](rmbloat/JobHandler.py:353). Commit `71c5c3c` inserted a rewritten method above the original body without deleting the old one, so both copies were maintained in parallel (later fixes such as `max_height` scaling were applied to each) and the *older* body, being last in the class, was the one bound at import time. The stale copy is deleted; the surviving implementation keeps the newer sample logic (`start_secs = max(120, probe.duration) * 0.20`, which seeks 20% into the full movie instead of 20% into the 30-second sample, where `job.duration_secs` is only the sample length) and now also sets `params.subtitle_codec` (`'srt'` for internal text subtitles, `'copy'` when merging an external `.en.srt`), behaviour that only the deleted copy had. `pylint --errors-only rmbloat/JobHandler.py` no longer reports `E0102`, and `python3 -m unittest discover -s tests -t .` passes (38 tests).
+
 ---
 
 # Critical findings
@@ -70,7 +72,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 # High-severity findings
 
-1. **Duplicate method definition.** [`start_transcode_job()`](rmbloat/JobHandler.py:339) is defined again at [`JobHandler.py:442`](rmbloat/JobHandler.py:442); the first copy is dead. `pylint --errors-only` confirms `E0102: method already defined line 339`. The copies already differ (subtitle codec/sample start logic), so future fixes can land in the wrong copy.
+1. **Duplicate method definition.** [`start_transcode_job()`](rmbloat/JobHandler.py:339) was defined again at [`JobHandler.py:442`](rmbloat/JobHandler.py:442); the first copy was dead. `pylint --errors-only` confirmed `E0102: method already defined line 339`. The copies had already diverged (subtitle codec/sample start logic), so future fixes could land in the wrong copy. **Resolved** — see the H1 entry under “Resolved findings”.
 
 2. **Filename purge loop is wrong.** In [`ConvertUtils.standard_name()`](rmbloat/ConvertUtils.py:237), `end` from the sliced search is reused as an offset into the new full string. Only the first match is processed, and subsequent scanning often stops early. Reproduced outputs:
    - `Movie.1080p.x264` → `Movie.x264.1080p.x265.cmf28.recode.mkv`
@@ -172,7 +174,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 4. Fix `is_valid_video_file()`/scanning to test `os.path.basename()` so `TEMP./ORIG./SAMPLE.` are skipped (C6).
 5. Rework the file swap to be transactional: unique rollback name, destination-collision check, verify temp, restore on failure, and never report `OK` on swap failure (C7/M6).
 6. Correct the shrink/reject state machine and apply `min_shrink_pct` universally (C8).
-7. Remove the duplicate `start_transcode_job()` and fix the `standard_name()` purge loop (H1/H2).
+7. ~~Remove the duplicate `start_transcode_job()`~~ (H1 done) and fix the `standard_name()` purge loop (H2).
 8. Change the probe cache key to include the directory (or inode) and lock all cache mutations (H3/M1).
 9. Replace the hardcoded sample directory and fix the stdin fd handling (H4/H5).
 10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8).
@@ -181,6 +183,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 ## Verification notes
 - `python3 -m py_compile rmbloat/*.py` passes.
+- `python3 -m unittest discover -s tests -t .` passes (38 tests) after removing the duplicate `start_transcode_job()`.
 - `python3 -m unittest discover -s tests -v` passes (26 regression tests, including the C4 input-validation/probe-filtering and C5 auto-mode stop suites).
-- `pylint --errors-only rmbloat/*.py` reports `E0102` for the duplicate method, plus import errors for dependencies not installed here.
+- `pylint --errors-only rmbloat/*.py` reports only import errors for dependencies not installed here (e.g. `send2trash`); the `E0102` duplicate-method error is gone (H1).
 - Reproduced during the original audit: `-L` `IndexError` (C1), `--chooser-tests` `FileNotFoundError`, `IniManager.write()` ignoring `vals`, `ProbeCache` basename+size collision, `None` probe for audio-only `.mp4`, `TEMP./ORIG./SAMPLE.` inclusion in scans, `StructuredLogger.put(data=...)` `TypeError`, log-trim reordering, and `Vid.descr_str()` `TypeError`.
