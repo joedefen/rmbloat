@@ -493,19 +493,24 @@ class Converter:
         # --- Restore TTY Input if needed ---
         if read_pipe:
             try:
-                # 2a. Close the current stdin (the pipe)
+                # 2a. Close the current stdin (the pipe). This frees fd 0.
                 sys.stdin.close()
                 # 2b. Open the TTY device (the actual keyboard/terminal)
                 # os.O_RDONLY is read-only access.
                 tty_fd = os.open('/dev/tty', os.O_RDONLY)
-                # 2c. Replace file descriptor 0 (stdin) with the TTY descriptor
-                # os.dup2(old_fd, new_fd) copies the old_fd to the new_fd (FD 0).
-                os.dup2(tty_fd, 0)
-                # 2d. Re-create the sys.stdin file object for Python's I/O
+                # 2c. Replace file descriptor 0 (stdin) with the TTY descriptor.
+                # os.open() normally reuses the just-freed fd 0, in which case
+                # no dup2 is needed (and closing it below would close stdin).
+                if tty_fd != 0:
+                    os.dup2(tty_fd, 0)
+                # 2d. Re-create the sys.stdin file object for Python's I/O.
                 # os.fdopen(0, 'r') creates a new Python file object from FD 0.
                 sys.stdin = os.fdopen(0, 'r')
-                # 2e. Close the original file descriptor variable (tty_fd)
-                os.close(tty_fd)
+                # 2e. Close the original descriptor only when it is a distinct
+                # fd. Closing it when it *is* fd 0 would leave sys.stdin backed
+                # by a closed descriptor, breaking the interactive session.
+                if tty_fd != 0:
+                    os.close(tty_fd)
 
             except OSError as e:
                 # This handles cases where /dev/tty is not available (e.g., some non-interactive environments)

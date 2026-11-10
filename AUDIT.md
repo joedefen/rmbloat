@@ -33,6 +33,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H4. `--sample` wrote to `/heap/samples` and leaked an absolute path** — Resolved in [`start_transcode_job()`](rmbloat/JobHandler.py:353). The sample temp file is now named `SAMPLE.{quality}.{standard_name}` relative to the source video's own directory (the method already `chdir`s there), so no developer-specific directory is required and no extra directory needs creating. [`finish_transcode_job()`](rmbloat/JobHandler.py:474) stores only [`os.path.basename()`](rmbloat/JobHandler.py:527) in `vid.basename1`, so the UI never displays an absolute temp path. Regression coverage lives in [`tests/test_file_swap.py`](tests/test_file_swap.py) (`SampleOutputTests`): the sample output resolves inside the source directory, and `basename1` remains a bare filename even if the temp path is absolute.
 
+- **H5. Piped `-` input closed stdin when restoring the TTY** — Resolved in [`create_video_file_list()`](rmbloat/rmbloat.py:486). Closing the pipe frees fd 0, so `os.open('/dev/tty', os.O_RDONLY)` usually returns fd 0 itself. The old code then called `os.close(tty_fd)` unconditionally, closing fd 0 right after `sys.stdin = os.fdopen(0, 'r')` and leaving the interactive session with a closed descriptor. The restore path now skips `os.dup2()` and the cleanup `os.close()` when the TTY already landed on fd 0, and still duplicates-then-closes when it received a distinct descriptor. Regression coverage lives in [`tests/test_stdin_restore.py`](tests/test_stdin_restore.py): fd 0 is never closed in the reuse case, and a distinct fd is duplicated to 0 and then closed.
+
 ---
 
 # Critical findings
@@ -90,7 +92,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 4. **Sample mode writes to a hardcoded developer path.** [`start_transcode_job()`](rmbloat/JobHandler.py:457) used `prefix = '/heap/samples/SAMPLE...'` and never created the directory, so `--sample` failed on any normal machine. **Resolved** — see the H4 entry under “Resolved findings”.
 
-5. **Stdin/TTY reopen closes the new stdin.** In [`create_video_file_list()`](rmbloat/rmbloat.py:445), `sys.stdin.close()` frees fd 0; `os.open('/dev/tty')` therefore typically returns fd 0; then [`os.close(tty_fd)`](rmbloat/rmbloat.py:459) closes fd 0 again, leaving `sys.stdin` backed by a closed descriptor. Piped `-` input is therefore likely to break the interactive session. Only close `tty_fd` if it differs from 0.
+5. **Stdin/TTY reopen closed the new stdin.** In [`create_video_file_list()`](rmbloat/rmbloat.py:486), `sys.stdin.close()` frees fd 0, so `os.open('/dev/tty')` typically returns fd 0 itself; the old code then closed fd 0 again, leaving `sys.stdin` backed by a closed descriptor and breaking piped `-` input after startup. **Resolved** — see the H5 entry under “Resolved findings”.
 
 6. **Log trimming scrambles chronological order.** [`_trim_log_file()`](rmbloat/StructuredLogger.py:293) sorts by weighted age, keeps newest, then `reverse()`s the effective-age order, which is not the timestamp order. Reproduced: all old `ERR` lines ended up after newer `OK` lines. [`get_window_of_entries()`](rmbloat/StructuredLogger.py:484) and [`refresh_window()`](rmbloat/StructuredLogger.py:528) assume chronology, so the History screen and incremental reads become incorrect after a trim.
 
@@ -182,7 +184,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 6. Correct the shrink/reject state machine and apply `min_shrink_pct` universally (C8).
 7. ~~Remove the duplicate `start_transcode_job()`~~ (H1 done) and fix the `standard_name()` purge loop (H2).
 8. Change the probe cache key to include the directory (or inode) and lock all cache mutations (H3/M1).
-9. Replace the hardcoded sample directory and fix the stdin fd handling (H4/H5).
+9. ~~Replace the hardcoded sample directory and fix the stdin fd handling~~ (H4/H5 done).
 10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8).
 11. Set `requires-python` to `>=3.9` or add postponed annotations; fix packaging/docs (H10/L1).
 12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, and swap failure/rollback. Add CI to run `pylint`/tests.
