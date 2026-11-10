@@ -10,53 +10,11 @@ These tests verify that fd 0 is never closed after the reopen, whether the TTY
 lands on fd 0 (the common case) or on a distinct descriptor.
 """
 
-import contextlib
-import sys
 import types
 import unittest
 from unittest import mock
 
-
-class _Dummy:
-    """Minimal stand-in for console_window classes."""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-
-@contextlib.contextmanager
-def stubbed_runtime_dependencies():
-    """Install fake third-party modules for the duration of the import."""
-    previous = {}
-
-    def install(name, **attributes):
-        previous[name] = sys.modules.get(name)
-        module = types.ModuleType(name)
-        for key, value in attributes.items():
-            setattr(module, key, value)
-        sys.modules[name] = module
-        return module
-
-    console_window = install('console_window')
-    for name in ('ConsoleWindow', 'OptionSpinner', 'Screen', 'ScreenStack',
-                 'ConsoleWindowOpts', 'IncrementalSearchBar', 'Context',
-                 'Theme'):
-        setattr(console_window, name, type(name, (_Dummy,), {}))
-
-    ruamel = install('ruamel')
-    ruamel_yaml = install('ruamel.yaml', YAML=_Dummy)
-    ruamel.yaml = ruamel_yaml
-
-    install('send2trash', send2trash=lambda *args, **kwargs: None)
-
-    try:
-        yield
-    finally:
-        for name, module in previous.items():
-            if module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
+from tests.runtime_stubs import stubbed_runtime_dependencies
 
 
 with stubbed_runtime_dependencies():
