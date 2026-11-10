@@ -77,8 +77,15 @@ class Vid:
 
     def descr_str(self):
         """ return the descr string for adorning progress """
+        # A run only gets its ``descr`` later (JobHandler sets 'initial run'),
+        # and `start_new_run()` leaves it None, so tolerate both that and an
+        # empty runs list instead of raising TypeError/IndexError.
+        if not self.runs:
+            return ''
         descr = self.runs[-1].descr
-        return '' if 'initial' in descr else f'  [{descr}]'
+        if not descr or 'initial' in str(descr):
+            return ''
+        return f'  [{descr}]'
 
 class Job:
     """ Represents a video conversion job """
