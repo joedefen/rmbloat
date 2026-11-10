@@ -1,0 +1,178 @@
+# rmbloat audit (v0.8.5)
+
+## Scope and method
+- Reviewed all 16 modules in [`rmbloat/`](rmbloat) (~7,157 lines), [`pyproject.toml`](pyproject.toml), [`README.md`](README.md), [`BLURB.md`](BLURB.md), [`linter`](linter), and [`runner`](runner).
+- Performed static review, `python3 -m py_compile rmbloat/*.py`, `pylint --errors-only`, and targeted behavioral probes for the highest-risk paths.
+- Third-party runtime dependencies (`console_window`, `ruamel.yaml`, `send2trash`) are not installed in this checkout, so the curses UI was not exercised end-to-end. FFmpeg 7.1 is installed and was used for command-generation checks.
+- The initial review performed no code modifications; applied fixes are recorded under “Resolved findings” below.
+
+## Overall assessment
+The architecture is sensible: clear module boundaries, dataclass models, argv-list subprocess calls, a probe cache, a retry ladder, and a structured logger. However, several **user-facing paths are broken today**, and the file-replacement path has **data-loss risks** that contradict the README. The project also lacks automated tests/CI capable of catching these regressions.
+
+## Resolved findings
+
+- **C1. `rmbloat --logs` crashed with `IndexError`** — Resolved in [`main()`](rmbloat/rmbloat.py:1442). The handler now filters [`StructuredLogger.log_paths`](rmbloat/StructuredLogger.py:584) to existing files, builds the `less` argv from that list without indexing past its end, reports the expected log path and exits non-zero when no log file exists, and uses `less -R +F` so ANSI/ffmpeg escape sequences render correctly. Verified with a live logger (single `events.jsonl` path) and with a missing log file: no `IndexError`, and the command line ends with the existing log path. Regression coverage lives in [`tests/test_logs_cli.py`](tests/test_logs_cli.py) and runs with `python3 -m unittest discover -s tests -v`.
+
+- **C2. `rmbloat --chooser-tests` crashed with `FileNotFoundError`** — Resolved in [`make_namespace()`](rmbloat/FfmpegChooser.py:447). Namespace construction now accepts `validate_input_exists=False`, which [`run_tests()`](rmbloat/FfmpegChooser.py:987) uses when rendering illustrative example commands for the placeholder `input.mp4`; real encode/probe callers keep the default validation. [`run_tests()`](rmbloat/FfmpegChooser.py:987) also treats `FileNotFoundError` like `RuntimeError`, reporting the error and returning exit code 1 instead of raising a traceback. Verified by running `run_tests(show_test_encode=True)` without an `input.mp4` present and by exercising the real `main(['--chooser-tests'])` path; regression coverage lives in [`tests/test_chooser_tests_cli.py`](tests/test_chooser_tests_cli.py).
+
+- **C3. `--save-defaults` never saved the new values** — Resolved in [`write()`](rmbloat/IniManager.py:139). Serialization now reads the live [`self.vals`](rmbloat/IniManager.py:45) attributes instead of the constructor-supplied defaults, preserving list/int/bool/float round-tripping and appending attributes added at runtime. This also fixes the schema-mismatch rewrite in the constructor, which previously reset every existing user setting to its constructor default when a new field was introduced; it now writes the values read from disk plus defaults for the newly added fields. Verified with `vals.beta='CHANGED'` + `write()` (file now contains `beta = CHANGED`) and with a simulated schema upgrade that retained existing values while adding the new key. Regression coverage lives in [`tests/test_ini_manager.py`](tests/test_ini_manager.py).
+
+---
+
+# Critical findings
+
+### C1. `rmbloat --logs` always crashes with `IndexError`
+[`StructuredLogger.log_paths`](rmbloat/StructuredLogger.py:584) returns exactly one path, but [`main()`](rmbloat/rmbloat.py:1445) unconditionally accesses `files[1]`. Verified with a live logger: `log_paths` length is 1, `files[1]` raises `IndexError`. The README advertises this command at [`README.md:538`](README.md:538).
+
+### C2. The documented quick-start command `rmbloat --chooser-tests` crashes
+When no video file is supplied, [`main()`](rmbloat/rmbloat.py:1472) sets `show_test_encode=True`. [`FfmpegChooser.run_tests()`](rmbloat/FfmpegChooser.py:980) then builds an example using `input_file='input.mp4'`, and [`make_namespace()`](rmbloat/FfmpegChooser.py:534) raises `FileNotFoundError` because that file normally does not exist. `run_tests()` only catches `RuntimeError` and `KeyboardInterrupt`. Reproduced: `run_tests -> FileNotFoundError input_file does not exist: input.mp4`. This breaks the first command in the README’s Quick Start ([`README.md:19`](README.md:19)).
+
+### C3. `--save-defaults` never saves the new values
+[`IniManager.write()`](rmbloat/IniManager.py:139) iterates `self._default_values` and writes those constructor defaults, not the current `self.vals` attributes. [`main()`](rmbloat/rmbloat.py:1438) updates `ini.vals` and calls `ini.write()`, so the printed “new defaults” are not persisted. Reproduced: setting `vals.beta='CHANGED'` and calling `write()` still produced `beta = default`. This also means any INI schema mismatch rewrite silently resets user settings to constructor defaults. This is likely the most damaging configuration bug.
+
+### C4. Any non-video, audio-only, or stale path crashes startup
+[`ProbeCache._get_metadata_with_ffprobe()`](rmbloat/ProbeCache.py:156) returns `None` when ffprobe finds no video stream. [`batch_get_or_probe()`](rmbloat/ProbeCache.py:555) stores that `None` in results. [`create_video_file_list()`](rmbloat/rmbloat.py:477) wraps it in `PathProbePair(file_path, None)`, and [`main_loop()`](rmbloat/rmbloat.py:694) immediately sorts by `vid.probe.bloat`, raising `AttributeError`. Reproduced with an audio-only `.mp4`: `results: {'audio_only.mp4': None}`. Immediate file arguments are also not extension/existence-filtered in [`get_candidate_video_files()`](rmbloat/ConvertUtils.py:128), so `rmbloat notes.txt` or a deleted saved default path hits the same failure.
+
+### C5. Auto mode never stops
+`--auto-hr` is documented to “stop cleanly after the specified time limit” ([`README.md:386`](README.md:386)), but:
+- [`Converter.__init__()`](rmbloat/rmbloat.py:109) stores `auto_mode_hrs_limit` and it is never read.
+- [`print_auto_mode_vitals()`](rmbloat/rmbloat.py:505) is defined but never called.
+- [`_manage_queue_and_auto_mode()`](rmbloat/rmbloat.py:288) returns immediately in auto mode when the queue is empty.
+
+Result: an auto run idles forever after the queue drains, and cron/`rmbloatd` maintenance runs never terminate on schedule.
+
+### C6. `TEMP.` / `ORIG.` / `SAMPLE.` files are not skipped
+[`is_valid_video_file()`](rmbloat/ConvertUtils.py:75) checks `filename.startswith(SKIP_PREFIXES)`, but [`get_candidate_video_files()`](rmbloat/ConvertUtils.py:169) passes a full absolute path. An absolute path never starts with `TEMP.`, so all three are accepted. Reproduced: a scanned directory returned `good.mkv, ORIG.foo.mkv, SAMPLE.foo.mkv, TEMP.foo.mkv`. This can re-convert backups/leftover temp/sample files and consume large amounts of disk; it combines badly with C7 and the unused temp cleanup.
+
+### C7. The original-file swap is not atomic and can lose data / overwrite outputs
+In [`_execute_file_swap()`](rmbloat/JobHandler.py:706) the original is trashed or permanently unlinked **before** the temp file is renamed into place. If the final [`os.rename()`](rmbloat/JobHandler.py:730) fails, the original is already gone. Additionally:
+- `os.rename` silently replaces an existing destination on POSIX.
+- `send2trash` failure falls back to permanent `os.unlink()` ([`JobHandler.py:720`](rmbloat/JobHandler.py:720)), even when the user requested trash.
+- The surrounding `except OSError` ([`JobHandler.py:747`](rmbloat/JobHandler.py:747)) only appends log strings; the caller still treats the job as successful.
+
+This directly contradicts the README’s “Conversions are atomic” claim ([`README.md:664`](README.md:664)).
+
+### C8. “Insufficient shrink” is recorded as an error, and the shrink guard is not universal
+In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
+- The rejection path calls `set_anomaly(..., 'OPT')`, then the later failure branch calls [`set_anomaly(..., 'Err')`](rmbloat/JobHandler.py:618), overwriting `OPT`.
+- It sets `vid.doit = 'ERR'`, increments auto-mode error counters, while [`_log_job_final()`](rmbloat/rmbloat.py:335) is still called with the prior `' OK'` report.
+- The minimum-shrink check is conditioned on `original_was_allowed`, so files whose original codec is disallowed can be replaced by a **larger** output despite `-m/--min-shrink-pct` (README says “only replaces if new file is 10%+ smaller”, [`README.md:660`](README.md:660)).
+
+---
+
+# High-severity findings
+
+1. **Duplicate method definition.** [`start_transcode_job()`](rmbloat/JobHandler.py:339) is defined again at [`JobHandler.py:442`](rmbloat/JobHandler.py:442); the first copy is dead. `pylint --errors-only` confirms `E0102: method already defined line 339`. The copies already differ (subtitle codec/sample start logic), so future fixes can land in the wrong copy.
+
+2. **Filename purge loop is wrong.** In [`ConvertUtils.standard_name()`](rmbloat/ConvertUtils.py:237), `end` from the sliced search is reused as an offset into the new full string. Only the first match is processed, and subsequent scanning often stops early. Reproduced outputs:
+   - `Movie.1080p.x264` → `Movie.x264.1080p.x265.cmf28.recode.mkv`
+   - `Show.S01E02.720p.H.264` → `Show.S01E02.H.264.1080p.x265.cmf28.recode.mkv`
+   - `Something.xvid.480p.avi` → `Something.480p.avi.1080p.x265.cmf28.recode.mkv`
+   This leaves old codec/resolution tokens in names and can duplicate resolution tags. Use `re.sub` or correctly accumulate offsets.
+
+3. **Probe cache key collision.** [`_get_valid_entry()`](rmbloat/ProbeCache.py:362) keys only on basename + size, and rewrites the stored `folder`. Reproduced with two different files named `same.mp4` of equal size in different folders: looking up the second returned the first file’s cached metadata. This can assign wrong codec/resolution/duration/subtitle info and confuse [`move_entry()`](rmbloat/ProbeCache.py:473).
+
+4. **Sample mode writes to a hardcoded developer path.** [`start_transcode_job()`](rmbloat/JobHandler.py:457) uses `prefix = '/heap/samples/SAMPLE...'` and never creates the directory. `--sample` will fail on any normal machine and leaves an absolute temp path in `vid.basename1` ([`JobHandler.py:612`](rmbloat/JobHandler.py:612)).
+
+5. **Stdin/TTY reopen closes the new stdin.** In [`create_video_file_list()`](rmbloat/rmbloat.py:445), `sys.stdin.close()` frees fd 0; `os.open('/dev/tty')` therefore typically returns fd 0; then [`os.close(tty_fd)`](rmbloat/rmbloat.py:459) closes fd 0 again, leaving `sys.stdin` backed by a closed descriptor. Piped `-` input is therefore likely to break the interactive session. Only close `tty_fd` if it differs from 0.
+
+6. **Log trimming scrambles chronological order.** [`_trim_log_file()`](rmbloat/StructuredLogger.py:293) sorts by weighted age, keeps newest, then `reverse()`s the effective-age order, which is not the timestamp order. Reproduced: all old `ERR` lines ended up after newer `OK` lines. [`get_window_of_entries()`](rmbloat/StructuredLogger.py:484) and [`refresh_window()`](rmbloat/StructuredLogger.py:528) assume chronology, so the History screen and incremental reads become incorrect after a trim.
+
+7. **Unbounded ffmpeg log capture.** [`run_ffmpeg()`](rmbloat/TranscodeThread.py:114) appends every non-progress stderr line to `info.texts` without limit. Corrupt media can emit enormous repeated logs, growing memory during a single job. [`_log_job_final()`](rmbloat/rmbloat.py:252) then serializes `asdict(vid)` including `runs[*].texts`; it clears only `dumped['texts']`, not the run logs, so successful jobs can also produce huge JSON log entries.
+
+8. **`StructuredLogger.put(..., data=...)` raises `TypeError`.** [`put()`](rmbloat/StructuredLogger.py:393) passes `data=kwargs.get('data')` and also `**kwargs`, duplicating `data`. Verified: `TypeError ... got multiple values for keyword argument 'data'`.
+
+9. **`Job` lacks `is_retry`/`is_software_fallback` defaults.** [`Job.__init__()`](rmbloat/Models.py:89) does not define them, but [`check_job_status()`](rmbloat/JobHandler.py:211) depends on them. It works only because `start_transcode_job()` injects attributes dynamically; any other `Job` construction will raise `AttributeError`.
+
+10. **Declared Python 3.8 support is false.** `requires-python = ">=3.8"` in [`pyproject.toml:13`](pyproject.toml:13), but built-in generic annotations such as `tuple[bool, str]` are evaluated at import time on 3.8 ([`ConvertUtils.py:183`](rmbloat/ConvertUtils.py:183), [`StructuredLogger.py:431`](rmbloat/StructuredLogger.py:431), [`SystemDiscovery.py:100`](rmbloat/SystemDiscovery.py:100), [`rmbloat.py:406`](rmbloat/rmbloat.py:406)). [`shutdown(cancel_futures=True)`](rmbloat/ProbeCache.py:578) also requires 3.9. Set the minimum to 3.9 (or add `from __future__ import annotations` and avoid 3.9-only APIs).
+
+11. **Docker acceleration path never detects 10-bit support and may lack GPU permissions.** `vaapi_supports_10bit` is only set in the system path ([`FfmpegChooser.py:136`](rmbloat/FfmpegChooser.py:136)), so docker-accelerated encodes force `nv12`/8-bit even for 10-bit sources ([`FfmpegChooser.py:729`](rmbloat/FfmpegChooser.py:729)). The acceleration test runs without `--user` ([`FfmpegChooser.py:315`](rmbloat/FfmpegChooser.py:315)), while real encodes use `--user uid:gid` without supplementary render/video groups ([`FfmpegChooser.py:634`](rmbloat/FfmpegChooser.py:634)); the test can pass while real encodes fail.
+
+12. **Fatal errors exit with status 0.** [`main()`](rmbloat/rmbloat.py:1482) catches all `Exception`, prints a traceback, and returns normally. `pylint`, cron, systemd, and shell scripts cannot distinguish success from a failed initialization.
+
+13. **Conversions can silently restart after quitting the Convert screen.** [`ConvertScreen.quit_ACTION()`](rmbloat/rmbloat.py:988) pops the screen but leaves `job_handler` set. [`advance_jobs()`](rmbloat/rmbloat.py:343) starts queued jobs whenever the stack is not on Select, so visiting History/Help afterward can resume conversions unintentionally.
+
+14. **`rmbloatd` checks the wrong lock path.** [`is_daemon_running_anywhere()`](rmbloat/rmbloatd.py:111) hardcodes `/tmp/video_probes.json.lock`, but the app constructs `ProbeCache` with the config directory ([`rmbloat.py:1481`](rmbloat/rmbloat.py:1481)), producing `~/.config/rmbloat/video_probes.json.lock`. Duplicate-instance detection in `rmbloatd start` is therefore ineffective.
+
+---
+
+# Medium-severity findings
+
+- **Probe-cache concurrency races:** worker threads call `_increment_probe_failure()` → `_set_cache()` without `_cache_lock` ([`ProbeCache.py:225`](rmbloat/ProbeCache.py:225), [`ProbeCache.py:342`](rmbloat/ProbeCache.py:342)), while `store()` iterates the same dictionaries. This can lose updates or trigger “dictionary changed size during iteration”.
+- **Uncaught ffprobe metadata conversions:** `int(video_stream.get('width', 0))`, `float(duration)`, and `int(bit_rate)` can raise `TypeError`/`ValueError` for unusual files ([`ProbeCache.py:171`](rmbloat/ProbeCache.py:171)); these exceptions are not handled by the probe error path.
+- **`Vid.descr_str()` assumes a non-`None` description** ([`Models.py:82`](rmbloat/Models.py:82)). A fresh run created by `start_new_run()` with no `descr` raises `TypeError`; verified.
+- **Incomplete recycle-directory exclusion:** only `.Trash*`, `Trash`, and `lost+found` are skipped ([`ConvertUtils.py:156`](rmbloat/ConvertUtils.py:156)). Synology `#recycle`, QNAP `@Recycle`, `.recycle`, and similar stores are not excluded, so deleted media can be converted.
+- **Swap errors are swallowed twice:** [`_execute_file_swap()`](rmbloat/JobHandler.py:747) catches `OSError` locally, so `finish_transcode_job()` still reports success and the UI logs `OK` even when the filesystem operation failed.
+- **Non-atomic state writes:** [`PersistentState.save()`](rmbloat/PersistentState.py:62) and [`IniManager.write()`](rmbloat/IniManager.py:156) truncate/rewrite in place; a crash can corrupt `state.json`/`config.ini`. Use temp file + `os.replace`.
+- **Predictable temp/copy files:** the probe cache temp path is `cache_path + ".tmp"` ([`ProbeCache.py:330`](rmbloat/ProbeCache.py:330)), and History copy exports to `/tmp/rmbloat-export.txt` ([`rmbloat.py:1309`](rmbloat/rmbloat.py:1309)). On multi-user systems these are symlink/clobber and privacy risks; use `mkstemp`/XDG cache directories with 0600 permissions.
+- **Docker hardening/portability:** `--net=host --ipc=host` ([`FfmpegChooser.py:632`](rmbloat/FfmpegChooser.py:632)) is unnecessary privilege surface, and mounts lack SELinux `:z`. Automatic image pull at startup ([`FfmpegChooser.py:250`](rmbloat/FfmpegChooser.py:250)) is a network/supply-chain side effect; pin the image by digest.
+- **Exception-handling gaps in chooser detection:** [`_run_command()`](rmbloat/FfmpegChooser.py:110) catches only timeout/missing-executable; `PermissionError`/other `OSError` can abort startup. `real_world_tests()` also unlinks any pre-existing `test_<strategy>.mkv` in the video directory ([`FfmpegChooser.py:836`](rmbloat/FfmpegChooser.py:836)), risking deletion of a user file.
+- **Filter inconsistency:** successful rows are stored with a leading space (`' OK'`) by [`advance_jobs()`](rmbloat/rmbloat.py:326), but [`make_lines()`](rmbloat/rmbloat.py:161) tests `doit.startswith('OK')`; the `-DUN` filters therefore do not hide successful conversions.
+- **History search staleness:** when a search is active, newly read entries are not refiltered ([`rmbloat.py:1127`](rmbloat/rmbloat.py:1127)); `filtered_entries` can lag behind the refreshed log window.
+- **Global `os.chdir()` in job startup:** [`start_transcode_job()`](rmbloat/JobHandler.py:445) changes process-wide CWD and never restores it. It works today because consumers use matching relative paths, but it is fragile in a threaded program.
+- **Companion-file rename scope:** [`bulk_rename()`](rmbloat/FileOps.py:145) walks the entire current directory recursively and uses overwriting `os.rename()` ([`FileOps.py:190`](rmbloat/FileOps.py:190)). It may surprise users by renaming same-basename items in unrelated subdirectories.
+- **Temp-file lifecycle:** [`emergency_cleanup()`](rmbloat/JobHandler.py:19) is never wired to `atexit`/signals, and `TranscodeThread` is a daemon thread ([`TranscodeThread.py:21`](rmbloat/TranscodeThread.py:21)). A crash can leave an ffmpeg child and `TEMP.*` files behind.
+- **CLI boolean semantics are inverted when saved defaults are true:** [`-F/-B/-M/--use-trash`](rmbloat/rmbloat.py:1356) use `store_false` when the saved default is true, so passing the flag flips the saved setting rather than forcing it. This contradicts the help text and is confusing in scripts.
+- **`-L/--logs` still depends on `less`** being installed; it now uses `-R +F` so escape sequences render (C1 fixed).
+
+---
+
+# Low-severity, docs, and packaging
+
+- README/BLURB drift:
+  - `pipx rmbloat` typo at [`README.md:37`](README.md:37).
+  - `[-n]` is listed in usage at [`README.md:189`](README.md:189) but no such option exists.
+  - `--use-trash` is undocumented in the usage block.
+  - `-T` says “30s cvt” while [`main()`](rmbloat/rmbloat.py:1474) uses `duration=120`.
+  - “Conversions are atomic” and “auto mode stops cleanly” are contradicted by C7/C5.
+  - [`BLURB.md:34`](BLURB.md:34) links `image/...` while the repository uses `images/...`.
+- [`StructuredLogger.MAX_LOG_SIZE`](rmbloat/StructuredLogger.py:141) has a comment saying “10 MB” but the value is 50 MB.
+- [`linter`](linter) references `../console_window`, which is not present in this checkout; it also passes `$1` unquoted and supports only one argument. `pylint --errors-only` currently reports missing third-party imports plus the duplicate method (H1).
+- Dead code/unused features:
+  - [`SystemDiscovery`](rmbloat/SystemDiscovery.py) is never imported; clipboard support is implemented directly via OSC 52 in [`HistoryScreen`](rmbloat/rmbloat.py:1259). Its detection path also can leave a `wl-copy` process running after timeout.
+  - `_crf_to_qp()`, `scale_opts`, `map_opts`, `sample_start_secs`, and `sample_duration_secs` are unused in [`FfmpegChooser.py`](rmbloat/FfmpegChooser.py:542).
+  - `Probe.customs` is written but never consumed by the encoder mapping.
+  - [`should_use_10bit()`](rmbloat/JobHandler.py:57) has several branches that all return `False`; only 10-bit sources return `True`.
+- [`is_same_episode()`](rmbloat/VideoParser.py:194) tests `rhs.is_tv_episode` without calling it; the bound method is always truthy.
+- [`check_special()`](rmbloat/VideoParser.py:268) contains a duplicated `specialsdir_pat` branch; the specials regex uses `(:?` at [`VideoParser.py:98`](rmbloat/VideoParser.py:98), likely a typo for `(?:`.
+- [`run_regressions()`](rmbloat/VideoParser.py:429) prints failures but never raises or exits nonzero, so it cannot gate CI.
+- No CI configuration. [`tests/`](tests) now contains `unittest` regression tests for the `--logs` CLI path; the hardcoded parser regressions remain the only coverage elsewhere.
+- `body_rows=max(10 + len(self.vids), 10000)` in [`do_window_mode()`](rmbloat/rmbloat.py:551) effectively always allocates a 10,000-row body buffer, which is likely to hurt TUI redraw performance/memory on modest machines.
+- `Vid.ops` is populated by [`JobHandler`](rmbloat/JobHandler.py:710) but never displayed in the TUI, so swap failures are visible only in logs.
+- [`format_time_delta()`](rmbloat/StructuredLogger.py:99) produces `1m0s`, `1d0h`, etc., rather than the compact forms described in its docstring.
+
+---
+
+# Security review
+
+**Positive:** reviewed ffmpeg/ffprobe invocations use argv lists, not `shell=True`. Display/log quoting uses `shlex.quote`. The `rmbloatd` wrapper quotes user-provided arguments with `shlex.quote` before placing them in the tmux command.
+
+**Risks to address:**
+- Predictable shared paths (`/tmp/rmbloat-export.txt`, probe-cache `.tmp` file) are vulnerable to symlink/clobber attacks on multi-user hosts.
+- Automatic Docker image pull is an unrequested network/supply-chain action; use a digest and ask/opt in.
+- `--net=host --ipc=host` and missing SELinux labels in Docker mode increase container escape/privilege exposure.
+- The probe cache and logs contain full media paths and ffmpeg output by default (0644 under a typical umask); consider 0600 and XDG cache locations.
+- Processing untrusted media with ffmpeg/ffprobe is inherently risky; the optional container path is a good foundation, but the default local path is unsandboxed.
+
+---
+
+# Recommended remediation order
+
+1. Fix the three broken documented commands: `--logs` (C1), `--chooser-tests` (C2), `--save-defaults` (C3).
+2. Make all callers tolerate `None` probe results and validate immediate file/stdin inputs before probing (C4/M4).
+3. Implement auto-mode time-limit enforcement and call the existing vitals/exit routine (C5).
+4. Fix `is_valid_video_file()`/scanning to test `os.path.basename()` so `TEMP./ORIG./SAMPLE.` are skipped (C6).
+5. Rework the file swap to be transactional: unique rollback name, destination-collision check, verify temp, restore on failure, and never report `OK` on swap failure (C7/M6).
+6. Correct the shrink/reject state machine and apply `min_shrink_pct` universally (C8).
+7. Remove the duplicate `start_transcode_job()` and fix the `standard_name()` purge loop (H1/H2).
+8. Change the probe cache key to include the directory (or inode) and lock all cache mutations (H3/M1).
+9. Replace the hardcoded sample directory and fix the stdin fd handling (H4/H5).
+10. Bound ffmpeg log text, fix log trimming order, and make `put(data=...)` work (H6/H7/H8).
+11. Set `requires-python` to `>=3.9` or add postponed annotations; fix packaging/docs (H10/L1).
+12. Add tests for: CLI smoke paths, scanner filtering, probe-cache collisions, filename generation, log trimming, and swap failure/rollback. Add CI to run `pylint`/tests.
+
+## Verification notes
+- `python3 -m py_compile rmbloat/*.py` passes.
+- `python3 -m unittest discover -s tests -v` passes (3 `--logs` regression tests).
+- `pylint --errors-only rmbloat/*.py` reports `E0102` for the duplicate method, plus import errors for dependencies not installed here.
+- Reproduced during the original audit: `-L` `IndexError` (C1), `--chooser-tests` `FileNotFoundError`, `IniManager.write()` ignoring `vals`, `ProbeCache` basename+size collision, `None` probe for audio-only `.mp4`, `TEMP./ORIG./SAMPLE.` inclusion in scans, `StructuredLogger.put(data=...)` `TypeError`, log-trim reordering, and `Vid.descr_str()` `TypeError`.

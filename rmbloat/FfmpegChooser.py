@@ -444,13 +444,20 @@ class FfmpegChooser:
         print("="*60 + "\n")
 
 
-    def make_namespace(self, **overrides) -> SimpleNamespace:
+    def make_namespace(self, validate_input_exists: bool = True,
+                       **overrides) -> SimpleNamespace:
         """
         Create a namespace with sensible defaults for FFmpeg encoding.
 
         Required arguments (must be provided):
             input_file: Input video file path
             output_file: Output video file path
+
+        Args:
+            validate_input_exists: When True (the default), raise
+                FileNotFoundError if input_file does not exist. Set to False
+                when building an illustrative namespace (e.g. to print an
+                example command) where the path is a placeholder.
 
         Optional arguments with defaults:
             crf: Quality (default: 28, lower=better quality)
@@ -531,7 +538,7 @@ class FfmpegChooser:
         # Validate required fields with better error messages
         if defaults.input_file is None:
             raise ValueError("input_file is required but was not provided")
-        if not Path(defaults.input_file).exists():
+        if validate_input_exists and not Path(defaults.input_file).exists():
             raise FileNotFoundError(f"input_file does not exist: {defaults.input_file}")
 
         if defaults.output_file is None:
@@ -1015,12 +1022,15 @@ class FfmpegChooser:
                 print("Example FFmpeg Command")
                 print("="*60)
 
+                # These paths are illustrative only, so do not require the
+                # input file to actually exist.
                 params = self.make_namespace(
                     input_file='input.mp4',
                     output_file='output.mkv',
                     crf=28,
                     preset='medium',
                     color_opts=['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'],
+                    validate_input_exists=False,
                 )
 
                 cmd = self.make_ffmpeg_cmd(params)
@@ -1035,7 +1045,7 @@ class FfmpegChooser:
 
             return 0
 
-        except RuntimeError as e:
+        except (RuntimeError, FileNotFoundError) as e:
             print(f"\nError: {e}", file=sys.stderr)
             return 1
         except KeyboardInterrupt:

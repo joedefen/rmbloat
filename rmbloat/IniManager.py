@@ -145,7 +145,17 @@ class IniManager:
         config[self.SECTION] = {}
 
         # Transfer all current attribute values from self.vals
-        for key, value in self._default_values.items():
+        current_values = vars(self.vals)
+
+        # Write the known default fields first (stable ordering), then any
+        # additional attributes that were added to self.vals at runtime.
+        ordered_keys = [key for key in self._default_values
+                        if key in current_values]
+        ordered_keys += [key for key in current_values
+                         if key not in self._default_values]
+
+        for key in ordered_keys:
+            value = current_values[key]
             # Handle list type: store as newline-separated values
             if isinstance(value, list):
                 config[self.SECTION][key] = '\n' + '\n'.join(str(item) for item in value)

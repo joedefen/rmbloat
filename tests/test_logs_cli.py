@@ -1,0 +1,157 @@
+"""Regression tests for the `rmbloat --logs` command (audit finding C1).
+
+The original handler assumed ``StructuredLogger.log_paths`` returned at least
+two paths and unconditionally accessed ``files[1]``.  The logger actually
+returns a single path, so ``rmbloat --logs`` always raised ``IndexError``.
+
+These tests exercise the real ``main(['--logs'])`` path.  Third-party runtime
+dependencies are stubbed so the tests run in a bare checkout, and ``HOME`` is
+redirected to a temporary directory so no user configuration or logs are
+touched.
+"""
+
+import contextlib
+import importlib
+import io
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+class _Dummy:
+    """Minimal stand-in for console_window classes."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+@contextlib.contextmanager
+def stubbed_runtime_dependencies():
+    """Install fake third-party modules for the duration of a test.
+
+    ``rmbloat.rmbloat`` imports curses UI classes, ruamel.yaml, and
+    send2trash at module import time.  The ``--logs`` path uses none of
+    them, so deterministic stubs keep this regression test hermetic.
+    """
+    previous = {}
+
+    def install(name, **attributes):
+        previous[name] = sys.modules.get(name)
+        module = types.ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        sys.modules[name] = module
+        return module
+
+    console_window = install('console_window')
+    for name in ('ConsoleWindow', 'OptionSpinner', 'Screen', 'ScreenStack',
+                 'ConsoleWindowOpts', 'IncrementalSearchBar', 'Context',
+                 'Theme'):
+        setattr(console_window, name, type(name, (_Dummy,), {}))
+
+    ruamel = install('ruamel')
+    ruamel_yaml = install('ruamel.yaml', YAML=_Dummy)
+    ruamel.yaml = ruamel_yaml
+
+    install('send2trash', send2trash=lambda *args, **kwargs: None)
+
+    try:
+        yield
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def purge_rmbloat_modules():
+    """Drop cached rmbloat modules so module-level paths use the temp HOME."""
+    for name in list(sys.modules):
+        if name == 'rmbloat' or name.startswith('rmbloat.'):
+            sys.modules.pop(name, None)
+
+
+class LogsCommandRegressionTests(unittest.TestCase):
+    """`rmbloat --logs` must page the one existing log file, never crash."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+        home_patch = mock.patch.dict(
+            os.environ, {'HOME': self.temp_dir.name}, clear=False)
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+
+        dependencies = stubbed_runtime_dependencies()
+        dependencies.__enter__()
+        self.addCleanup(dependencies.__exit__, None, None, None)
+
+        purge_rmbloat_modules()
+        self.addCleanup(purge_rmbloat_modules)
+
+        # Import after HOME and the dependency stubs are in place: the module
+        # creates its StructuredLogger at import time.
+        self.rmbloat = importlib.import_module('rmbloat.rmbloat')
+
+    def test_logs_pages_the_single_existing_log_file(self):
+        self.rmbloat.lg.info('regression entry for --logs')
+
+        paths = self.rmbloat.lg.log_paths
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths, [str(self.rmbloat.lg.log_file)])
+        self.assertTrue(os.path.isfile(paths[0]))
+
+        with mock.patch('os.execvp', side_effect=SystemExit(0)) as execvp:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self.rmbloat.main(['--logs'])
+
+        self.assertEqual(raised.exception.code, 0)
+        execvp.assert_called_once_with(
+            'less', ['less', '-R', '+F', paths[0]])
+
+    def test_logs_reports_missing_log_file_instead_of_raising_indexerror(self):
+        log_path = str(self.rmbloat.lg.log_file)
+        self.assertFalse(os.path.isfile(log_path))
+
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with mock.patch('os.execvp') as execvp:
+            with contextlib.redirect_stderr(stderr), \
+                    contextlib.redirect_stdout(stdout):
+                with self.assertRaises(SystemExit) as raised:
+                    self.rmbloat.main(['--logs'])
+
+        self.assertEqual(raised.exception.code, 1)
+        execvp.assert_not_called()
+        self.assertIn('No log file found at:', stderr.getvalue())
+        self.assertIn(log_path, stderr.getvalue())
+
+    def test_logs_only_passes_existing_paths_to_less(self):
+        self.rmbloat.lg.info('path-filtering regression entry')
+        existing = str(self.rmbloat.lg.log_file)
+        missing = str(Path(existing).with_name('missing.jsonl'))
+        self.assertFalse(os.path.isfile(missing))
+
+        with mock.patch.object(
+                self.rmbloat.StructuredLogger, 'log_paths',
+                new_callable=mock.PropertyMock,
+                return_value=[existing, missing]):
+            with mock.patch('os.execvp', side_effect=SystemExit(0)) as execvp:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        self.rmbloat.main(['--logs'])
+
+        # The missing second path must be filtered out, not indexed blindly.
+        execvp.assert_called_once_with(
+            'less', ['less', '-R', '+F', existing])
+
+
+if __name__ == '__main__':
+    unittest.main()

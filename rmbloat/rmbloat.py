@@ -1440,10 +1440,13 @@ def main(args=None):
             sys.exit(0)
 
         if opts.logs:
-            files = lg.log_paths
-            cmd = ['less', '+F', files[0]]
-            if os.path.isfile(files[1]):
-                cmd.append(files[1])
+            files = [path for path in lg.log_paths if os.path.isfile(path)]
+            if not files:
+                print(f"No log file found at: {lg.log_file}", file=sys.stderr)
+                sys.exit(1)
+            # -R renders ANSI escape sequences (e.g. ffmpeg output) instead of
+            # showing their raw bytes; +F follows appended entries.
+            cmd = ['less', '-R', '+F'] + files
             try:
                 program = cmd[0]
                 # This call replaces the current Python process
