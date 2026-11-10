@@ -13,6 +13,7 @@ import math
 import re
 import fcntl
 import atexit
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
@@ -434,18 +435,31 @@ class ProbeCache:
             for cache_key in basenames_to_delete:
                 del self.cache_data[cache_key]
 
-            # Write atomically
-            temp_path = self.cache_path + ".tmp"
+            # Write atomically through a unique, private (0600) temp file in
+            # the same directory.  The previous ``cache_path + ".tmp"`` name
+            # was predictable, so another user could pre-create or symlink it.
+            temp_path = None
             try:
-                with open(temp_path, 'w', encoding='utf-8') as f:
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=f'.{os.path.basename(self.cache_path)}.',
+                    suffix='.tmp',
+                    dir=os.path.dirname(self.cache_path) or '.',
+                    text=True)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     json.dump(self.cache_data, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(temp_path, self.cache_path)
+                temp_path = None
                 self._dirty_count = 0
             except IOError as e:
                 print(f"Error writing cache file: {e}")
             finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
+                if temp_path is not None:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
 
     def _set_cache(self, filepath: str, meta: Probe):
         """Stores the metadata in the cache dictionary."""

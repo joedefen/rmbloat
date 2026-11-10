@@ -57,6 +57,8 @@ MONO_THEME = 'mono'
 THEME_CHOICES = (*Theme.list_all(), MONO_THEME)
 
 
+
+
 def settle_appearance(cli_theme=None, no_color=False, saved_theme='',
                       saved_colors=True):
     """Turn the color switches and the remembered choice into process state.
@@ -1531,22 +1533,24 @@ class HistoryScreen(RmbloatScreen):
                 except Exception:
                     success = False
 
-                # 3. User Feedback & Fallback
-                if success:
-                    # We show success, but warn the user if they are on a limited terminal
-                    win.alert(message='Copied (OSC 52). If paste fails, check /tmp/rmbloat-export.txt')
-
-                # 4. Always export to /tmp as a "Hard" Fallback
+                # 3. Always write a private hard fallback in the XDG cache
+                # directory.  The old fixed /tmp path was readable by other
+                # users and could be replaced with a symlink.
+                export_path = None
                 try:
-                    export_path = '/tmp/rmbloat-export.txt'
-                    with open(export_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-
-                    if not success:
-                        win.alert(message=f'Clipboard blocked. Exported to {export_path}')
+                    export_path = FileOps.write_history_export(text)
                 except Exception as exc:
                     if not success:
                         win.alert(message=f'All copy methods failed: {exc}')
+
+                # 4. User Feedback
+                if success:
+                    message = 'Copied (OSC 52).'
+                    if export_path:
+                        message += f' Fallback export: {export_path}'
+                    win.alert(message=message)
+                elif export_path:
+                    win.alert(message=f'Clipboard blocked. Exported to {export_path}')
 
     def hist_search_ACTION(self):
         """ Handle '/' key - start incremental filter search """

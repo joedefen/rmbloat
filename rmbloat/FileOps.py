@@ -5,8 +5,46 @@ File operation utilities for rmbloat
 # pylint: disable=broad-exception-caught,too-many-locals
 # pylint: disable=line-too-long,invalid-name
 import os
+import tempfile
 import time
 from pathlib import Path
+
+
+def history_export_dir():
+    """Return the per-user cache directory for clipboard fallback exports.
+
+    Uses ``$XDG_CACHE_HOME`` when set (falling back to ``~/.cache``) instead
+    of a world-writable ``/tmp`` path, so one user cannot read another user's
+    copied log entries or pre-create the destination as a symlink.
+    """
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.join(
+        os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'rmbloat')
+
+
+def write_history_export(text):
+    """Write ``text`` to a new private export file and return its path.
+
+    ``tempfile.mkstemp`` creates the file with mode 0600 and a unique name, so
+    the export can never clobber or follow a path planted by another user.
+    """
+    export_dir = history_export_dir()
+    os.makedirs(export_dir, mode=0o700, exist_ok=True)
+    fd, export_path = tempfile.mkstemp(
+        prefix='rmbloat-export-', suffix='.txt', dir=export_dir, text=True)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.unlink(export_path)
+        except OSError:
+            pass
+        raise
+    return export_path
+
 
 def sanitize_file_paths(paths):
     """
