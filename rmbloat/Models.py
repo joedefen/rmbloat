@@ -2,14 +2,16 @@
 """
 Data models for rmbloat video conversion
 """
+import math
 import os
 import time
-import math
 from dataclasses import dataclass, field
-from typing import Optional, List
 from datetime import timedelta
+from typing import List, Optional
+
 from .ProbeCache import Probe
 from .TranscodeThread import TranscodeThread
+
 # pylint: disable=import-outside-toplevel,too-many-instance-attributes
 # pylint: disable=invalid-name,too-many-positional-arguments,too-many-arguments
 

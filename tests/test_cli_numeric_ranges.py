@@ -18,9 +18,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.runtime_stubs import (purge_rmbloat_modules,
-                                 stubbed_runtime_dependencies)
-
+from tests.runtime_stubs import purge_rmbloat_modules, stubbed_runtime_dependencies
 
 SAVED_DEFAULTS = {
     'allowed_codecs': 'x265',

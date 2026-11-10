@@ -20,8 +20,9 @@ from unittest import mock
 from tests.runtime_stubs import stubbed_runtime_dependencies
 
 with stubbed_runtime_dependencies():
-    from rmbloat import JobHandler as JobHandlerModule
     from rmbloat.Models import Job
+
+    from rmbloat import JobHandler as JobHandlerModule
 
 
 def make_vid(texts=()):

@@ -9,6 +9,7 @@ import tempfile
 import types
 from pathlib import Path
 
+
 class IniManager:
     """
     A class to manage application configuration stored in a config.ini file

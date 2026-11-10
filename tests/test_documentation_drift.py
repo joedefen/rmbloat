@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from rmbloat.IniManager import IniManager
+
 from tests.runtime_stubs import purge_rmbloat_modules, stubbed_runtime_dependencies
 
 README = Path(__file__).resolve().parent.parent / 'README.md'

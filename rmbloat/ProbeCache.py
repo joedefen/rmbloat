@@ -5,22 +5,22 @@
 # pylint: disable=too-many-locals,too-many-branches,consider-using-with
 # pylint: disable=too-many-instance-attributes,consider-using-dict-items
 
+import atexit
+import fcntl
 import json
+import math
 import os
+import re
 import stat
 import sys
-import math
-import re
-import fcntl
-import atexit
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any, List
-from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
-from . import Sandbox
-from . import StatusLine
+from dataclasses import asdict, dataclass, field
+from threading import RLock
+from typing import Any, Dict, List, Optional
+
+from . import Sandbox, StatusLine
 
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60

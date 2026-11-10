@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """ CPU Current Usage Support"""
-import time
 import collections
-from typing import Tuple, Deque
+import time
+from typing import Deque, Tuple
+
 # pylint: disable=invalid-name,broad-exception-caught,raise-missing-from
 
 class CpuStatus:
@@ -59,7 +60,8 @@ class CpuStatus:
 
                 return work_jiffies, total_jiffies
         except Exception as e:
-            raise RuntimeError(f"Failed to read CPU stats from /proc/stat: {e}")
+            raise RuntimeError(
+                f"Failed to read CPU stats from /proc/stat: {e}") from None
 
     def _add_current_reading(self):
         """Helper to fetch and store the current data point in the history."""

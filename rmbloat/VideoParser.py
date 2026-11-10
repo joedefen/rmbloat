@@ -6,7 +6,9 @@ import string
 import sys
 from io import StringIO
 from types import SimpleNamespace
+
 from ruamel.yaml import YAML
+
 # pylint: disable=too-many-statements,too-many-branches,too-many-nested-blocks
 # pylint: disable=too-many-locals,broad-exception-caught,too-few-public-methods
 # pylint: disable=too-many-instance-attributes,line-too-long,invalid-name
@@ -412,7 +414,7 @@ class VideoParser():
                     winner.year = loser.year # Jury still out, but retained as requested
         else:
             # Should not happen if the inner 'break' logic is sound
-            assert False, "Multiple hits greater than 2 encountered."
+            raise AssertionError("Multiple hits greater than 2 encountered.")
 
 
         # Set final attributes

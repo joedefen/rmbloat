@@ -191,7 +191,8 @@ The output will show which strategies work and recommend the best one. `rmbloat`
 ### Starting `rmbloat` from the CLI
 `rmbloat` requires a list of files or directories to scan for conversion candidates (or uses saved defaults if configured).  The full list of options are:
 ```
-usage: rmbloat.py [-h] [--ascii [BOOL]] [--glyphs {auto,ascii,unicode}]
+usage: rmbloat.py [-h] [--version] [--ascii [BOOL]]
+                  [--glyphs {auto,ascii,unicode}]
                   [--theme {dark-mono,light-mono,default,solarized-dark,solarized-light,gruvbox,nord}]
                   [--no-color] [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F]
                   [--no-full-speed] [-B] [--no-keep-backup] [-M]
@@ -210,6 +211,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+  --version             show the release number and exit
   --ascii [BOOL]        use plain-ASCII symbols; --ascii=no forces the Unicode
                         set. Without the switch rmbloat detects the terminal
   --glyphs {auto,ascii,unicode}

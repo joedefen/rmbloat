@@ -18,7 +18,6 @@ from unittest import mock
 from rmbloat.IniManager import IniManager
 from rmbloat.PersistentState import PersistentState
 
-
 DEFAULTS = {
     'beta': 'default',
     'n': 1,

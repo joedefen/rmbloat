@@ -19,9 +19,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from rmbloat.IniManager import IniManager
-from tests.runtime_stubs import (purge_rmbloat_modules,
-                                 stubbed_runtime_dependencies)
 
+from tests.runtime_stubs import purge_rmbloat_modules, stubbed_runtime_dependencies
 
 # The configuration fields ``main()`` seeds an IniManager with.  The fake
 # manager in the CLI tests must expose the same keys because --save-defaults

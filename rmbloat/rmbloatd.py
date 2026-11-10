@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ rmbloatd main """
 import os
-import sys
 import shlex
+import sys
 
 if __package__ in (None, ""):
     # Executed directly (``python rmbloat/rmbloatd.py``): make the package

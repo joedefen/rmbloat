@@ -7,16 +7,16 @@ ERR entries age 10x slower than other entries, so they persist longer.
 # pylint: disable=too-many-instance-attributes,invalid-name,line-too-long
 # pylint: disable=unused-argument
 
+import inspect
+import json
 import os
 import sys
-import json
-import inspect
 import tempfile
 from collections import OrderedDict
-from pathlib import Path
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from dataclasses import dataclass, asdict, field
-from typing import Optional, List, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 def default_log_dir(app_name: str = 'rmbloat') -> Path:
@@ -485,7 +485,8 @@ class StructuredLogger:
         try:
             with open(self.log_file, 'r', encoding='utf-8') as f:
                 for line in f:
-                    if not line.strip(): continue
+                    if not line.strip():
+                        continue
                     try:
                         data = json.loads(line)
                         # Delete if timestamp matches/older AND (no filter OR level matches)

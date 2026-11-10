@@ -16,12 +16,12 @@ from unittest import mock
 
 from tests.runtime_stubs import stubbed_runtime_dependencies
 
-
 with stubbed_runtime_dependencies():
-    from rmbloat import rmbloat as RmbloatModule
     from rmbloat.Models import PathProbePair, Vid
     from rmbloat.ProbeCache import Probe
     from rmbloat.TranscodeThread import TranscodeThread
+
+    from rmbloat import rmbloat as RmbloatModule
 
 
 class TranscodeLogBufferTests(unittest.TestCase):

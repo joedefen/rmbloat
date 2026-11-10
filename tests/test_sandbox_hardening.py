@@ -11,9 +11,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rmbloat import Sandbox
 from rmbloat.FfmpegChooser import FfmpegChooser
-from rmbloat.ProbeCache import ProbeCache, Probe
+from rmbloat.ProbeCache import Probe, ProbeCache
+
+from rmbloat import Sandbox
 from tests.runtime_stubs import stubbed_runtime_dependencies
 
 

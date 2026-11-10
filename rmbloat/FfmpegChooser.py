@@ -5,18 +5,20 @@ FfmpegChooser - Intelligent FFmpeg runtime selection with hardware acceleration 
 # pylint: disable=too-many-branches,too-many-statements,too-many-locals,invalid-name
 # pylint: disable=too-many-instance-attributes,broad-exception-caught,line-too-long
 
+import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
-import shutil
-import argparse
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any
 from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
+
 from . import Sandbox
+
 
 class FfmpegChooser:
     """

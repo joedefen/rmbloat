@@ -16,9 +16,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from rmbloat import Sandbox
 from rmbloat.ProbeCache import NOT_A_VIDEO_ANOMALY, ProbeCache
 from rmbloat.Sandbox import CappedResult
+
+from rmbloat import Sandbox
 
 AUDIO_ONLY = json.dumps({
     'streams': [{'codec_type': 'audio', 'codec_name': 'aac'}],

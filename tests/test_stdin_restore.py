@@ -16,7 +16,6 @@ from unittest import mock
 
 from tests.runtime_stubs import stubbed_runtime_dependencies
 
-
 with stubbed_runtime_dependencies():
     from rmbloat import rmbloat as RmbloatModule
 

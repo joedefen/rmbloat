@@ -9,38 +9,50 @@
 # pylint: disable=too-many-public-methods,invalid-name,multiple-statements
 
 
-import os
-import sys
-import base64
 import argparse
-import traceback
-import re
 import atexit
-import signal
-import shutil
-import time
-import json
+import base64
 import curses
+import json
+import os
+import re
+import shutil
+import signal
+import sys
 import textwrap
+import time
+import traceback
 from dataclasses import asdict
 from types import SimpleNamespace
-from console_window import (ConsoleWindow, OptionSpinner, Screen, ScreenStack,
-                            ConsoleWindowOpts, IncrementalSearchBar, Context,
-                            Theme, appearance)
+
+from console_window import (
+    ConsoleWindow,
+    ConsoleWindowOpts,
+    Context,
+    IncrementalSearchBar,
+    OptionSpinner,
+    Screen,
+    ScreenStack,
+    Theme,
+    appearance,
+)
 from console_window import cli as display_cli
-from .ProbeCache import ProbeCache
-from .VideoParser import Mangler
-from .IniManager import IniManager
-from .StructuredLogger import StructuredLogger
+
+from . import ConvertUtils, FileOps, Sandbox, StatusLine, __version__
 from .CpuStatus import CpuStatus
 from .FfmpegChooser import FfmpegChooser
-from .Models import PathProbePair, Vid
-from . import FileOps
-from . import ConvertUtils
-from . import Sandbox
-from . import StatusLine
+from .IniManager import IniManager
 from .JobHandler import JobHandler
+from .Models import PathProbePair, Vid
 from .PersistentState import PersistentState
+from .ProbeCache import ProbeCache
+from .StructuredLogger import StructuredLogger
+from .VideoParser import Mangler
+
+# The banner `--version` prints.  One string, used by the early answer in
+# `main()` and by argparse's `--version` action, so the release gate's smoke
+# stage and the help text cannot disagree.
+VERSION_BANNER = f'rmbloat {__version__}'
 
 lg = StructuredLogger('rmbloat')
 
@@ -421,9 +433,12 @@ class Converter:
                 run['texts'] = self._tail_for_log(run.get('texts'), limit)
 
         title = 'RE-ENCODE-TO-H265'
-        if clean_label == 'OK2': title += '-RETRY'
-        elif clean_label == 'OK3': title += '-SOFTWARE'
-        elif clean_label == 'OPT': title += '-REJECTED'
+        if clean_label == 'OK2':
+            title += '-RETRY'
+        elif clean_label == 'OK3':
+            title += '-SOFTWARE'
+        elif clean_label == 'OPT':
+            title += '-REJECTED'
 
         # Use the stripped label for the logic check
         lg.put('OK' if is_ok else 'ERR',
@@ -1685,6 +1700,13 @@ def main(args=None) -> int:
     main loop raises an unexpected exception.  Callers (cron, systemd, shell
     scripts) can therefore distinguish a successful run from a failed one.
     """
+    argv = list(sys.argv[1:] if args is None else args)
+    # --version is answered before any configuration is read or written: the
+    # release gate runs it in a throwaway venv where no config exists yet, and
+    # asking for the version must not create one.
+    if '--version' in argv:
+        print(VERSION_BANNER)
+        return 0
     try:
         ini = IniManager(app_name='rmbloat',
                                allowed_codecs='x265',
@@ -1704,6 +1726,14 @@ def main(args=None) -> int:
         vals = ini.vals
         parser = argparse.ArgumentParser(
             description="CLI/curses bulk Video converter for media servers")
+        # The release gate's smoke stage runs the installed console script with
+        # --version and requires this number on stdout; it lives in the package
+        # so the built artifact, the gate and `rmbloat --version` cannot differ.
+        # main() answers the flag before this parser exists, so this action is
+        # what puts the switch in --help for a parse that does reach here.
+        parser.add_argument('--version', action='version',
+                    version=VERSION_BANNER,
+                    help='show the release number and exit')
         # Standard display switches: --ascii/--glyphs, --theme and --no-color.
         # apply_display_arguments() below acts on them before any window exists.
         display_cli.add_display_arguments(parser, prog='rmbloat')

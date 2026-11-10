@@ -15,9 +15,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from rmbloat import Sandbox
-from rmbloat.ProbeCache import ProbeCache, Probe
+from rmbloat.ProbeCache import Probe, ProbeCache
 from rmbloat.Sandbox import CappedResult
+
+from rmbloat import Sandbox
 
 
 def _ffprobe_result(payload):

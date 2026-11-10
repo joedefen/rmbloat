@@ -26,13 +26,13 @@ from unittest import mock
 
 from tests.runtime_stubs import stubbed_runtime_dependencies
 
-
 with stubbed_runtime_dependencies():
-    from rmbloat import Sandbox
     from rmbloat.Models import PathProbePair, Probe
     from rmbloat.PersistentState import PersistentState
     from rmbloat.ProbeCache import ProbeCache
     from rmbloat.TranscodeThread import TranscodeThread
+
+    from rmbloat import Sandbox
 
 
 class MainLoopCwdTests(unittest.TestCase):

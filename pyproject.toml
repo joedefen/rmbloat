@@ -1,16 +1,28 @@
 [build-system]
-requires = ["flit_core>=3.4"]
+# flit_core 3.12 is the first release that understands the PEP 639 `license`
+# expression and `license-files` keys used below.  The upper bound matters:
+# flit_core 4.x writes Metadata 2.5, which only twine >= 7 and packaging >= 26
+# accept -- exactly the floors the shared release gate checks for.
+requires = ["flit_core>=3.12,<5"]
 build-backend = "flit_core.buildapi"
 
 [project]
 name = "rmbloat"
-version = "1.0.0"
+# The release number lives in `rmbloat/__init__.py` (`__version__`).  This table
+# only declares where it comes from, so `./bless`, the built artifacts and the
+# smoke run all report the same string.
+dynamic = ["version"]
 readme = "README.md"
 description = "An intelligent FFmpeg utility for prioritizing and converting inefficient video files (BLOAT score)."
 authors = [
     { name = "Joe Defen", email = "joedef@duck.com" }
 ]
 requires-python = ">=3.11"
+# PEP 639: an SPDX expression plus the file it refers to.  The old
+# `License :: OSI Approved :: MIT License` classifier is deliberately gone --
+# declaring both invites the classifier and the expression to disagree.
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "console-window==2.2.2",
     "ruamel.yaml>=0.18.16",
@@ -18,7 +30,6 @@ dependencies = [
     "Send2Trash>=1.8.3",
 ]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -30,22 +41,60 @@ classifiers = [
 [project.urls]
 "Homepage" = "https://github.com/joedefen/rmbloat"
 
-[project.license]
-text = "MIT"
-
 [project.scripts]
 rmbloat = "rmbloat.rmbloat:main"
 rmbloatd = "rmbloat.rmbloatd:main"
 
-# Development gates.  `./linter` requires pylint to be importable by the same
-# interpreter that has the runtime dependencies, so pylint lives here rather
-# than being borrowed from another interpreter on PATH:
-#     python -m pip install -e '.[dev]'
 [project.optional-dependencies]
+# The toolchain `./bless` runs with, and the one a contributor needs to run the
+# same three gates by hand.  `./linter` also requires pylint to be importable by
+# the interpreter that holds the runtime dependencies, so pylint lives here
+# rather than being borrowed from another interpreter on PATH.  Build the
+# environment with `bt penv`, which installs this tree editable plus this extra.
 dev = [
+    "build>=1.2",
+    "packaging>=26",
     "pylint>=3.0",
-    "ruff>=0.6",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.9",
+    "twine>=7",
 ]
 
+[tool.bless]
+# The branch model the release gate keeps.  This project has both a trunk and a
+# development branch and `publish` aligns them before tagging; while `dev` did
+# not exist the trunk alone would satisfy the model.
+branches = ["main", "dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
+# Keep Ruff deterministic instead of inheriting a developer's global or a
+# version's default rule set: the gate CI runs and the gate `./bless` runs have
+# to be the same gate.  3.11 is the oldest interpreter `requires-python` allows.
 target-version = "py311"
+line-length = 120
+src = ["rmbloat", "tests"]
+extend-exclude = ["build", "dist", ".venv"]
+
+[tool.ruff.lint]
+# Small, high-signal set: pycodestyle import/statement errors, Pyflakes, import
+# sorting and bugbear.  Formatting and annotation-modernisation rules are
+# intentionally excluded, so `ruff check` never argues about layout or about
+# `Optional[X]` spellings this codebase already settled.
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.coverage.run]
+# src pins the measured package no matter which directory pytest is started
+# from, so the number the release gate prints is reproducible.
+source = ["rmbloat"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# Measured just above this when the shared gate was adopted; the floor is a
+# ratchet against new code arriving without a test, not a target to optimise.
+# Raise it when the number rises.
+fail_under = 60
+show_missing = true

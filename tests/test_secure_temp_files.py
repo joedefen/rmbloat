@@ -16,8 +16,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rmbloat import FileOps
 from rmbloat.ProbeCache import ProbeCache
+
+from rmbloat import FileOps
 
 
 class ProbeCacheSecureTempFileTests(unittest.TestCase):

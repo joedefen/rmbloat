@@ -18,7 +18,6 @@ from unittest import mock
 
 from rmbloat.IniManager import IniManager
 
-
 DEFAULTS = {
     'alpha': 'orig',
     'beta': 'default',

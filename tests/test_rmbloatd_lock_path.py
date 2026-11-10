@@ -12,9 +12,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from rmbloat import rmbloatd
 from rmbloat.IniManager import IniManager
 from rmbloat.ProbeCache import ProbeCache, default_cache_dir, default_lock_path
+
+from rmbloat import rmbloatd
 
 
 class RmbloatdLockPathTests(unittest.TestCase):

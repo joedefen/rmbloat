@@ -9,7 +9,6 @@ import tempfile
 import time
 from pathlib import Path
 
-
 HISTORY_EXPORT_PREFIX = 'rmbloat-export-'
 HISTORY_EXPORT_SUFFIX = '.txt'
 # A copy used to leave one file in the cache directory forever, so a session

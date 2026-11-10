@@ -4,15 +4,16 @@
 # pylint: disable=too-many-nested-blocks,too-many-instance-attributes
 # pylint: disable=too-many-locals,consider-using-with,too-many-branches
 # pylint: disable=too-many-arguments,too-many-positional-arguments
+import fcntl
 import os
 import re
-import fcntl
 import subprocess
 import threading
 import time
-from types import SimpleNamespace
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Optional
+
 from . import Sandbox
 
 

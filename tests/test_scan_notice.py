@@ -21,8 +21,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests.runtime_stubs import (purge_rmbloat_modules,
-                                 stubbed_runtime_dependencies)
+from tests.runtime_stubs import purge_rmbloat_modules, stubbed_runtime_dependencies
 
 
 class _TtyStream:

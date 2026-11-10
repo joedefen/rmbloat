@@ -27,17 +27,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.runtime_stubs import (purge_rmbloat_modules,
-                                 stubbed_runtime_dependencies)
-
+from tests.runtime_stubs import purge_rmbloat_modules, stubbed_runtime_dependencies
 
 # `rmbloat.ConvertUtils` pulls in `rmbloat.VideoParser`, which imports
 # `ruamel.yaml` at module import time.  Stub it so this file's tests run in a
 # bare checkout; the stubs are removed again immediately afterwards and the
 # module objects stay bound below.
 with stubbed_runtime_dependencies():
-    from rmbloat import ConvertUtils
     from rmbloat.ProbeCache import Probe, ProbeCache
+
+    from rmbloat import ConvertUtils
 
 
 

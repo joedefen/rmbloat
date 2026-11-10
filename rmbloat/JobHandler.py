@@ -11,11 +11,12 @@ import re
 import time
 import uuid
 from pathlib import Path
+
 import send2trash
-from .Models import Job, Vid
+
+from . import FileOps, Sandbox
 from .ConvertUtils import bash_quote
-from . import FileOps
-from . import Sandbox
+from .Models import Job, Vid
 from .TranscodeThread import TranscodeThread
 
 
