@@ -138,15 +138,44 @@ class ProbeCache:
         except Exception:
             return None
 
+    @staticmethod
+    def _as_int(value, default=0):
+        """
+        Best-effort int conversion for ffprobe fields.
+
+        ffprobe reports some numbers as strings, may omit them entirely, and
+        emits placeholders such as ``'N/A'`` for unusual or truncated files.
+        Returning ``default`` instead of raising keeps such values from
+        bypassing the probe error path with ``TypeError``/``ValueError``.
+        """
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_float(value, default=0.0):
+        """Best-effort float conversion for ffprobe fields (see _as_int)."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def _get_metadata_with_ffprobe(self, file_path: str) -> Optional[Probe]:
         """
         Extracts video metadata using ffprobe and creates a Probe object.
         """
         def get_color_spt():
             nonlocal video_stream
-            colorspace = video_stream.get('color_space', 'unknown')
-            color_primaries = video_stream.get('color_primaries', 'unknown')
-            color_trc = video_stream.get('color_transfer', 'unknown')
+            # Coerce to text: unusual streams may report JSON nulls or other
+            # non-string types, which would break the join below.
+            colorspace = str(video_stream.get('color_space') or 'unknown')
+            color_primaries = str(video_stream.get('color_primaries') or 'unknown')
+            color_trc = str(video_stream.get('color_transfer') or 'unknown')
             parts = [colorspace]
             if color_primaries != colorspace:
                 parts.append(color_primaries)
@@ -188,7 +217,14 @@ class ProbeCache:
             )
 
             metadata = json.loads(result.stdout)
-            video_stream = next((s for s in metadata.get('streams', []) if s.get('codec_type') == 'video'), None)
+            if not isinstance(metadata, dict):
+                raise ValueError("ffprobe output is not a JSON object.")
+            raw_streams = metadata.get('streams') or []
+            if not isinstance(raw_streams, list):
+                raise ValueError("ffprobe 'streams' is not a list.")
+            # Drop malformed stream entries up front so later field access is safe.
+            streams = [s for s in raw_streams if isinstance(s, dict)]
+            video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
 
             if not video_stream or not metadata.get("format"):
                 print(f"Error: ffprobe output missing critical stream/format data for '{file_path}'.")
@@ -196,9 +232,9 @@ class ProbeCache:
 
             # Capture all streams as compact "type:codec" strings
             all_streams = []
-            for s in metadata.get('streams', []):
-                stream_type = s.get('codec_type', 'unknown')
-                stream_codec = s.get('codec_name', 'unknown')
+            for s in streams:
+                stream_type = s.get('codec_type') or 'unknown'
+                stream_codec = s.get('codec_name') or 'unknown'
                 all_streams.append(f"{stream_type}:{stream_codec}")
 
             size_bytes = self._get_file_size(file_path)
@@ -208,20 +244,20 @@ class ProbeCache:
             meta = Probe(
                 folder=os.path.dirname(file_path) + '/',
                 last_seen=int(time.time()),
-                width=int(video_stream.get('width', 0)),
-                height=int(video_stream.get('height', 0)),
-                codec=video_stream.get('codec_name', '---'),
+                width=self._as_int(video_stream.get('width')),
+                height=self._as_int(video_stream.get('height')),
+                codec=video_stream.get('codec_name') or '---',
                 color_spt=get_color_spt(),
-                pix_fmt=video_stream.get('pix_fmt', 'unknown'),
-                bitrate=int(int(metadata["format"].get('bit_rate', '0'))/1000),
-                duration=float(metadata["format"].get('duration', 0.0)),
+                pix_fmt=video_stream.get('pix_fmt') or 'unknown',
+                bitrate=self._as_int(metadata["format"].get('bit_rate')) // 1000,
+                duration=self._as_float(metadata["format"].get('duration')),
                 streams=all_streams,
                 size_bytes=size_bytes,
             )
 
             # Detect unsafe subtitle streams
             safe_subtitle_codecs = {'subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'}
-            subtitle_streams = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'subtitle']
+            subtitle_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
 
             if subtitle_streams:
                 drop_indices = []
@@ -255,6 +291,11 @@ class ProbeCache:
             return self._increment_probe_failure(file_path)
         except IOError as e:
             print(f"File size error: {e}")
+            return self._increment_probe_failure(file_path)
+        except (TypeError, ValueError, AttributeError) as e:
+            # Last-resort guard for unexpected metadata shapes (e.g. a stream
+            # field that is neither numeric nor textual).
+            print(f"Error: Unusable ffprobe metadata for '{file_path}': {e}")
             return self._increment_probe_failure(file_path)
 
     # --- Cache Management Methods ---
