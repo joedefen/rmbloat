@@ -3,6 +3,7 @@
 import os
 import re
 import string
+import sys
 from io import StringIO
 from types import SimpleNamespace
 from ruamel.yaml import YAML
@@ -314,9 +315,13 @@ class VideoParser():
                 compiled_re = self.compiled_regexes.get(key, None)
                 if not compiled_re:
                     pat = self.regexes[cat][idx][1]
-                    # Append repack/release group info capture to all patterns
+                    # Append repack/release group info capture to all patterns.
+                    # The empty alternative must be tried *last*: with a bare
+                    # `.*?(\brepack\b|)` the empty branch matches immediately at
+                    # the current position, so the lazy scan never looked ahead
+                    # and `is_repack` was always False.
                     compiled_re = re.compile(self.trash_in_front_re + pat
-                            + r'.*?(\brepack\b|)', re.IGNORECASE)
+                            + r'(?:.*?(\brepack\b)|)', re.IGNORECASE)
                     self.compiled_regexes[key] = compiled_re
 
                 match = compiled_re.match(self.corename)
@@ -425,11 +430,12 @@ class VideoParser():
     # --- Regression Testing ---
 
     @staticmethod
-    def run_regressions(verbose: bool = False):
+    def run_regressions(verbose: bool = False) -> int:
         """
         Runs the internal test suite against the hardcoded YAML data.
 
         :param verbose: If True, prints all results; otherwise, prints only failures and summary.
+        :returns: The number of failing cases, so a caller (or CI) can gate on it.
         """
         # Load the YAML tests using the internal ruamel.yaml instance
         tests = yaml.load(VideoParser.tests_yaml)
@@ -459,6 +465,8 @@ class VideoParser():
             _print("\nTEST DUMP w new results:\n")
             # Use the custom_yaml_dump placeholder
             _print(custom_yaml_dump(results, flow_nodes=('result',), indent=4))
+
+        return fail_cnt
 
     @staticmethod
     def parse_file(filename: str, verbose: bool = False) -> bool:
@@ -503,39 +511,43 @@ class VideoParser():
     tests_yaml = r"""
     !!omap
     - Yellowstone.2018.S03E08.720p.HEVC.x265-MeGusta.mkv: !!omap
-      - result: tv0 "Yellowstone" s3e8 Y=2018 any .mkv
+      - result: tv0 "Yellowstone" s03e08 Y=2018 any .mkv
     - Law.and.Order.S18E01-E02.Called.Home.and.Darkness.2008.DVDRip.x264-TVV.mkv: !!omap
-      - result: tv0 "Law and Order" s18e1-2 any .mkv
+      - result: tv0 "Law and Order" s18e01-02 any .mkv
     - The.Amazing.World.of.Gumball.S03E13E14.720p.WEB-DL.AAC2.0.H.264-iT00NZ-7.mkv: !!omap
-      - result: tv0 "The Amazing World of Gumball" s3e13-14 any .mkv
+      - result: tv0 "The Amazing World of Gumball" s03e13-14 any .mkv
     - The Amazing World of Gumball - 132 - The Curse-28.mkv: !!omap
-      - result: tv3 "The Amazing World of Gumball" s1e32 any .mkv
+      - result: tv3 "The Amazing World of Gumball" s01e32 any .mkv
     - when.calls.the.heart.s06e07.repack.webrip.x264-tbs.mkv: !!omap
-      - result: tv0 "when calls the heart" s6e7 repack any .mkv
+      - result: tv0 "when calls the heart" s06e07 repack any .mkv
     - penny.dreadful.205.hdtv-lol.mp4: !!omap
-      - result: tv3 "penny dreadful" s2e5 any .mp4
+      - result: tv3 "penny dreadful" s02e05 any .mp4
     - American Experience s24e03-04 The Clinton Years.avi: !!omap
-      - result: tv0 "American Experience" s24e3-4 any .avi
+      - result: tv0 "American Experience" s24e03-04 any .avi
     - Homeland S01 E01 - 480p - BRRip - x264 - AAC 5.1 -={SPARROW}=-.mp4: !!omap
-      - result: tv0 "Homeland" s1e1 any .mp4
+      - result: tv0 "Homeland" s01e01 any .mp4
     - Friends - [1x08] - The One where Nana dies Twice.mkv: !!omap
-      - result: tv1 "Friends" s1e8 any .mkv
+      - result: tv1 "Friends" s01e08 any .mkv
     - Captain Alatriste The Spanish Musketeer (2006).mkv: !!omap
       - result: mov0 "Captain Alatriste The Spanish Musketeer" Y=2006 any .mkv
     - Wonder.Woman.1984.2020.720p.HMAX.WEBRip.AAC2.0.X.264-EVO.mkv: !!omap
       - result: mov1 "Wonder Woman 1984" Y=2020 any .mkv
     - law.and.order.svu.220.dvdrip.avi: !!omap
-      - result: tv3 "law and order svu" s2e20 any .avi
+      - result: tv3 "law and order svu" s02e20 any .avi
     - '[HorribleSubs] One Punch Man S2 - 11 [480p].mkv': !!omap
-      - result: tv5 "One Punch Man" s2e11 any .mkv
+      - result: tv5 "One Punch Man" s02e11 any .mkv
     - Gone with the Wind.1939: !!omap
       - result: mov1 "Gone with the Wind" Y=1939 any n/a
+    # No year and no release/junk token, so no movie pattern can anchor on it;
+    # the name is reported as unparsed (n/a) and standard_name() falls back to
+    # its codec-token purge.  (It used to be reported as mov2 before the junk
+    # anchor became mandatory.)
     - Gone with the Wind.avi: !!omap
-      - result: mov2 "Gone with the Wind" any .avi
+      - result: n/a "Gone with the Wind" any .avi
     - Big.Little.Lies.Part.1.iNTERNAL.720p.HEVC.x265-MeGusta.mkv: !!omap
-      - result: tv7 "Big Little Lies" s1e1 any .mkv
+      - result: tv7 "Big Little Lies" s01e01 any .mkv
     - The.Flash.2014.S06E06.720p.HEVC.x265-MeGusta.mkv: !!omap
-      - result: tv0 "The Flash" s6e6 Y=2014 any .mkv
+      - result: tv0 "The Flash" s06e06 Y=2014 any .mkv
     - Borat.PROPER.DVDRip.XviD-DoNE.avi: !!omap
       - result: mov2 "Borat" any .avi
     - Samurai Jack - 0xSpecial 4 - Genndy\'s Scrapbook.avi: !!omap
@@ -616,7 +628,7 @@ if __name__ == "__main__":
         print(f'{mangled=}    {video=}')
 
 
-    VideoParser.run_regressions(verbose=False)
+    failures = VideoParser.run_regressions(verbose=False)
 
     # ---
 
@@ -637,3 +649,6 @@ if __name__ == "__main__":
     print("Testing Movie file: Captain Alatriste The Spanish Musketeer (2006).mkv")
     print("="*50)
     VideoParser.parse_file("Captain Alatriste The Spanish Musketeer (2006).mkv", verbose=True)
+
+    # Non-zero on regression failures so this entry point can gate CI.
+    sys.exit(1 if failures else 0)
