@@ -1,9 +1,9 @@
 """Regression tests for the ``rmbloatd`` duplicate-instance lock path.
 
-The wrapper used to hardcode ``/tmp/video_probes.json.lock`` while the app
-constructs ``ProbeCache`` with its config directory, producing
-``~/.config/rmbloat/video_probes.json.lock``.  ``rmbloatd start`` therefore
-never saw a running instance.  These tests pin the shared source of truth.
+The wrapper used to hardcode ``/tmp/video_probes.json.lock``.  The app now
+keeps its private probe cache in ``$XDG_CACHE_HOME/rmbloat`` (``~/.cache`` by
+default), so ``rmbloatd`` must derive the lock from that same directory.
+These tests pin the shared source of truth.
 """
 
 import os
@@ -22,33 +22,44 @@ class RmbloatdLockPathTests(unittest.TestCase):
 
     def _expected_lock(self, home):
         return os.path.join(
-            home, '.config', 'rmbloat', 'video_probes.json.lock')
+            home, '.cache', 'rmbloat', 'video_probes.json.lock')
 
-    def test_default_lock_path_uses_config_dir(self):
+    def test_default_lock_path_uses_xdg_cache_dir(self):
         with tempfile.TemporaryDirectory() as home, \
-                mock.patch.dict(os.environ, {'HOME': home}):
+                mock.patch.dict(os.environ, {'HOME': home}, clear=True):
             self.assertEqual(default_lock_path(), self._expected_lock(home))
             self.assertNotEqual(
                 default_lock_path(), '/tmp/video_probes.json.lock')
+            self.assertNotEqual(
+                default_lock_path(),
+                os.path.join(home, '.config', 'rmbloat',
+                             'video_probes.json.lock'))
 
     def test_probe_cache_default_ctor_uses_same_lock_path(self):
         with tempfile.TemporaryDirectory() as home, \
-                mock.patch.dict(os.environ, {'HOME': home}), \
+                mock.patch.dict(os.environ, {'HOME': home}, clear=True), \
                 mock.patch.object(ProbeCache, '_acquire_instance_lock'), \
                 mock.patch.object(ProbeCache, 'load'):
             cache = ProbeCache()
         self.assertEqual(cache.lock_path, self._expected_lock(home))
 
-    def test_ini_manager_and_probe_cache_agree_on_directory(self):
+    def test_xdg_cache_home_overrides_config_dir(self):
         with tempfile.TemporaryDirectory() as home, \
-                mock.patch.dict(os.environ, {'HOME': home}):
-            self.assertEqual(
-                str(IniManager.default_config_dir('rmbloat')),
-                default_cache_dir())
+                tempfile.TemporaryDirectory() as cache_home, \
+                mock.patch.dict(os.environ,
+                                {'HOME': home,
+                                 'XDG_CACHE_HOME': cache_home},
+                                clear=True):
+            expected = os.path.join(
+                cache_home, 'rmbloat', 'video_probes.json.lock')
+            self.assertEqual(default_lock_path(), expected)
+            self.assertNotEqual(
+                default_cache_dir(),
+                str(IniManager.default_config_dir('rmbloat')))
 
     def test_main_exports_lock_path_to_shell_script(self):
         with tempfile.TemporaryDirectory() as home, \
-                mock.patch.dict(os.environ, {'HOME': home}), \
+                mock.patch.dict(os.environ, {'HOME': home}, clear=True), \
                 mock.patch.object(sys, 'argv', ['rmbloatd', 'start']), \
                 mock.patch.object(rmbloatd.os, 'execve') as execve:
             rmbloatd.main()

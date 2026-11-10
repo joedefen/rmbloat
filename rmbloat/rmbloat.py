@@ -1846,7 +1846,9 @@ def main(args=None) -> int:
 
         opts.bloat_thresh = max(500, opts.bloat_thresh)
 
-        Converter(opts, os.path.dirname(ini.config_file_path), ini).main_loop()
+        # Let ProbeCache choose its private XDG cache directory.  The cache
+        # contains media paths and must not live next to config.ini.
+        Converter(opts, ini=ini).main_loop()
         return 0
     except Exception as exc:
         # Note: We no longer call Window.exit_handler(), as ConsoleWindow handles it

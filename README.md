@@ -597,8 +597,8 @@ rmbloat --chooser-tests --prefer-strategy docker_accel
 # Check for existing process
 ps aux | grep rmbloat
 
-# Find and remove stale lock file
-rm ~/.config/rmbloat/*.lock
+# Find and remove stale lock file (XDG cache directory)
+rm "${XDG_CACHE_HOME:-$HOME/.cache}"/rmbloat/*.lock
 
 # If using rmbloatd
 rmbloatd status
@@ -789,7 +789,7 @@ Software and hardware encoders use different quality scales:
 - A 4K video with `-q 28` using hardware acceleration would encode at approximately QP 32 (28 + 2 for resolution + 2 for hardware mapping), efficiently compressing the high pixel count while maintaining excellent visual quality.
 
 ### Logging (--logs)
-When a conversion completes successfully or not, details are logged into files in your `~/.config/rmbloat` folder. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
+When a conversion completes successfully or not, details are logged into private files in your `$XDG_STATE_HOME/rmbloat` folder (`~/.local/state/rmbloat` by default). The log directory is mode 0700 and `events.jsonl` is mode 0600 because log entries contain media paths and ffmpeg output. You can view those files with `rmbloat --logs` using `less`; see the `less` man page if needed.
 
 ### Performance and Server Impact
 By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering its priority. This will (in our experience) allow the server to run rather well.  But, your experience may vary.

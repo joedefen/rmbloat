@@ -145,23 +145,27 @@ class MainExitStatusTests(unittest.TestCase):
 
     def test_successful_run_returns_zero(self):
         converter = mock.Mock()
+        ini = self._fake_ini()
         with mock.patch.object(
-                self.rmbloat, 'IniManager', return_value=self._fake_ini()), \
+                self.rmbloat, 'IniManager', return_value=ini), \
              mock.patch.object(
-                self.rmbloat, 'Converter', return_value=converter):
+                self.rmbloat, 'Converter', return_value=converter) as conv_cls:
             status = self.rmbloat.main([])
 
         self.assertEqual(status, 0)
         converter.main_loop.assert_called_once_with()
+        # ProbeCache must choose its private XDG directory, not the config dir.
+        self.assertIsNone(conv_cls.call_args.kwargs.get('cache_dir'))
+        self.assertIs(conv_cls.call_args.kwargs.get('ini'), ini)
 
     def test_unexpected_exception_returns_one_and_reports_traceback(self):
         stderr = io.StringIO()
         with mock.patch.object(
                 self.rmbloat, 'IniManager',
-                side_effect=RuntimeError('initialization exploded')):
-            with contextlib.redirect_stderr(stderr), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                status = self.rmbloat.main([])
+                side_effect=RuntimeError('initialization exploded')), \
+             contextlib.redirect_stderr(stderr), \
+             contextlib.redirect_stdout(io.StringIO()):
+            status = self.rmbloat.main([])
 
         self.assertEqual(status, 1)
         printed = stderr.getvalue()
@@ -174,10 +178,10 @@ class MainExitStatusTests(unittest.TestCase):
 
         with mock.patch.object(
                 self.rmbloat, 'IniManager',
-                side_effect=RuntimeError('boom')):
-            with contextlib.redirect_stderr(io.StringIO()), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                status = self.rmbloat.main([])
+                side_effect=RuntimeError('boom')), \
+             contextlib.redirect_stderr(io.StringIO()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            status = self.rmbloat.main([])
 
         self.assertEqual(status, 1)
         win.stop_curses.assert_called_once_with()

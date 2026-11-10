@@ -7,6 +7,7 @@ ERR entries age 10x slower than other entries, so they persist longer.
 # pylint: disable=too-many-instance-attributes,invalid-name,line-too-long
 # pylint: disable=unused-argument
 
+import os
 import sys
 import json
 import inspect
@@ -15,6 +16,19 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Dict, Any
+
+
+def default_log_dir(app_name: str = 'rmbloat') -> Path:
+    """Return the per-user state directory used for structured logs.
+
+    Logs contain absolute media paths and ffmpeg output, so they belong in
+    ``$XDG_STATE_HOME`` rather than the configuration directory.  The default
+    is ``~/.local/state/<app_name>``; callers that pass ``log_dir`` explicitly
+    still control the parent directory.
+    """
+    base = os.environ.get('XDG_STATE_HOME') or os.path.join(
+        os.path.expanduser('~'), '.local', 'state')
+    return Path(base) / app_name
 
 # ============================================================================
 # Data Classes for Structured Logging
@@ -144,7 +158,7 @@ class StructuredLogger:
     """
 
     # Size limits (adjust as needed)
-    MAX_LOG_SIZE = 50 * 1024 * 1024  # 10 MB
+    MAX_LOG_SIZE = 50 * 1024 * 1024  # 50 MB
     TRIM_TO_RATIO = 0.67  # Trim to 67% when max exceeded
     ERR_AGE_WEIGHT = 10  # ERR entries age 10x slower
 
@@ -173,24 +187,36 @@ class StructuredLogger:
             'last_trim': datetime.now()
         }
 
+    @staticmethod
+    def _chmod_private(path: Path, mode: int) -> None:
+        """Tighten ``path`` permissions, ignoring filesystems that refuse it."""
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
     def _setup_paths(self, log_dir: Optional[Path]) -> None:
-        """Set up log directory and file paths."""
+        """Set up private log directory and file paths."""
         try:
             if log_dir:
-                base_dir = Path(log_dir)
+                self.log_dir = Path(log_dir) / self.app_name
             else:
-                base_dir = Path.home() / '.config'
+                self.log_dir = default_log_dir(self.app_name)
 
-            # Create app-specific directory
-            self.log_dir = base_dir / self.app_name
-            self.log_dir.mkdir(parents=True, exist_ok=True)
+            # Logs (and archives) contain media paths and ffmpeg output, so
+            # only the owning user may traverse the directory.
+            self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._chmod_private(self.log_dir, 0o700)
 
             # Single log file (JSON Lines format)
             self.log_file = self.log_dir / "events.jsonl"
+            if self.log_file.exists():
+                self._chmod_private(self.log_file, 0o600)
 
             # Archive directory
             self.archive_dir = self.log_dir / "archive"
-            self.archive_dir.mkdir(exist_ok=True)
+            self.archive_dir.mkdir(exist_ok=True, mode=0o700)
+            self._chmod_private(self.archive_dir, 0o700)
 
         except Exception as e:
             print(f"FATAL: Cannot setup log directory: {e}", file=sys.stderr)
@@ -250,9 +276,17 @@ class StructuredLogger:
         if self.log_file.exists() and self.log_file.stat().st_size >= self.MAX_LOG_SIZE:
             self._trim_log_file()
 
-        # Write the entry
+        # Write the entry.  ``os.open`` with mode 0600 protects the file even
+        # if the process umask would otherwise create it world-readable; the
+        # explicit fchmod also tightens logs written by older releases.
         try:
-            with open(self.log_file, 'a', encoding='utf-8') as f:
+            fd = os.open(self.log_file,
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'a', encoding='utf-8') as f:
                 json_line = json.dumps(entry.to_dict())
                 f.write(json_line + '\n')
 

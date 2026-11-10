@@ -20,8 +20,6 @@ from typing import Optional, Dict, Any, List
 from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
 
-from .IniManager import IniManager
-
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60
 
@@ -32,13 +30,17 @@ DEFAULT_CACHE_FILE_NAME = "video_probes.json"
 
 def default_cache_dir():
     """
-    Returns the directory rmbloat uses for its probe cache.
+    Returns the per-user XDG cache directory for the probe cache.
 
-    The application passes the directory holding ``config.ini``
-    (``~/.config/rmbloat``), so the cache and its ``.lock`` file live next to
-    the rest of the per-user state rather than in the shared ``/tmp``.
+    The cache contains absolute media paths and ffmpeg-derived metadata, so it
+    belongs in ``$XDG_CACHE_HOME/rmbloat`` (``~/.cache/rmbloat`` by default)
+    rather than the configuration directory or a shared ``/tmp``.  The
+    ``.lock`` file lives here too, and :func:`rmbloatd` derives its path from
+    this function.
     """
-    return str(IniManager.default_config_dir("rmbloat"))
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.join(
+        os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'rmbloat')
 
 
 def default_lock_path(cache_file_name=DEFAULT_CACHE_FILE_NAME):
@@ -82,9 +84,21 @@ class ProbeCache:
                  chooser=None):
         if cache_dir_name is None:
             cache_dir_name = default_cache_dir()
-            os.makedirs(cache_dir_name, exist_ok=True)
+        # Keep the cache directory private: entries expose the user's media
+        # paths.  ``mode`` and the explicit chmod cover an older directory
+        # created under a permissive umask.
+        os.makedirs(cache_dir_name, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(cache_dir_name, 0o700)
+        except OSError:
+            pass
         self.cache_path = os.path.join(cache_dir_name, cache_file_name)
         self.lock_path = self.cache_path + ".lock"
+        if os.path.exists(self.cache_path):
+            try:
+                os.chmod(self.cache_path, 0o600)
+            except OSError:
+                pass
         self.cache_data: Dict[str, Dict[str, Any]] = {}  # abs_path -> {size_str -> probe_dict}
         self._dirty_count = 0
         # Reentrant: callers such as batch_get_or_probe() already hold this lock
@@ -104,7 +118,13 @@ class ProbeCache:
     def _acquire_instance_lock(self):
         """Acquire exclusive lock - only one rmbloat instance can run"""
         try:
-            self._lock_file = open(self.lock_path, 'w', encoding='utf-8')
+            fd = os.open(self.lock_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            self._lock_file = os.fdopen(fd, 'w', encoding='utf-8')
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Register cleanup on exit
             atexit.register(self._release_instance_lock)

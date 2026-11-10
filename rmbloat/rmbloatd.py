@@ -116,8 +116,8 @@ is_daemon_running_anywhere() {
     # Check if rmbloat is running anywhere (including outside tmux) by testing
     # the ProbeCache single-instance lock.  The Python wrapper injects the
     # authoritative path (ProbeCache.default_lock_path) via RMBLOAT_LOCK_FILE;
-    # the fallback matches the app default (config dir), not /tmp.
-    local LOCK_FILE="${RMBLOAT_LOCK_FILE:-$HOME/.config/rmbloat/video_probes.json.lock}"
+    # the fallback matches the app default (XDG cache dir), not /tmp.
+    local LOCK_FILE="${RMBLOAT_LOCK_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/rmbloat/video_probes.json.lock}"
 
     if [ -f "$LOCK_FILE" ]; then
         # Lock file exists - check if it's actually locked (not stale)
@@ -228,8 +228,8 @@ def main():
     else:
         env['RMBLOAT_ARGS'] = ''
 
-    # The app acquires its probe-cache lock in the config directory; pass the
-    # same path to the shell script so duplicate-instance detection works.
+    # The app acquires its probe-cache lock in the XDG cache directory; pass
+    # the same path to the shell script so duplicate-instance detection works.
     env['RMBLOAT_LOCK_FILE'] = default_lock_path()
 
     # Replace the current process with the new command
