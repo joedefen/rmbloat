@@ -37,6 +37,7 @@ from .Models import PathProbePair, Vid
 from . import FileOps
 from . import ConvertUtils
 from . import Sandbox
+from . import StatusLine
 from .JobHandler import JobHandler
 from .PersistentState import PersistentState
 
@@ -670,9 +671,10 @@ class Converter:
 
         # The directory walk below visits every entry under the given paths.  On
         # a media share with tens of thousands of files that pause can last many
-        # seconds, so announce the scan (and report what it found) instead of
-        # leaving the terminal silent between the FFmpeg summary and the probe
-        # progress line.
+        # seconds, so the scan owns a single status line: it opens with the
+        # announcement and is replaced by the final count and duration.  Keeping
+        # it to one line means the probe status that follows starts on a fresh
+        # row and neither phase can overwrite or hide the other.
         scan_targets = [p for p in (getattr(self.opts, 'files', None) or [])
                         if p != '-']
         if scan_targets:
@@ -681,20 +683,17 @@ class Converter:
             # Keep the notice after the (stdout) detection summary even when
             # stdout is redirected to a file or pipe.
             sys.stdout.flush()
-            sys.stderr.write(
-                f"Scanning {label} for video files"
-                " (large collections can take a while)...\n")
-            sys.stderr.flush()
+            StatusLine.begin(f"Scanning {label} for video files"
+                             " (large collections can take a while)...")
 
         # Get candidate video file paths
         scan_start = time.monotonic()
         paths_to_probe, read_pipe = self.get_candidate_video_files(self.opts.files)
         if scan_targets:
             found = len(paths_to_probe)
-            sys.stderr.write(
+            StatusLine.end(
                 f"Found {found} candidate video{'s' if found != 1 else ''}"
-                f" in {time.monotonic() - scan_start:.1f}s\n")
-            sys.stderr.flush()
+                f" in {time.monotonic() - scan_start:.1f}s")
 
         # --- Restore TTY Input if needed ---
         if read_pipe:
@@ -723,16 +722,8 @@ class Converter:
                 sys.stderr.write(f"Error reopening TTY: {e}. Cannot enter interactive mode.\n")
                 sys.exit(1)
 
-        # 5. Final Probing and Progress Indicator 🎬
-        total_files = len(paths_to_probe)
-#       probe_count = 0
-#       update_interval = 10  # Update the line every 10 probes
-
-        if total_files > 0:
-            # Print the initial line to start the progress bar
-            sys.stderr.write(f"probing: 0% 0 of {total_files}\r")
-            sys.stderr.flush()
-
+        # 5. Final probing.  ProbeCache owns the single status line for this
+        # phase, so the scan above must already have terminated its own.
         results = self.probe_cache.batch_get_or_probe(paths_to_probe)
         for file_path, probe in results.items():
             # batch_get_or_probe() omits files it could not probe (missing,

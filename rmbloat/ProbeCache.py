@@ -20,6 +20,7 @@ from typing import Optional, Dict, Any, List
 from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
 from . import Sandbox
+from . import StatusLine
 
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60
@@ -703,7 +704,12 @@ class ProbeCache:
             return results
 
         total_files, probe_cnt = len(probe_needed_paths), 0
-        print(f"Starting concurrent ffprobe for {len(probe_needed_paths)} files using {max_workers} threads...")
+        probe_start = time.monotonic()
+        # The probe phase owns one status line for its whole duration; see
+        # rmbloat.StatusLine for why it must not share a row with stdout.
+        StatusLine.begin(
+            f"Starting concurrent ffprobe for {total_files} files"
+            f" using {max_workers} threads...")
 
         def probe_wrapper(filepath: str) -> Optional[Probe]:
             return self._get_metadata_with_ffprobe(filepath)
@@ -732,8 +738,8 @@ class ProbeCache:
                             if self._dirty_count >= 100:
                                 self.store()
                                 percent = round(100 * probe_cnt / total_files, 1)
-                                sys.stderr.write(f"probing: {percent}% {probe_cnt} of {total_files}\r")
-                                sys.stderr.flush()
+                                StatusLine.update(
+                                    f"probing: {percent}% {probe_cnt} of {total_files}")
 
                     except KeyboardInterrupt:
                         print("\n🛑 Received interrupt. Shutting down worker threads...")
@@ -771,12 +777,15 @@ class ProbeCache:
                 with self._cache_lock:
                     self.store()
                 if exit_please:
+                    StatusLine.end("probing: interrupted")
                     sys.exit(1)
 
         self.store()
         if total_files > 0:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+            # Always finish on a complete state, even when the last cache flush
+            # happened before the final file was probed.
+            StatusLine.end(f"probing: 100% {total_files} of {total_files}"
+                           f" in {time.monotonic() - probe_start:.1f}s")
 
         if failed_paths:
             sys.stderr.write(
