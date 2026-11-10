@@ -25,6 +25,15 @@ from . import StatusLine
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60
 
+# Anomaly stored for a file ffprobe could read but which contains no video
+# stream (an audio-only track, cover art, a data file).  The value is a durable
+# verdict rather than a failure to retry, so it is deliberately *not* of the
+# ``?P<digit>`` form used by the probe-failure ladder in
+# ``_increment_probe_failure()``: the entry is served from the cache instead of
+# re-running ffprobe on every scan, but ``get()``/``batch_get_or_probe()`` still
+# report the file as absent so it never becomes a row.
+NOT_A_VIDEO_ANOMALY = '?NV'
+
 # Only ask ffprobe for the fields the cache actually consumes.  Besides being
 # smaller, this keeps a crafted file's tag/chapter metadata out of the JSON
 # parser and the memory footprint.
@@ -283,8 +292,22 @@ class ProbeCache:
             streams = [s for s in raw_streams if isinstance(s, dict)]
             video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
 
-            if not video_stream or not metadata.get("format"):
-                print(f"Error: ffprobe output missing critical stream/format data for '{file_path}'.",
+            if not video_stream:
+                # ffprobe read the file fine and it simply has no video stream.
+                # Record that verdict in the cache: a media share that mixes
+                # music and video would otherwise re-run ffprobe (each with a
+                # 30-second timeout) and re-print this error for every audio
+                # file on every single scan.
+                print(f"Error: no video stream in '{file_path}'; skipping it.",
+                      file=sys.stderr)
+                self._record_not_a_video(file_path)
+                return None
+
+            if not metadata.get("format"):
+                # A video stream without format data usually means a truncated
+                # or still-being-written file, so this stays undecided rather
+                # than becoming a durable "not a video" verdict.
+                print(f"Error: ffprobe output missing format data for '{file_path}'.",
                       file=sys.stderr)
                 return None
 
@@ -380,6 +403,27 @@ class ProbeCache:
 
             self._set_cache(filepath, meta)
         return meta
+
+    def _record_not_a_video(self, filepath: str) -> None:
+        """Cache a durable "this file has no video stream" verdict.
+
+        The entry is keyed by path *and* size, so replacing the file re-probes
+        it, and it ages out with the normal 4-week prune if the file stops
+        being scanned.  Callers must still treat the file as absent; recording
+        the verdict only saves the next run from launching ffprobe again.
+        """
+        size_bytes = self._get_file_size(filepath)
+        if size_bytes is None:
+            # The file vanished or is unreadable between ffprobe and here; there
+            # is no size to key an entry on, so leave the cache untouched.
+            return
+        meta = Probe(
+            folder=os.path.dirname(self._cache_key(filepath)) + '/',
+            last_seen=int(time.time()),
+            anomaly=NOT_A_VIDEO_ANOMALY,
+            size_bytes=size_bytes
+        )
+        self._set_cache(filepath, meta)
 
     @staticmethod
     def _compute_fields(meta):
@@ -574,6 +618,11 @@ class ProbeCache:
                 except (ValueError, IndexError):
                     pass
 
+            # NOT_A_VIDEO_ANOMALY falls through deliberately: it is a durable
+            # verdict, not a failure to retry, so serving the entry (and
+            # refreshing last_seen below) is exactly what stops the next scan
+            # from running ffprobe on the file again.
+
             # Keep the stored folder in sync with the key's directory.
             folder = os.path.dirname(key) + '/'
             if entry.get('folder') != folder:
@@ -588,12 +637,19 @@ class ProbeCache:
 
     def get(self, filepath: str) -> Optional[Probe]:
         """
-        Primary entry point. Tries cache first (by basename+size).
-        If invalid, runs ffprobe, stores result, and returns it.
+        Primary entry point. Tries the cache first (absolute path + size),
+        then runs ffprobe, stores the result, and returns it.  ``None`` means
+        "not a usable video": the file is missing, has no video stream (that
+        verdict is cached), or the probe failed.
         """
         # 1. Check for valid cache hit
         meta = self._get_valid_entry(filepath)
         if meta:
+            # A cached "no video stream" verdict is not a probe result; report
+            # the file as absent so it never becomes a row.  The cache entry
+            # stays, so this call did not need ffprobe.
+            if meta.anomaly == NOT_A_VIDEO_ANOMALY:
+                return None
             return meta
 
         # 2. Cache miss/invalid: Run ffprobe
@@ -690,20 +746,32 @@ class ProbeCache:
 
         Files that produce no metadata (missing, audio-only, or otherwise not a
         probeable video) are omitted from the returned mapping and reported on
-        stderr, so callers never have to handle a ``None`` probe.
+        stderr, so callers never have to handle a ``None`` probe.  A file whose
+        lack of a video stream is already cached is reported as a single
+        aggregate count: naming thousands of audio tracks on every scan would
+        bury the files that actually need attention.
         """
         exit_please = False
         results: Dict[str, Probe] = {}
         failed_paths: List[str] = []
+        cached_skips: List[str] = []
         probe_needed_paths: List[str] = []
 
         # 1. First Pass: Check Cache for all files
         for filepath in filepaths:
             meta = self._get_valid_entry(filepath)
-            if meta:
+            if meta and meta.anomaly == NOT_A_VIDEO_ANOMALY:
+                cached_skips.append(filepath)
+            elif meta:
                 results[filepath] = meta
             else:
                 probe_needed_paths.append(filepath)
+
+        if cached_skips:
+            sys.stderr.write(
+                f"Skipped {len(cached_skips)} file(s) already known to have no"
+                " video stream (cached; re-probed when their size changes).\n")
+            sys.stderr.flush()
 
         # 2. Second Pass: Concurrent Probing for cache misses
         if not probe_needed_paths:
