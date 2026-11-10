@@ -489,6 +489,7 @@ class JobHandler:
         self.elaborate_err(vid)
 
         probe = None
+        rejected = False
         if success:
             # Check if the file actually exists and is valid
             probe = self.probe_cache.get(job.temp_file)
@@ -502,13 +503,23 @@ class JobHandler:
                 net_pct = int(round(net_ratio * 100))
                 vid.net = f'{net_pct}%'
 
-                # Optimization Check: If already a good codec, did we save enough space?
-                original_was_allowed = self.is_allowed_codec(self.opts, vid.probe0)
-                if original_was_allowed and net_pct > -self.opts.min_shrink_pct:
-                    vid.ops.append(f"REJECTED: Already {vid.probe0.codec} and shrink ({net_pct}%) not > -{self.opts.min_shrink_pct}%")
+                # Minimum-shrink guard. This applies to *every* transcode, not
+                # only ones whose original codec is already allowed: a
+                # disallowed original codec is not a licence to replace a file
+                # with a larger one. A rejection is NOT an error - it means the
+                # source is already optimally sized - so keep the 'OPT' anomaly
+                # (do not let the failure path overwrite it) and leave the
+                # original file untouched.
+                if net_pct > -self.opts.min_shrink_pct:
+                    vid.ops.append(
+                        f"REJECTED: shrink ({net_pct}%) not > "
+                        f"-{self.opts.min_shrink_pct}% (original "
+                        f"{vid.probe0.codec})")
                     self.probe_cache.set_anomaly(vid.filepath, 'OPT')
+                    rejected = True
                     success = False
-                    vid.doit = 'ERR'
+                    vid.doit = 'OPT'
+                    probe = None  # the temp output will be deleted below
 
         # 3. File Swaps or Cleanup
         # A failed swap means the transcode itself was fine but we could not
@@ -531,7 +542,11 @@ class JobHandler:
             if success and not self.opts.sample:
                 self.ok_count += 1
                 self.consecutive_failures = 0
-            elif not success:
+            elif not success and not rejected:
+                # A rejected job is a successful transcode whose output was
+                # not worth keeping, so it must not trip the failure counters
+                # (otherwise a run of already-optimal files would stop auto
+                # mode via the "10 consecutive failures" guard).
                 self.error_count += 1
                 self.consecutive_failures += 1
 
@@ -540,7 +555,9 @@ class JobHandler:
                 os.remove(job.temp_file)
                 if not vid.ops:
                     vid.ops.append(f"CLEANUP: Deleted {job.temp_file} - Job failed or rejected.")
-            self.probe_cache.set_anomaly(vid.filepath, 'Err')
+            # Never overwrite the 'OPT' anomaly recorded for a rejection.
+            if not rejected:
+                self.probe_cache.set_anomaly(vid.filepath, 'Err')
 
         if not swap_ok:
             probe = None

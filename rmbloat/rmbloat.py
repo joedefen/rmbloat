@@ -325,7 +325,11 @@ class Converter:
         dumped = asdict(job.vid)
         runs = dumped.get('runs') or []
 
-        if clean_label.startswith('OK'):
+        # 'OPT' means the transcode succeeded but was rejected because it did
+        # not shrink enough. It is not an error, so log it with the OK stream.
+        is_ok = clean_label.startswith('OK') or clean_label == 'OPT'
+
+        if is_ok:
             # Clean up logs for successful runs, including each run's ffmpeg
             # output (asdict embedded runs[*].texts even though vid.texts was
             # cleared).
@@ -342,9 +346,10 @@ class Converter:
         title = 'RE-ENCODE-TO-H265'
         if clean_label == 'OK2': title += '-RETRY'
         elif clean_label == 'OK3': title += '-SOFTWARE'
+        elif clean_label == 'OPT': title += '-REJECTED'
 
         # Use the stripped label for the logic check
-        lg.put('OK' if clean_label.startswith('OK') else 'ERR',
+        lg.put('OK' if is_ok else 'ERR',
                f"{title} ", json.dumps(dumped, indent=4))
 
     def _auto_mode_elapsed_hrs(self):
@@ -452,9 +457,11 @@ class Converter:
                     self.job.vid.probe1 = self.apply_probe(self.job.vid, probe)
 
                 # finish_transcode_job() can downgrade an FFmpeg success to an
-                # error (e.g. the original could not be replaced safely).
-                if vid.doit == 'ERR':
-                    report = 'ERR'
+                # error (e.g. the original could not be replaced safely) or
+                # record a rejection ('OPT' = already optimally sized). Keep
+                # both terminal states instead of reporting the prior ' OK'.
+                if vid.doit in ('ERR', 'OPT'):
+                    report = vid.doit
                 vid.doit = vid.doit_auto = report
 
                 # Final Logging (moved from old_advance_jobs)
