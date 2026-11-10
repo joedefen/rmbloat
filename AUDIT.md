@@ -14,7 +14,7 @@
 | Gate | Command | Result |
 | --- | --- | --- |
 | Byte-compile | `.venv/bin/python -m py_compile rmbloat/*.py tests/*.py` | pass |
-| Tests | `.venv/bin/python -m unittest discover -s tests -t .` | `OK` — 215 tests |
+| Tests | `.venv/bin/python -m unittest discover -s tests -t .` | `OK` — 218 tests |
 | Ruff | `.venv/bin/python -m ruff check --select F,E9 rmbloat tests` | `All checks passed!` |
 | Pylint wrapper | `./linter` | exit 30 — see [L3](#l3-the-linter-wrapper-selects-an-interpreter-that-cannot-see-the-dependencies) |
 
@@ -31,7 +31,7 @@ The following areas were remediated previously and were **verified to still hold
 - **Shrink/reject state machine.** `OPT` is distinct from `ERR`, the shrink guard applies to every transcode, and rejections do not trip auto-mode failure counters. See [`finish_transcode_job()`](rmbloat/JobHandler.py:545).
 - **Auto-mode termination.** `--auto-hr` deadline, drained-queue exit, no-selection exit and the 10-consecutive-failure ladder all terminate the run. See [`_manage_queue_and_auto_mode()`](rmbloat/rmbloat.py:462).
 - **Probe cache.** Path+size keying, `RLock` around every mutation, atomic store via `mkstemp` + `os.replace`, and 4-week pruning. See [`ProbeCache`](rmbloat/ProbeCache.py:89).
-- **Private data locations.** Logs in `$XDG_STATE_HOME/rmbloat`, cache and instance lock in `$XDG_CACHE_HOME/rmbloat`, directories 0700 and files 0600; atomic config/state writes. See [`default_log_dir()`](rmbloat/StructuredLogger.py:21), [`default_cache_dir()`](rmbloat/ProbeCache.py:42), [`IniManager.write()`](rmbloat/IniManager.py:151).
+- **Private data locations.** Logs in `$XDG_STATE_HOME/rmbloat`, cache and instance lock in `$XDG_CACHE_HOME/rmbloat`, directories 0700 and files 0600; atomic config/state writes. See [`default_log_dir()`](rmbloat/StructuredLogger.py:22), [`default_cache_dir()`](rmbloat/ProbeCache.py:42), [`IniManager.write()`](rmbloat/IniManager.py:151).
 - **Sandbox design.** Container hardening, optional bwrap/systemd-run wrapping, environment allow-list, rlimits through [`exec_limits.py`](rmbloat/exec_limits.py:1), regular-file-only probes, and process-group termination. The design is accepted; [M4](#m4---ipc-none-contradicts---shm-size-in-the-container-hardening) records one internal inconsistency, not a redesign.
 - **Docker identity parity and supply chain.** Probes and encodes share `--user`/`--group-add`; images are digest-pinned and never pulled implicitly.
 - **Parser corpus gate.** [`VideoParser.run_regressions()`](rmbloat/VideoParser.py:433) returns a failure count, `python -m rmbloat.VideoParser` exits non-zero on regression, and the corpus is current. The `n/a` expectation for `Gone with the Wind.avi` is deliberate: with no year and no release token no movie pattern can anchor, and [`standard_name()`](rmbloat/ConvertUtils.py:243) falls back to codec-token purging.
@@ -91,7 +91,9 @@ non-empty leftovers: ['.rmbloat-tmp-982290dg/TEMP.movie.crf28.recode.mkv',
 
 ### M3. Log trimming and history purging rewrite the log in place
 
-**Where:** [`_trim_log_file()`](rmbloat/StructuredLogger.py:356) and [`purge_at_or_before()`](rmbloat/StructuredLogger.py:469) both do `open(self.log_file, 'w')` on the live file after reading it. Every other persistent store in the project was made atomic (`config.ini`, `state.json`, the probe cache).
+**Status: resolved after this baseline** — see [Resolved after this baseline](#resolved-after-this-baseline).
+
+**Where:** [`_trim_log_file()`](rmbloat/StructuredLogger.py:325) and [`purge_at_or_before()`](rmbloat/StructuredLogger.py:476) both rewrote the live file in place with `open(self.log_file, 'w')` after reading it. Every other persistent store in the project was made atomic (`config.ini`, `state.json`, the probe cache).
 
 **Impact:** a crash or full disk inside that window truncates `events.jsonl` to a prefix or to zero, losing the entire history the History screen and `--logs` exist to show. The trim path runs automatically whenever the 50 MB cap is exceeded, and it rewrites the whole file, so the window is not small. Additionally, `purge_at_or_before()` silently drops malformed lines instead of preserving them, so one corrupt line deletes itself on the next purge.
 
@@ -142,6 +144,10 @@ cache entries stored: {}
 ### M2 — a retried job no longer leaks its previous work directory
 
 [`_discard_pending_temp()`](rmbloat/JobHandler.py:346) removes the previous attempt's temp output and its private directory at the top of every [`start_transcode_job()`](rmbloat/JobHandler.py:390), before a new `.rmbloat-tmp-*` directory is allocated. `Sandbox.remove_private_work_dir()` still removes only an empty directory, so a preserved output from a failed install is never deleted by this path. The exit path already removed the private directory ([`emergency_cleanup()`](rmbloat/JobHandler.py:112)), so a skipped job leaves nothing behind. Regression tests: [`tests/test_job_cwd_isolation.py:176`](tests/test_job_cwd_isolation.py:176) retries a job and asserts exactly one private directory survives, and [`tests/test_job_cwd_isolation.py:199`](tests/test_job_cwd_isolation.py:199) asserts that exit cleanup after a started job removes the partial file and the directory.
+
+### M3 — log trim and history purge are now atomic
+
+New [`_atomic_rewrite()`](rmbloat/StructuredLogger.py:299) writes the survivors to a 0600 `mkstemp` sibling inside the log directory, flushes and fsyncs it, then installs it with `os.replace()`. A failure unlinks the sibling and leaves `events.jsonl` byte-for-byte intact. Both the automatic trim at the 50 MB cap ([`_trim_log_file()`](rmbloat/StructuredLogger.py:325)) and the History screen's [`purge_at_or_before()`](rmbloat/StructuredLogger.py:476) use it. Unparseable lines are no longer deleted: trim carries them through verbatim ([`StructuredLogger.py:352`](rmbloat/StructuredLogger.py:352)) and purge keeps any line it cannot interpret instead of dropping it ([`StructuredLogger.py:499`](rmbloat/StructuredLogger.py:499)). Regression tests: [`tests/test_log_trim.py:99`](tests/test_log_trim.py:99) forces `os.replace()` to fail during a trim and asserts the original bytes are unchanged and no temp sibling remains; [`tests/test_log_trim.py:122`](tests/test_log_trim.py:122) and [`tests/test_log_trim.py:133`](tests/test_log_trim.py:133) assert malformed lines survive trim and purge.
 
 ---
 
@@ -210,21 +216,20 @@ No new injection, traversal, or privilege surface was found. Argument vectors ar
 
 The suite is hermetic apart from the installed dependencies and POSIX process groups ([`tests/test_sandbox_hardening.py:163`](tests/test_sandbox_hardening.py:163) skips on Windows). Recommended CI shape: install the project, then `py_compile`, `unittest discover`, and `ruff check --select F,E9`; leave `./linter` out until [L3](#l3-the-linter-wrapper-selects-an-interpreter-that-cannot-see-the-dependencies) is addressed.
 
-Regression coverage was added for the now-resolved [M1](#m1---sample-cannot-be-run-twice-for-the-same-video) and [M2](#m2-a-retried-job-permanently-leaks-its-previous-private-work-directory-and-partial-output) (see [Resolved after this baseline](#resolved-after-this-baseline)). No test currently covers: log-trim atomicity ([M3](#m3-log-trimming-and-history-purging-rewrite-the-log-in-place)), negative caching ([M5](#m5-files-that-are-not-videos-are-re-probed-on-every-single-run)), `--save-defaults` failure ([L1](#l1---save-defaults-cannot-report-a-failed-write)), or the transcode diagnostics ([L6](#l6-transcode-diagnostics-lose-information)).
+Regression coverage was added for the now-resolved [M1](#m1---sample-cannot-be-run-twice-for-the-same-video), [M2](#m2-a-retried-job-permanently-leaks-its-previous-private-work-directory-and-partial-output), and [M3](#m3-log-trimming-and-history-purging-rewrite-the-log-in-place) (see [Resolved after this baseline](#resolved-after-this-baseline)). No test currently covers: negative caching ([M5](#m5-files-that-are-not-videos-are-re-probed-on-every-single-run)), `--save-defaults` failure ([L1](#l1---save-defaults-cannot-report-a-failed-write)), or the transcode diagnostics ([L6](#l6-transcode-diagnostics-lose-information)).
 
 ## Suggested order
 
 1. **M5** — stop paying for ffprobe on files that will never be converted.
-2. **M3** — make the last non-atomic persistent write atomic.
-3. **M4** — resolve the IPC/shm contradiction and verify on VAAPI hardware.
-4. **L4**, **L5**, **L6** — remove vestigial state and stop losing diagnostics while doing it.
-5. **L1**, **L7**, **L9** — exit-status and input-validation polish that matters once CI and cron drive the tool.
-6. **L3**, **L8**, **L2** — tooling and documentation hygiene.
+2. **M4** — resolve the IPC/shm contradiction and verify on VAAPI hardware.
+3. **L4**, **L5**, **L6** — remove vestigial state and stop losing diagnostics while doing it.
+4. **L1**, **L7**, **L9** — exit-status and input-validation polish that matters once CI and cron drive the tool.
+5. **L3**, **L8**, **L2** — tooling and documentation hygiene.
 
 ## Verification performed for this audit
 
 - `py_compile`, the 212-test suite, and `ruff --select F,E9` all passed under `.venv` at the time of the audit (table above).
-- After the M1/M2 fixes: `py_compile`, the 215-test suite (three new regressions), `ruff --select F,E9`, and `git diff --check` all pass.
+- After the M1/M2/M3 fixes: `py_compile`, the 218-test suite (six new regressions), `ruff --select F,E9`, and `git diff --check` all pass.
 - The system interpreter fails only on the two modules needing `ruamel.yaml`, confirming the dependency (not code) explanation.
 - `./linter` exit 30 with four `E0401` errors, from `/usr/bin/pylint` (`#!/usr/bin/python3`) rather than the project interpreter.
 - Behavioural probes (scratch harness outside the repository, stubs from [`tests/runtime_stubs.py`](tests/runtime_stubs.py:21)) reproduced: two leftover work directories after one retry; a second sample run setting `doit='ERR'`; two ffprobe invocations and zero cache entries for one audio-only file; an expired cache entry surviving `store()` with `dirty_count == 0`; and the literal `JobERR: str(boom)` text.

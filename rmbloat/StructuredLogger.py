@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import inspect
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime
@@ -295,6 +296,32 @@ class StructuredLogger:
         except Exception as e:
             print(f"LOG WRITE ERROR: {e}", file=sys.stderr)
 
+    def _atomic_rewrite(self, lines) -> None:
+        """Replace the log file with ``lines`` without truncating it in place.
+
+        Survivors are written to a 0600 sibling created by ``mkstemp`` and then
+        installed with ``os.replace()``, exactly like the config, state and
+        probe-cache stores.  A crash or a full disk therefore leaves the
+        existing history untouched instead of reducing it to a prefix.
+        """
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(self.log_file.parent),
+            prefix=f'.{self.log_file.name}.',
+            suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._chmod_private(temp_path, 0o600)
+            os.replace(temp_path, self.log_file)
+        except BaseException:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
     def _trim_log_file(self) -> None:
         """
         Trim log file by removing oldest entries (by weighted age) until size < MAX_LOG_SIZE * TRIM_TO_RATIO.
@@ -304,8 +331,11 @@ class StructuredLogger:
             return
 
         try:
-            # Read all entries
+            # Read all entries.  Malformed lines are preserved verbatim: a
+            # corrupt or externally edited line is not a reason to delete data
+            # that the operator may still want to inspect.
             entries = []  # (timestamp, level, line, line_size)
+            unparsed = []  # lines kept exactly as found
             with open(self.log_file, 'r', encoding='utf-8') as f:
                 while True:
                     line = f.readline()
@@ -318,8 +348,8 @@ class StructuredLogger:
                             level = data.get('level', 'OK')
                             line_size = len(line.encode('utf-8'))
                             entries.append((timestamp, level, line, line_size))
-                        except (json.JSONDecodeError, KeyError, ValueError):
-                            pass  # Skip malformed entries
+                        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                            unparsed.append(line)
 
             # Calculate effective age for each entry.  ``index`` preserves the
             # original file order for stable tie-breaking between equal ages.
@@ -353,8 +383,8 @@ class StructuredLogger:
             # entries, so get_window_of_entries()/refresh_window() saw a
             # non-chronological file.
             kept.sort(key=lambda item: (item[0], item[1]))
-            with open(self.log_file, 'w', encoding='utf-8') as f:
-                f.writelines(line for _timestamp, _index, line in kept)
+            self._atomic_rewrite(
+                [line for _timestamp, _index, line in kept] + unparsed)
 
             self.stats['last_trim'] = datetime.now()
 
@@ -463,11 +493,12 @@ class StructuredLogger:
                             if level_filter is None or data.get('level') == level_filter:
                                 continue
                         kept.append(line)
-                    except json.JSONDecodeError:
-                        continue
+                    except (json.JSONDecodeError, AttributeError, TypeError):
+                        # A malformed line cannot be interpreted, so it cannot
+                        # be proven old enough to delete: keep it verbatim.
+                        kept.append(line)
 
-            with open(self.log_file, 'w', encoding='utf-8') as f:
-                f.writelines(kept)
+            self._atomic_rewrite(kept)
         except Exception as e:
             print(f"PURGE ERROR: {e}", file=sys.stderr)
 

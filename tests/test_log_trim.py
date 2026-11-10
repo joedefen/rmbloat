@@ -7,11 +7,14 @@ timestamp order: an old ``ERR`` line could end up after newer ``OK`` lines.
 chronological, so the History screen and incremental reads broke after a trim.
 """
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from rmbloat.StructuredLogger import LogEntry, StructuredLogger
 
@@ -92,6 +95,52 @@ class LogTrimOrderTests(unittest.TestCase):
         parsed = [datetime.fromisoformat(ts) for ts in window.keys()]
 
         self.assertEqual(parsed, sorted(parsed))
+
+    def test_failed_replace_during_trim_leaves_the_original_intact(self):
+        """A failed atomic install must not truncate the existing history."""
+        self.add_entry(2000, 'ERR')
+        for seconds_ago in (1000, 900, 800, 700, 600, 500):
+            self.add_entry(seconds_ago, 'OK')
+        self.write_log()
+        original = self.logger.log_file.read_bytes()
+
+        widest = max(len(line.encode('utf-8')) for line in self.lines)
+        self.logger.MAX_LOG_SIZE = widest * 4
+        self.logger.TRIM_TO_RATIO = 1.0
+        stderr = io.StringIO()
+        with mock.patch(
+                'rmbloat.StructuredLogger.os.replace',
+                side_effect=OSError('simulated full disk')), \
+                contextlib.redirect_stderr(stderr):
+            self.logger._trim_log_file()  # pylint: disable=protected-access
+
+        self.assertEqual(self.logger.log_file.read_bytes(), original)
+        self.assertIn('TRIM ERROR', stderr.getvalue())
+        # The temporary sibling was cleaned up.
+        self.assertEqual(list(Path(self._tmpdir.name).rglob('*.tmp')), [])
+
+    def test_trim_preserves_unparseable_lines(self):
+        self.add_entry(2000, 'ERR')
+        for seconds_ago in (1000, 900, 800, 700, 600, 500):
+            self.add_entry(seconds_ago, 'OK')
+        self.lines.append('{ this is not json }\n')
+
+        self.trim_keeping_four()
+
+        contents = self.logger.log_file.read_text(encoding='utf-8')
+        self.assertIn('{ this is not json }', contents)
+
+    def test_purge_preserves_unparseable_lines(self):
+        self.add_entry(10, 'OK')
+        self.lines.append('{ this is not json }\n')
+        self.write_log()
+
+        self.logger.purge_at_or_before(datetime.now().isoformat())
+
+        lines = [line for line in
+                 self.logger.log_file.read_text(encoding='utf-8').splitlines()
+                 if line.strip()]
+        self.assertEqual(lines, ['{ this is not json }'])
 
 
 if __name__ == '__main__':
