@@ -243,7 +243,6 @@ class MainLoopNoneProbeTests(unittest.TestCase):
     def make_converter(self, ppps, files=()):
         converter = object.__new__(self.rmbloat.Converter)
         converter.opts = types.SimpleNamespace(files=list(files))
-        converter.original_cwd = os.getcwd()
         converter.probe_cache = mock.Mock()
         converter.create_video_file_list = mock.Mock(return_value=ppps)
         converter.process_one_ppp = mock.Mock()

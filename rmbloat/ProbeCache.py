@@ -219,7 +219,7 @@ class ProbeCache:
             return ",".join(parts)
 
         if not os.path.exists(file_path):
-            print(f"Error: File not found at '{file_path}'")
+            print(f"Error: File not found at '{file_path}'", file=sys.stderr)
             return None
 
         # Feed ffmpeg only regular files.  A FIFO, device node, or symlink to
@@ -229,11 +229,12 @@ class ProbeCache:
             real_path = os.path.realpath(file_path)
             file_stat = os.stat(real_path)
         except OSError as exc:
-            print(f"Error: cannot stat '{file_path}': {exc}")
+            print(f"Error: cannot stat '{file_path}': {exc}", file=sys.stderr)
             return self._increment_probe_failure(file_path)
 
         if not stat.S_ISREG(file_stat.st_mode):
-            print(f"Error: refusing to probe non-regular file '{file_path}'")
+            print(f"Error: refusing to probe non-regular file '{file_path}'",
+                  file=sys.stderr)
             return self._increment_probe_failure(file_path)
 
         # Build ffprobe command using chooser if available
@@ -262,11 +263,12 @@ class ProbeCache:
                 stderr_limit=Sandbox.PROBE_MAX_STDERR,
             )
             if result.timed_out:
-                print(f"Error: ffprobe timed out for '{file_path}'.")
+                print(f"Error: ffprobe timed out for '{file_path}'.",
+                      file=sys.stderr)
                 return self._increment_probe_failure(file_path)
             if result.truncated:
                 print(f"Error: ffprobe output exceeded the safety limit "
-                      f"for '{file_path}'.")
+                      f"for '{file_path}'.", file=sys.stderr)
                 return self._increment_probe_failure(file_path)
             if result.returncode != 0:
                 return self._increment_probe_failure(file_path)
@@ -282,7 +284,8 @@ class ProbeCache:
             video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
 
             if not video_stream or not metadata.get("format"):
-                print(f"Error: ffprobe output missing critical stream/format data for '{file_path}'.")
+                print(f"Error: ffprobe output missing critical stream/format data for '{file_path}'.",
+                      file=sys.stderr)
                 return None
 
             # Capture all streams as compact "type:codec" strings
@@ -323,18 +326,21 @@ class ProbeCache:
             return meta
 
         except (json.JSONDecodeError, UnicodeDecodeError):
-            print(f"Error: Failed to decode ffprobe JSON output for '{file_path}'.")
+            print(f"Error: Failed to decode ffprobe JSON output for '{file_path}'.",
+                  file=sys.stderr)
             return self._increment_probe_failure(file_path)
         except FileNotFoundError:
-            print("Error: The 'ffprobe' command was not found. Is FFmpeg installed and in your PATH?")
+            print("Error: The 'ffprobe' command was not found. Is FFmpeg installed and in your PATH?",
+                  file=sys.stderr)
             return self._increment_probe_failure(file_path)
         except IOError as e:
-            print(f"File size error: {e}")
+            print(f"File size error: {e}", file=sys.stderr)
             return self._increment_probe_failure(file_path)
         except (TypeError, ValueError, AttributeError) as e:
             # Last-resort guard for unexpected metadata shapes (e.g. a stream
             # field that is neither numeric nor textual).
-            print(f"Error: Unusable ffprobe metadata for '{file_path}': {e}")
+            print(f"Error: Unusable ffprobe metadata for '{file_path}': {e}",
+                  file=sys.stderr)
             return self._increment_probe_failure(file_path)
 
     # --- Cache Management Methods ---

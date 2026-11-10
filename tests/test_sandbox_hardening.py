@@ -43,6 +43,19 @@ def _make_chooser(**overrides):
 class ContainerHardeningTests(unittest.TestCase):
     """Every container invocation must drop privileges and the network."""
 
+    # The only IPC modes in which ``--shm-size`` has any effect.  ``none``
+    # mounts no shared memory, so pairing it with ``--shm-size`` silently
+    # throws the allowance away.
+    SHM_COMPATIBLE_IPC_MODES = ('private', 'shareable', 'host')
+
+    def ipc_mode(self, cmd):
+        if '--ipc' in cmd:
+            return cmd[cmd.index('--ipc') + 1]
+        for arg in cmd:
+            if arg.startswith('--ipc='):
+                return arg.split('=', 1)[1]
+        return None
+
     def assert_hardened(self, cmd):
         self.assertIn('--network', cmd)
         self.assertEqual(cmd[cmd.index('--network') + 1], 'none')
@@ -54,6 +67,30 @@ class ContainerHardeningTests(unittest.TestCase):
         self.assertIn('--shm-size', cmd)
         self.assertNotIn('--net=host', cmd)
         self.assertNotIn('--ipc=host', cmd)
+        # ``--shm-size`` is only honoured by modes that keep a private shm
+        # segment; ``none`` would contradict it.
+        self.assertIn(self.ipc_mode(cmd), self.SHM_COMPATIBLE_IPC_MODES)
+        self.assertNotEqual(self.ipc_mode(cmd), 'host')
+
+    def test_shm_size_is_paired_with_a_compatible_ipc_mode(self):
+        """``--ipc none`` used to discard the ``--shm-size`` allowance."""
+        args = Sandbox.harden_container_args()
+        self.assertIn('--shm-size', args)
+        self.assertEqual(self.ipc_mode(args), 'private')
+        self.assertNotEqual(self.ipc_mode(args), 'none')
+
+    def test_ipc_namespace_stays_private_and_never_host(self):
+        """``private`` isolates IPC exactly like ``none`` but keeps shm."""
+        for use_acceleration in (False, True):
+            args = Sandbox.harden_container_args(
+                use_acceleration=use_acceleration)
+            self.assertEqual(self.ipc_mode(args), 'private')
+            self.assertNotIn('host', (self.ipc_mode(args),))
+
+    def test_ipc_mode_can_be_overridden_without_losing_shm_size(self):
+        args = Sandbox.harden_container_args(ipc_mode='shareable')
+        self.assertEqual(self.ipc_mode(args), 'shareable')
+        self.assertIn('--shm-size', args)
 
     def test_container_flags_are_shared(self):
         args = Sandbox.harden_container_args()

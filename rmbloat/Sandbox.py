@@ -51,6 +51,13 @@ PROBE_MAX_STDERR = 64 * 1024
 DEFAULT_PIDS_LIMIT = 1024
 DEFAULT_SHM_SIZE = '1g'
 
+# IPC isolation mode for container runs.  ``private`` gives the container its
+# own IPC namespace (so it cannot reach the host's), *and* it is the only mode
+# other than ``host`` that honours ``--shm-size``.  ``none``, by contrast,
+# mounts no shared memory at all, which would silently discard the enlargement
+# that VA-API surface hand-off depends on.
+DEFAULT_IPC_MODE = 'private'
+
 # A short encode is still allowed to be larger than this; the value is a floor
 # for RLIMIT_FSIZE, not a cap on typical output.  It is scaled by the input
 # size by the caller.
@@ -106,17 +113,27 @@ class CappedResult:
 def harden_container_args(use_acceleration: bool = False,
                           pids_limit: int = DEFAULT_PIDS_LIMIT,
                           shm_size: str = DEFAULT_SHM_SIZE,
-                          memory_mb: Optional[int] = None) -> list:
+                          memory_mb: Optional[int] = None,
+                          ipc_mode: str = DEFAULT_IPC_MODE) -> list:
     """Return the isolation flags shared by every container invocation.
 
     ``--read-only`` needs writable scratch space, so ``/tmp`` and ``/run`` are
     overlaid with noexec tmpfs mounts and ``/dev/shm`` is enlarged with
     ``--shm-size``.  VA-API historically uses shared memory for buffer
     hand-off; the default 64 MB is too small for 4K surfaces.
+
+    ``use_acceleration`` records the caller's intent but adds nothing here: the
+    render node is exposed with ``--device`` by the caller, which is the only
+    place that knows the node path.
+
+    The IPC namespace must therefore stay ``private`` rather than ``none``:
+    ``none`` removes the shared-memory segment outright, so the enlarged
+    ``--shm-size`` would be ignored and hardware encoding of large frames
+    could fail.  ``private`` is just as isolated from the host as ``none``.
     """
     args = [
         '--network', 'none',
-        '--ipc', 'none',
+        '--ipc', ipc_mode,
         '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges',
         '--pids-limit', str(max(64, int(pids_limit))),
@@ -127,9 +144,6 @@ def harden_container_args(use_acceleration: bool = False,
     ]
     if memory_mb:
         args.extend(['--memory', f'{int(memory_mb)}m'])
-    if use_acceleration:
-        # ``--device`` is added by the caller because it needs the render node.
-        pass
     return args
 
 

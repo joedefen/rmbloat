@@ -149,11 +149,9 @@ class Converter:
         self.vids = []
         self.todo_vids = []
         self.visible_vids = []
-        self.original_cwd = os.getcwd()
         self.ff_pre_i_opts = []
         self.ff_post_i_opts = []
         self.ff_thread_opts = []
-        self.state = 'probe' # 'select', 'convert'
         self.job = None
         self.prev_time_encoded_secs = -1
         # Be quiet if user has already selected a specific strategy
@@ -998,23 +996,13 @@ class Converter:
             print("Usage: rmbloat {options} {video_file}...", file=sys.stderr)
             sys.exit(1)
 
-        # --- The main loop change is here ---
+        # Every path is absolute from here on: the scan resolves candidates and
+        # the parser, swap and rename helpers all work on absolute paths.  The
+        # loop therefore does not change the process working directory, which
+        # also removes the chance of failing on a directory that disappeared
+        # between the scan and this point.
         for ppp in ppps:
-            input_file_path_str = ppp.video_file
-            file_dir, _ = os.path.split(input_file_path_str)
-            if not file_dir:
-                file_dir = os.path.abspath(os.path.dirname(input_file_path_str))
-
-            # Use a try...finally block to ensure you always change back.
-            try:
-                os.chdir(file_dir)
-                self.process_one_ppp(ppp)
-
-            except Exception:
-                raise
-                # print(f"An error occurred while processing {file_basename}: {e}")
-            finally:
-                os.chdir(self.original_cwd)
+            self.process_one_ppp(ppp)
         self.do_window_mode()
 
 

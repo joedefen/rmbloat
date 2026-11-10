@@ -18,6 +18,13 @@ from . import Sandbox
 
 class TranscodeThread(threading.Thread):
     """ TBD """
+    # ffmpeg's machine-readable progress blocks always begin with one of these
+    # keys, so a leftover fragment that starts this way carries no diagnostic
+    # value and must not be reported as a log line.
+    PROGRESS_PREFIX_RE = re.compile(
+        r'^\s*(?:frame|fps|bitrate|total_size|out_time|out_time_ms|'
+        r'out_time_us|dup_frames|drop_frames|speed|progress|size|time)=')
+
     # Bound retained ffmpeg stderr so corrupt media cannot exhaust memory.
     # When a limit is crossed the oldest ~25% is discarded (amortized O(1)).
     MAX_LOG_LINES = 2000
@@ -52,7 +59,10 @@ class TranscodeThread(threading.Thread):
             self.run_ffmpeg()
         except Exception as e:
             self.info.return_code = 127
-            self.status_string = f'JobERR: str({e})'
+            # Interpolate the exception itself.  The previous text embedded a
+            # literal ``str(...)`` wrapper instead of calling it, so the log
+            # read ``JobERR: str(boom)`` and the actual message was buried.
+            self.status_string = f'JobERR: {e}'
         finally:
             self.is_finished = True
 
@@ -147,7 +157,22 @@ class TranscodeThread(threading.Thread):
             if not chunk:
                 time.sleep(0.10)
 
+        # ffmpeg's failure reason is usually the last thing it writes, and the
+        # read loop can reach EOF with that line still buffered because no
+        # newline ever arrived.  Dropping it hides the most useful diagnostic
+        # from the job log and from the retry ladder's error-signal search.
+        self._flush_partial_line(partial_line)
         self.is_finished = True
+
+    def _flush_partial_line(self, partial_line):
+        """Record a final stderr fragment that arrived without a newline."""
+        msg = partial_line.decode('utf-8', errors='ignore').strip()
+        if not msg:
+            return
+        # A leftover progress fragment ("frame=  12 fps=0.0") is not a message.
+        if self.PROGRESS_PREFIX_RE.match(msg):
+            return
+        self._record_text(msg)
 
     def _record_text(self, msg):
         """Append a stderr line, keeping ``info.texts`` within bounded size."""

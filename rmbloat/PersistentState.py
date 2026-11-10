@@ -38,15 +38,6 @@ class PersistentState:
             self.state[key] = value
             self.dirty = True
 
-    def save_updated_opts(self, opts):
-        """Save updated option variables from opts to state"""
-        for key in self.state:
-            if hasattr(opts, key):
-                value = getattr(opts, key)
-                if self.state[key] != value:
-                    self.state[key] = value
-                    self.dirty = True
-
     def restore_updated_opts(self, opts):
         """Restore option variables from state to opts"""
         for key in self.state:
