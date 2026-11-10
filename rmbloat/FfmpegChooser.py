@@ -46,13 +46,17 @@ class FfmpegChooser:
         Initialize and detect the best FFmpeg configuration.
 
         Args:
-            force_pull: Force pull the Docker image even if it exists locally
-            image: Docker image to use (default: joedefen/ffmpeg-vaapi-docker:latest)
+            force_pull: Pull the Docker image even if it already exists.  This
+                is the only path that performs a network pull; normal startup
+                uses a locally available image and never pulls implicitly.
+            image: Docker image to use (default: joedefen/ffmpeg-vaapi-docker:latest).
+                Tags are resolved to an immutable content digest before use.
             prefer_strategy: Strategy preference - 'auto', 'docker_accel', 'docker_cpu',
                            'system_cpu', or 'system_accel' (default: 'auto')
             quiet: Suppress detection output (default: False)
         """
         self.image = image
+        self.image_ref = None  # Resolved immutable digest/ID for container runs
         self.runtime = None  # 'docker', 'podman', or None
         self.has_docker_acceleration = False
         self.has_system_acceleration = False
@@ -227,7 +231,7 @@ class FfmpegChooser:
                 self.runtime, 'run', '--rm',
                 '--device=/dev/dri:/dev/dri',
                 *self._docker_user_and_group_args(self.render_device),
-                self.image,
+                self._image_for_run(),
                 *args,
             ]
         else:
@@ -271,7 +275,15 @@ class FfmpegChooser:
         self.runtime = None
 
     def _ensure_image(self, force_pull: bool) -> None:
-        """Ensure the Docker/Podman image is available locally."""
+        """Ensure the image exists locally and resolve an immutable reference.
+
+        Normal startup never pulls: pulling is a network/supply-chain side
+        effect, so it only happens when the caller explicitly requests it
+        (``force_pull``, e.g. ``--chooser-tests``).  Once the image is present,
+        its content digest (or image ID as a fallback) is recorded in
+        ``self.image_ref`` and used for every probe/encode, so a mutable tag
+        cannot change underneath a run.
+        """
         if not self.runtime:
             return
 
@@ -280,7 +292,14 @@ class FfmpegChooser:
         result = self._run_command(check_cmd, timeout=self.IMAGE_INSPECT_TIMEOUT)
         image_exists = result is not None and result.returncode == 0
 
-        # Pull if needed or forced
+        if not image_exists and not force_pull:
+            if not self.quiet:
+                print(f"  ✗ Image {self.image} is not available locally.")
+                print(f"    Pull it explicitly with: {self.runtime} pull {self.image}")
+            self.runtime = None
+            return
+
+        # Pull only on an explicit request (or when the caller forced a pull)
         if force_pull or not image_exists:
             if not self.quiet:
                 if force_pull:
@@ -297,9 +316,52 @@ class FfmpegChooser:
                 if not self.quiet:
                     print(f"  ✗ Failed to pull image {self.image}")
                 self.runtime = None
-        else:
-            if not self.quiet:
-                print(f"  ✓ Image {self.image} already available locally")
+                return
+        elif not self.quiet:
+            print(f"  ✓ Image {self.image} already available locally")
+
+        self.image_ref = self._resolve_pinned_image()
+
+    def _resolve_pinned_image(self) -> str:
+        """Return an immutable image reference for container runs.
+
+        Prefers the registry content digest (``repo@sha256:...``) and falls back
+        to the local image ID, which is also content-addressed.  If neither can
+        be read, the original tag is returned with a warning rather than
+        silently pretending it is pinned.
+        """
+        if not self.runtime:
+            return self.image
+
+        digest_cmd = [
+            self.runtime, 'image', 'inspect', '--format',
+            '{{index .RepoDigests 0}}', self.image,
+        ]
+        result = self._run_command(
+            digest_cmd, timeout=self.IMAGE_INSPECT_TIMEOUT, text_output=True)
+        if result and result.returncode == 0 and result.stdout:
+            digest_ref = result.stdout.strip()
+            if '@sha256:' in digest_ref:
+                return digest_ref
+
+        id_cmd = [
+            self.runtime, 'image', 'inspect', '--format',
+            '{{.Id}}', self.image,
+        ]
+        result = self._run_command(
+            id_cmd, timeout=self.IMAGE_INSPECT_TIMEOUT, text_output=True)
+        if result and result.returncode == 0 and result.stdout:
+            image_id = result.stdout.strip()
+            if image_id.startswith('sha256:'):
+                return image_id
+
+        if not self.quiet:
+            print(f"  ⚠ Could not resolve an immutable reference for {self.image}")
+        return self.image
+
+    def _image_for_run(self) -> str:
+        """Return the pinned container image reference for a run/probe."""
+        return getattr(self, 'image_ref', None) or self.image
 
     def _find_render_device(self) -> Optional[str]:
         """Find the first available render device."""
@@ -413,7 +475,7 @@ class FfmpegChooser:
             self.runtime, 'run', '--rm',
             '--device=/dev/dri:/dev/dri',
             *self._docker_user_and_group_args(render_device),
-            self.image,
+            self._image_for_run(),
             '-y',
             '-init_hw_device', f'vaapi=va:{render_device}',
             '-filter_hw_device', 'va',
@@ -747,14 +809,16 @@ class FfmpegChooser:
                 self.runtime, 'run', '--rm',
                 *self._docker_user_and_group_args(
                     self.render_device if self.use_acceleration else None),
-                '--net=host', '--ipc=host',
-                '-v', f'{workdir}:{workdir}',
+                # ``:z`` relabels the bind mount for SELinux hosts.  It is a
+                # no-op elsewhere, and avoids a denial when enforcing SELinux
+                # is active.  No host networking/IPC is needed for local files.
+                '-v', f'{workdir}:{workdir}:z',
                 '-w', workdir,
             ])
             if self.use_acceleration:
                 cmd.extend(['--device=/dev/dri:/dev/dri'])
 
-            cmd.append(self.image)
+            cmd.append(self._image_for_run())
 
             if params.use_nice_ionice:
                 cmd.extend(['ionice', '-c3', 'nice', '-n20'])
@@ -939,7 +1003,7 @@ class FfmpegChooser:
 
             # Create temporary chooser with this strategy
             temp_chooser = FfmpegChooser(
-                image=self.image,
+                image=self._image_for_run(),
                 prefer_strategy=strategy,
                 quiet=True
             )
@@ -1076,10 +1140,10 @@ class FfmpegChooser:
         if self.use_docker:
             cmd.extend([
                 self.runtime, 'run', '--rm',
-                '-v', f'{workdir}:{workdir}',
+                '-v', f'{workdir}:{workdir}:ro,z',
                 '-w', workdir,
                 '--entrypoint', 'ffprobe',
-                self.image,
+                self._image_for_run(),
             ])
             cmd.append(input_basename)
         else:

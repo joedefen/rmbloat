@@ -126,7 +126,14 @@ sudo usermod -aG render $USER
 # Log out and back in
 ```
 
-`rmbloat` will automatically pull and use the `joedefen/ffmpeg-vaapi-docker:latest` image. For details on this image and additional host setup requirements, see: https://github.com/joedefen/ffmpeg-vaapi-docker
+`rmbloat` uses the `joedefen/ffmpeg-vaapi-docker:latest` image when it is already present locally. Startup does **not** pull images automatically; pull it explicitly once (or use `--chooser-tests`, which force-pulls):
+
+```bash
+docker pull joedefen/ffmpeg-vaapi-docker:latest
+# or: podman pull joedefen/ffmpeg-vaapi-docker:latest
+```
+
+Once available, rmbloat resolves the image to its immutable digest (falling back to the local image ID) and uses that reference for every probe and encode, so a mutable tag cannot change during a run. For details on this image and additional host setup requirements, see: https://github.com/joedefen/ffmpeg-vaapi-docker
 
 ### Option 3: CPU-Only Encoding (Fallback)
 
@@ -518,9 +525,13 @@ sudo usermod -aG video $USER
 id -nG
 ```
 
-### Docker Not Pulling Image
+### Docker Image Not Available
 
-**Symptoms**: Docker fails to pull `joedefen/ffmpeg-vaapi-docker:latest`
+**Symptoms**: Docker is available but rmbloat reports
+`Image joedefen/ffmpeg-vaapi-docker:latest is not available locally`
+
+rmbloat intentionally does not pull images during normal startup, because a
+pull is an implicit network/supply-chain action. Pull it once yourself:
 
 **Solutions**:
 ```bash
@@ -530,13 +541,13 @@ sudo systemctl status docker
 # Test Docker manually
 docker run hello-world
 
-# Manually pull the image
+# Pull the image explicitly
 docker pull joedefen/ffmpeg-vaapi-docker:latest
 
 # If using Podman instead
 podman pull joedefen/ffmpeg-vaapi-docker:latest
 
-# Force pull with rmbloat (bypasses cache)
+# Or let the test command pull it (explicit force-pull)
 rmbloat --chooser-tests --prefer-strategy docker_accel
 ```
 
@@ -789,7 +800,7 @@ To test your hardware acceleration support:
 ```bash
 rmbloat --chooser-tests /path/to/test/video.mp4
 ```
-This will run 120-second encoding tests with different strategies and report which work best on your system. **If you newly downloaded a docker container, repeat or it will apply the download against the results.**
+This will run 120-second encoding tests with different strategies and report which work best on your system. This command force-pulls the Docker image; rerun the tests after a pull so the results reflect the newly downloaded image.
 
 ## Intelligent Resilience (The Retry Ladder)
 
