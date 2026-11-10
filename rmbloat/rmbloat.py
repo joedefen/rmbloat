@@ -668,8 +668,33 @@ class Converter:
         """ TBD """
         ppps = []
 
+        # The directory walk below visits every entry under the given paths.  On
+        # a media share with tens of thousands of files that pause can last many
+        # seconds, so announce the scan (and report what it found) instead of
+        # leaving the terminal silent between the FFmpeg summary and the probe
+        # progress line.
+        scan_targets = [p for p in (getattr(self.opts, 'files', None) or [])
+                        if p != '-']
+        if scan_targets:
+            label = (scan_targets[0] if len(scan_targets) == 1
+                     else f"{len(scan_targets)} paths")
+            # Keep the notice after the (stdout) detection summary even when
+            # stdout is redirected to a file or pipe.
+            sys.stdout.flush()
+            sys.stderr.write(
+                f"Scanning {label} for video files"
+                " (large collections can take a while)...\n")
+            sys.stderr.flush()
+
         # Get candidate video file paths
+        scan_start = time.monotonic()
         paths_to_probe, read_pipe = self.get_candidate_video_files(self.opts.files)
+        if scan_targets:
+            found = len(paths_to_probe)
+            sys.stderr.write(
+                f"Found {found} candidate video{'s' if found != 1 else ''}"
+                f" in {time.monotonic() - scan_start:.1f}s\n")
+            sys.stderr.flush()
 
         # --- Restore TTY Input if needed ---
         if read_pipe:

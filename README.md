@@ -279,6 +279,7 @@ options:
   This is useful for media server owners who want to cap their collection at a specific resolution to manage storage or ensure compatibility with playback devices.
 
   Candidate video files are probed (with `ffprobe`). If the probe fails, then the candidate is simply ignored. Probing many files can be time consuming, but `rmbloat` keeps a cache of probes so start-up can be fast if most of the candidates have been successfully probed.
+  * The directory walk that collects candidates reports itself: `Scanning <path> for video files (large collections can take a while)...` followed by `Found <n> candidate videos in <seconds>`. A walk over a share with tens of thousands of files can take 20 seconds or more, so the pause is the scan, not a hang.
 
 ## The Three Main Screens
 The main screens are:
