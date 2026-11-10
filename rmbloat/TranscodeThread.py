@@ -13,6 +13,7 @@ import time
 from types import SimpleNamespace
 from datetime import timedelta
 from typing import Optional
+from . import Sandbox
 
 
 class TranscodeThread(threading.Thread):
@@ -25,13 +26,15 @@ class TranscodeThread(threading.Thread):
     # A single stderr "line" without a newline can also grow arbitrarily.
     MAX_MESSAGE_CHARS = 4096
 
-    def __init__(self, cmd, run_info, job, progress_secs_max, temp_file=None):
+    def __init__(self, cmd, run_info, job, progress_secs_max, temp_file=None,
+                 env=None):
         super().__init__(daemon=True)
         self.cmd = cmd
         self.info = run_info
         self.job = job
         self.progress_secs_max = progress_secs_max
         self.temp_file = temp_file
+        self.env = env
 
         self.process: Optional[subprocess.Popen] = None
         self.progress_buffer = {}
@@ -58,10 +61,13 @@ class TranscodeThread(threading.Thread):
         try:
             self.process = subprocess.Popen(
                 self.cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=False,
-                bufsize=0
+                bufsize=0,
+                env=self.env,
+                start_new_session=True,
             )
             # Set non-blocking
             fd = self.process.stderr.fileno()
@@ -203,16 +209,9 @@ class TranscodeThread(threading.Thread):
         self._stop_event.set()
 
         if self.process and self.process.poll() is None:
-            try:
-                # Send SIGTERM
-                self.process.terminate()
-                # Give it a moment to release the file handle
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                # If it's being stubborn, SIGKILL
-                self.process.kill()
-            except Exception:
-                pass
+            # Signal the whole process group: the direct child may be a
+            # bwrap/systemd/docker wrapper with ffmpeg underneath it.
+            Sandbox.terminate_process_group(self.process, grace=2.0)
 
         # Now that the process is dead and the handle is released:
         self.cleanup()

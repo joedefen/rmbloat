@@ -349,11 +349,12 @@ class SampleOutputTests(unittest.TestCase):
         with mock.patch.object(JobHandlerModule, 'TranscodeThread'):
             job = self.handler.start_transcode_job(vid)
 
-        expected = str(self.root / f'SAMPLE.28.{self.standard_name}')
-        self.assertEqual(job.temp_file, expected)
-        self.assertEqual(self.handler.temp_file, expected)
+        temp_path = Path(job.temp_file)
         self.assertTrue(os.path.isabs(job.temp_file))
-        self.assertEqual(os.path.dirname(job.temp_file), str(self.root))
+        self.assertEqual(temp_path.name, f'SAMPLE.28.{self.standard_name}')
+        self.assertEqual(temp_path.parent.parent, Path(self.root))
+        self.assertTrue(temp_path.parent.name.startswith('.rmbloat-tmp-'))
+        self.assertEqual(self.handler.temp_file, job.temp_file)
         # Job startup must never change process-wide state.
         self.assertEqual(os.getcwd(), cwd_before)
         self.assertEqual(job.orig_backup_file,
@@ -363,17 +364,20 @@ class SampleOutputTests(unittest.TestCase):
             vid.filepath)
         self.assertEqual(
             self.chooser.make_namespace.call_args.kwargs['output_file'],
-            expected)
+            job.temp_file)
 
     def test_finish_sample_keeps_only_the_basename_for_display(self):
         vid = self.make_vid()
-        # Simulate an absolute temp path anyway: basename1 must never leak it.
-        temp_path = str(self.root / f'SAMPLE.28.{self.standard_name}')
+        work_dir = self.root / '.rmbloat-tmp-test'
+        work_dir.mkdir()
+        temp_path = work_dir / f'SAMPLE.28.{self.standard_name}'
+        temp_path.write_bytes(b'sample-data')
         vid.runs = [types.SimpleNamespace(
             command='-crf 28', return_code=0, texts=[], descr='initial run')]
         job = types.SimpleNamespace(
             vid=vid,
-            temp_file=temp_path,
+            temp_file=str(temp_path),
+            temp_dir=str(work_dir),
             thread=types.SimpleNamespace(is_alive=lambda: False),
         )
         self.probe_cache.get.return_value = types.SimpleNamespace(gb=0.5)
@@ -383,6 +387,9 @@ class SampleOutputTests(unittest.TestCase):
         self.assertIsNotNone(probe)
         self.assertEqual(vid.basename1, f'SAMPLE.28.{self.standard_name}')
         self.assertFalse(os.path.isabs(vid.basename1))
+        self.assertTrue(
+            (self.root / f'SAMPLE.28.{self.standard_name}').exists())
+        self.assertFalse(work_dir.exists())
 
 
 if __name__ == '__main__':

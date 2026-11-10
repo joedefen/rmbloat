@@ -109,11 +109,12 @@ class JobCwdIsolationTests(RmbloatModuleTestCase):
                 self.job_handler_module, 'TranscodeThread') as thread_cls:
             job = self.handler.start_transcode_job(vid)
 
-        expected_temp = str(
-            Path(self.video_dir.name) / f'SAMPLE.28.{self.standard_name}')
+        temp_path = Path(job.temp_file)
         self.assertEqual(os.getcwd(), cwd_before)
-        self.assertEqual(job.temp_file, expected_temp)
-        self.assertEqual(self.handler.temp_file, expected_temp)
+        self.assertEqual(temp_path.name, f'SAMPLE.28.{self.standard_name}')
+        self.assertEqual(temp_path.parent.parent, Path(self.video_dir.name))
+        self.assertTrue(temp_path.parent.name.startswith('.rmbloat-tmp-'))
+        self.assertEqual(self.handler.temp_file, job.temp_file)
         self.assertTrue(os.path.isabs(job.temp_file))
         self.assertEqual(
             job.orig_backup_file,
@@ -123,8 +124,8 @@ class JobCwdIsolationTests(RmbloatModuleTestCase):
             str(Path(self.video_dir.name) / self.original_name))
         self.assertEqual(
             self.chooser.make_namespace.call_args.kwargs['output_file'],
-            expected_temp)
-        self.assertEqual(thread_cls.call_args.kwargs['temp_file'], expected_temp)
+            job.temp_file)
+        self.assertEqual(thread_cls.call_args.kwargs['temp_file'], job.temp_file)
 
     def test_file_swap_and_companion_rename_ignore_process_cwd(self):
         vid = self.make_vid(do_rename=True)

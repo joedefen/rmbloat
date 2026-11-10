@@ -17,8 +17,10 @@ VIDEO_EXTENSIONS = {
     '.vob', '.ogv', '.m2ts', '.mts'
 }
 
-# Filename prefixes to skip during processing (treated as non-video files)
-SKIP_PREFIXES = ('TEMP.', 'ORIG.', 'SAMPLE.')
+# Filename prefixes to skip during processing (treated as non-video files).
+# ``.rmbloat-`` covers private work files and rollback names created by a
+# failed swap, which must never be rescanned or re-encoded.
+SKIP_PREFIXES = ('TEMP.', 'ORIG.', 'SAMPLE.', '.rmbloat-')
 
 # Directory names that hold deleted files, snapshots, or filesystem metadata.
 # Their contents must never be probed or converted: media found there is either
@@ -41,9 +43,10 @@ EXCLUDED_DIR_NAMES = frozenset({
     'lost+found',                # ext2/3/4 recovery directory
 })
 
-# Directory name prefixes to skip.  Covers macOS ``.Trash`` and the
-# per-user ``.Trash-1000`` directories created on non-Home mounts.
-EXCLUDED_DIR_PREFIXES = ('.trash',)
+# Directory name prefixes to skip.  Covers macOS ``.Trash``, the per-user
+# ``.Trash-1000`` directories created on non-Home mounts, and rmbloat's own
+# private per-job work directories.
+EXCLUDED_DIR_PREFIXES = ('.trash', '.rmbloat-')
 
 
 def is_excluded_directory(dir_name: str) -> bool:

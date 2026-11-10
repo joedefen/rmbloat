@@ -36,6 +36,7 @@ from .FfmpegChooser import FfmpegChooser
 from .Models import PathProbePair, Vid
 from . import FileOps
 from . import ConvertUtils
+from . import Sandbox
 from .JobHandler import JobHandler
 from .PersistentState import PersistentState
 
@@ -155,7 +156,11 @@ class Converter:
         self.prev_time_encoded_secs = -1
         # Be quiet if user has already selected a specific strategy
         quiet_chooser = bool(opts.prefer_strategy != 'auto')
-        self.chooser = FfmpegChooser(force_pull=False, prefer_strategy=opts.prefer_strategy, quiet=quiet_chooser)
+        self.chooser = FfmpegChooser(
+            force_pull=False,
+            prefer_strategy=opts.prefer_strategy,
+            quiet=quiet_chooser,
+            sandbox=getattr(opts, 'sandbox', 'auto'))
         self.probe_cache = ProbeCache(cache_dir_name=cache_dir, chooser=self.chooser)
         self.probe_cache.load()
         self.probe_cache.store()
@@ -1663,6 +1668,7 @@ def main(args=None) -> int:
                                min_shrink_pct=10,
                                prefer_strategy='auto',
                                quality=28,
+                               sandbox='auto',
                                thread_cnt=4,
                                use_trash=False,
                         )
@@ -1734,6 +1740,13 @@ def main(args=None) -> int:
         parser.add_argument('-q', '--quality',
                     default=vals.quality, type=int,
                     help=f'output quality (CRF) [dflt={vals.quality}]')
+        saved_sandbox = getattr(vals, 'sandbox', 'auto')
+        parser.add_argument('--sandbox',
+                    choices=Sandbox.SANDBOX_CHOICES,
+                    default=saved_sandbox,
+                    help='isolation for local ffmpeg/ffprobe: auto, container, '
+                         'bwrap, systemd, or none'
+                        + f' [dflt={saved_sandbox}]')
         parser.add_argument('-t', '--thread-cnt',
                     default=vals.thread_cnt, type=int,
                     help='thread count for ffmpeg conversions'
@@ -1824,7 +1837,8 @@ def main(args=None) -> int:
                 print(f"An error occurred during exec: {e}", file=sys.stderr)
                 sys.exit(1)
         if opts.chooser_tests:
-            chooser = FfmpegChooser(force_pull=True)
+            chooser = FfmpegChooser(
+                force_pull=True, sandbox=getattr(opts, 'sandbox', 'auto'))
 
             video_file = None
             if opts.files:

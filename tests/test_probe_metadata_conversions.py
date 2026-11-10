@@ -15,16 +15,18 @@ import tempfile
 import unittest
 from unittest import mock
 
+from rmbloat import Sandbox
 from rmbloat.ProbeCache import ProbeCache, Probe
+from rmbloat.Sandbox import CappedResult
 
 
 def _ffprobe_result(payload):
-    """Build a stand-in for ``subprocess.run()``'s CompletedProcess."""
-    completed = mock.Mock()
-    completed.stdout = json.dumps(payload)
-    completed.stderr = ''
-    completed.returncode = 0
-    return completed
+    """Build a stand-in for ``Sandbox.run_capped()``'s result."""
+    return CappedResult(
+        returncode=0,
+        stdout=json.dumps(payload).encode('utf-8'),
+        stderr=b'',
+    )
 
 
 class ProbeMetadataConversionTests(unittest.TestCase):
@@ -47,8 +49,8 @@ class ProbeMetadataConversionTests(unittest.TestCase):
             handle.write(b'data' * 10)
 
     def _probe(self, payload):
-        with mock.patch('rmbloat.ProbeCache.subprocess.run',
-                        return_value=_ffprobe_result(payload)), \
+        with mock.patch.object(Sandbox, 'run_capped',
+                               return_value=_ffprobe_result(payload)), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             return self.cache._get_metadata_with_ffprobe(self.video)  # pylint: disable=protected-access

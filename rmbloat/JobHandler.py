@@ -15,6 +15,7 @@ import send2trash
 from .Models import Job, Vid
 from .ConvertUtils import bash_quote
 from . import FileOps
+from . import Sandbox
 from .TranscodeThread import TranscodeThread
 
 
@@ -78,6 +79,7 @@ class JobHandler:
         self.ok_count = 0
         self.error_count = 0
         self.temp_file = None  # absolute path, for atexit signal cleanup
+        self.temp_dir = None  # private per-job output directory
         self.job = None  # active Job, so exit cleanup can abort ffmpeg
 
     def emergency_cleanup(self):
@@ -106,6 +108,9 @@ class JobHandler:
                 print(f"Warning: could not remove temp file {temp_file}: {exc}")
             finally:
                 self.temp_file = None
+
+        Sandbox.remove_private_work_dir(getattr(self, 'temp_dir', None))
+        self.temp_dir = None
 
     def validate_srt_file(self, filepath, min_captions=12):
         """
@@ -360,17 +365,35 @@ class JobHandler:
                 merged_external_subtitle = str(subtitle_path)
                 vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
 
-        # Samples are written next to the source file so --sample works on any
-        # machine instead of relying on a developer's hardcoded /heap/samples
-        # directory.  Absolute paths also keep the exit handler independent of
-        # whatever directory happens to be current when cleanup runs.
+        # Write the encode into a private directory on the media's filesystem.
+        # Same-filesystem placement keeps the final install atomic; a cache
+        # directory on another filesystem would turn it into a copy.  The
+        # directory is 0700 and the output file is pre-created with O_EXCL so
+        # a planted symlink cannot redirect the write.
         prefix = f'SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        temp_file = os.path.join(video_dir, f"{prefix}.{vid.standard_name}")
+        temp_dir = Sandbox.create_private_work_dir(video_dir)
+        if temp_dir is None:
+            # Best-effort fallback: keep the old location rather than failing
+            # the job.  The output is still pre-created exclusively below.
+            temp_dir = video_dir
+        self.temp_dir = temp_dir if temp_dir != video_dir else None
+        temp_file = os.path.join(
+            temp_dir, f"{prefix}.{os.path.basename(vid.standard_name)}")
         self.temp_file = temp_file
         orig_backup_file = os.path.join(video_dir, f"ORIG.{basename}")
 
         if os.path.exists(temp_file):
             os.unlink(temp_file)
+        try:
+            fd = os.open(
+                temp_file,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            os.close(fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            vid.ops.append(f"WARNING: could not pre-create {temp_file!r}: {exc}")
 
         duration_secs = self.sample_seconds if self.opts.sample else probe.duration
 
@@ -391,6 +414,7 @@ class JobHandler:
         job = Job(vid, orig_backup_file, temp_file, duration_secs, self.opts)
         job.is_retry = retry_with_error_tolerance
         job.is_software_fallback = force_software
+        job.temp_dir = self.temp_dir
         self.job = job
 
         # 2. Determine encoding strategy
@@ -416,6 +440,7 @@ class JobHandler:
         params.crf = self.opts.quality
         params.use_nice_ionice = not self.opts.full_speed
         params.thread_count = self.opts.thread_cnt
+        params.temp_dir = temp_dir
 
         if self.opts.sample:
             # Seek 20% into the movie (but at least two minutes in) so the
@@ -449,8 +474,11 @@ class JobHandler:
         if force_software and original_use_acceleration is not None:
             self.chooser.use_acceleration = original_use_acceleration
 
-        job.thread = TranscodeThread(cmd=ffmpeg_cmd, run_info=run, job=job,
-                    progress_secs_max=self.opts.progress_secs_max, temp_file=temp_file)
+        job.thread = TranscodeThread(
+            cmd=ffmpeg_cmd, run_info=run, job=job,
+            progress_secs_max=self.opts.progress_secs_max,
+            temp_file=temp_file,
+            env=self.chooser.child_env(temp_dir))
         job.thread.start()
 
         return job
@@ -530,6 +558,22 @@ class JobHandler:
                 success = False
                 vid.doit = 'ERR'
         elif success and self.opts.sample:
+            # --sample promises a file next to the source.  Move it out of the
+            # private work directory with the same no-clobber rule used by the
+            # real install.
+            sample_target = os.path.join(
+                os.path.dirname(os.path.abspath(vid.filepath)),
+                os.path.basename(job.temp_file))
+            try:
+                FileOps._rename_no_clobber(job.temp_file, sample_target, False)
+                job.temp_file = sample_target
+                vid.ops.append(f"sample {sample_target!r}")
+            except OSError as exc:
+                vid.ops.append(
+                    f"ERROR: could not place sample {sample_target!r}: {exc}")
+                success = False
+                swap_ok = False
+                vid.doit = 'ERR'
             # Keep only the filename: the UI shows basename1 in place of the
             # source name, never the absolute temp path used internally.
             vid.basename1 = os.path.basename(job.temp_file)
@@ -557,11 +601,16 @@ class JobHandler:
                 self.probe_cache.set_anomaly(vid.filepath, 'Err')
 
         if not swap_ok:
+            # A failed install may be the only copy of the new encode.  Keep
+            # the private directory so the operator can recover it.
             probe = None
+        else:
+            Sandbox.remove_private_work_dir(getattr(job, 'temp_dir', None))
 
         # The job is fully reaped: atexit/signal cleanup has nothing to do.
         self.job = None
         self.temp_file = None
+        self.temp_dir = None
 
         return probe
 
@@ -779,4 +828,7 @@ class JobHandler:
 
         # 10. Update Vid object for UI reference
         vid.basename1 = os.path.basename(final_name)
+        # The private work directory is now empty (the output was linked or
+        # renamed out); removing it leaves no trace in the media directory.
+        Sandbox.remove_private_work_dir(getattr(job, 'temp_dir', None))
         return True

@@ -7,8 +7,8 @@
 
 import json
 import os
+import stat
 import sys
-import subprocess
 import math
 import re
 import fcntl
@@ -19,9 +19,19 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
 from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
+from . import Sandbox
 
 # 4 weeks in seconds
 EXPIRY_SECONDS = 4 * 7 * 24 * 60 * 60
+
+# Only ask ffprobe for the fields the cache actually consumes.  Besides being
+# smaller, this keeps a crafted file's tag/chapter metadata out of the JSON
+# parser and the memory footprint.
+PROBE_SHOW_ENTRIES = (
+    'stream=codec_type,codec_name,width,height,pix_fmt,color_space,'
+    'color_primaries,color_transfer,r_frame_rate,avg_frame_rate:'
+    'format=duration,bit_rate'
+)
 
 # Default probe-cache filename.  Exposed so CLI wrappers (rmbloatd) can derive
 # the instance-lock path without duplicating the string.
@@ -211,32 +221,56 @@ class ProbeCache:
             print(f"Error: File not found at '{file_path}'")
             return None
 
+        # Feed ffmpeg only regular files.  A FIFO, device node, or symlink to
+        # one can hang the probe or expose unrelated data; symlinks to real
+        # media are resolved and accepted.
+        try:
+            real_path = os.path.realpath(file_path)
+            file_stat = os.stat(real_path)
+        except OSError as exc:
+            print(f"Error: cannot stat '{file_path}': {exc}")
+            return self._increment_probe_failure(file_path)
+
+        if not stat.S_ISREG(file_stat.st_mode):
+            print(f"Error: refusing to probe non-regular file '{file_path}'")
+            return self._increment_probe_failure(file_path)
+
         # Build ffprobe command using chooser if available
         if self.chooser:
             command = self.chooser.make_ffprobe_cmd(
-                file_path,
+                real_path,
                 '-v', 'error',
                 '-print_format', 'json',
-                '-show_format',
-                '-show_streams'
+                '-show_entries', PROBE_SHOW_ENTRIES,
             )
         else:
             command = [
-                'ffprobe', '-v', 'error', '-print_format', 'json',
-                '-show_format', '-show_streams', file_path
+                'ffprobe',
+                '-protocol_whitelist', Sandbox.PROTOCOL_WHITELIST,
+                '-v', 'error', '-print_format', 'json',
+                '-show_entries', PROBE_SHOW_ENTRIES, real_path
             ]
 
         try:
-            result = subprocess.run(
+            env = self.chooser.child_env() if self.chooser else Sandbox.local_env()
+            result = Sandbox.run_capped(
                 command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True,
-                timeout=30
+                env=env,
+                timeout=30,
+                stdout_limit=Sandbox.PROBE_MAX_STDOUT,
+                stderr_limit=Sandbox.PROBE_MAX_STDERR,
             )
+            if result.timed_out:
+                print(f"Error: ffprobe timed out for '{file_path}'.")
+                return self._increment_probe_failure(file_path)
+            if result.truncated:
+                print(f"Error: ffprobe output exceeded the safety limit "
+                      f"for '{file_path}'.")
+                return self._increment_probe_failure(file_path)
+            if result.returncode != 0:
+                return self._increment_probe_failure(file_path)
 
-            metadata = json.loads(result.stdout)
+            metadata = json.loads(result.stdout.decode('utf-8'))
             if not isinstance(metadata, dict):
                 raise ValueError("ffprobe output is not a JSON object.")
             raw_streams = metadata.get('streams') or []
@@ -257,7 +291,7 @@ class ProbeCache:
                 stream_codec = s.get('codec_name') or 'unknown'
                 all_streams.append(f"{stream_type}:{stream_codec}")
 
-            size_bytes = self._get_file_size(file_path)
+            size_bytes = self._get_file_size(real_path)
             if size_bytes is None:
                 raise IOError("Failed to get file size after probe.")
 
@@ -287,9 +321,7 @@ class ProbeCache:
 
             return meta
 
-        except subprocess.CalledProcessError:
-            return self._increment_probe_failure(file_path)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             print(f"Error: Failed to decode ffprobe JSON output for '{file_path}'.")
             return self._increment_probe_failure(file_path)
         except FileNotFoundError:

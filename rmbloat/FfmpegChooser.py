@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from types import SimpleNamespace
+from . import Sandbox
 
 class FfmpegChooser:
     """
@@ -42,7 +43,8 @@ class FfmpegChooser:
     SAFE_SUBTITLE_CODECS = {'subrip', 'srt', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'}
 
     def __init__(self, force_pull: bool = False, image: str = "joedefen/ffmpeg-vaapi-docker:latest",
-                 prefer_strategy: str = 'auto', quiet: bool = False) -> None:
+                 prefer_strategy: str = 'auto', quiet: bool = False,
+                 sandbox: str = 'auto') -> None:
         """
         Initialize and detect the best FFmpeg configuration.
 
@@ -68,6 +70,9 @@ class FfmpegChooser:
         self.vaapi_supports_10bit = False  # Will be detected during init
         self.prefer_strategy = prefer_strategy
         self.quiet = quiet
+        self.sandbox_preference = (sandbox if sandbox in Sandbox.SANDBOX_CHOICES
+                                   else 'auto')
+        self.sandbox_mode = 'none'
         self.strategy = None  # Will be set to the chosen strategy
 
         if not quiet:
@@ -86,6 +91,7 @@ class FfmpegChooser:
 
         # Decide final strategy
         self._decide_strategy()
+        self.sandbox_mode = self._resolve_sandbox_mode()
 
         # Print summary (handles quiet mode internally)
         self._print_summary()
@@ -122,6 +128,58 @@ class FfmpegChooser:
                 command = cmd[0] if cmd else 'command'
                 print(f"  ✗ Could not run {command}: {exc}")
             return None
+
+    def _resolve_sandbox_mode(self) -> str:
+        """Return the isolation actually available for the chosen strategy.
+
+        Container runs are isolated by the runtime flags.  Local runs use
+        bubblewrap when it is present and functional; an explicit request for
+        an unavailable strategy degrades to ``none`` with a visible warning.
+        """
+        if self.use_docker:
+            if self.sandbox_preference in ('bwrap', 'systemd', 'none'):
+                print(f"WARNING: --sandbox {self.sandbox_preference} does not apply "
+                      f"to the container runtime; using container isolation")
+            return 'container'
+
+        preference = self.sandbox_preference
+        if preference == 'container':
+            print("WARNING: no container runtime available; "
+                  "falling back to local sandbox detection")
+            preference = 'auto'
+
+        mode = Sandbox.detect_local_sandbox(preference)
+        if preference in ('bwrap', 'systemd') and mode == 'none':
+            print(f"WARNING: requested sandbox '{preference}' is not available; "
+                  "media decoders will run with full user privileges")
+        return mode
+
+    def describe_sandbox(self) -> str:
+        """Return a one-line description for the startup summary."""
+        if self.sandbox_mode == 'container':
+            runtime = self.runtime or 'container'
+            return f"{runtime} (network/caps/PIDs/read-only hardening)"
+        if self.sandbox_mode == 'bwrap':
+            return "bubblewrap (no network, read-only root, private /tmp)"
+        if self.sandbox_mode == 'systemd':
+            return "systemd-run (private network, strict filesystem)"
+        return "none (decoders run with full user privileges)"
+
+    def child_env(self, tmpdir: Optional[str] = None) -> Optional[dict]:
+        """Return the environment for a child process.
+
+        The docker/podman CLI needs the caller's environment (registry auth,
+        DOCKER_HOST, runtime dir), while a local ffmpeg must not inherit
+        ``FFREPORT`` or ``LD_PRELOAD``.  Return ``None`` for the container path
+        so ``subprocess`` inherits normally.
+        """
+        if self.use_docker:
+            return None
+        return Sandbox.local_env(tmpdir=tmpdir)
+
+    def _container_hardening(self, use_acceleration: bool = False) -> List[str]:
+        """Return the shared isolation flags placed after ``run --rm``."""
+        return Sandbox.harden_container_args(use_acceleration=use_acceleration)
 
     def _detect_system_ffmpeg(self) -> None:
         """Detect if system ffmpeg exists and test hardware acceleration."""
@@ -236,6 +294,7 @@ class FfmpegChooser:
                 return False
             test_cmd = [
                 self.runtime, 'run', '--rm',
+                *self._container_hardening(use_acceleration=True),
                 '--device=/dev/dri:/dev/dri',
                 *self._docker_user_and_group_args(self.render_device),
                 self._image_for_run(),
@@ -480,6 +539,7 @@ class FfmpegChooser:
         # let the probe pass while real encodes failed on device permissions.
         test_cmd = [
             self.runtime, 'run', '--rm',
+            *self._container_hardening(use_acceleration=True),
             '--device=/dev/dri:/dev/dri',
             *self._docker_user_and_group_args(render_device),
             self._image_for_run(),
@@ -591,11 +651,15 @@ class FfmpegChooser:
 
     def _print_summary(self) -> None:
         """Print a summary of the chosen configuration."""
-        # Quiet mode: show minimal or no output
+        # Quiet mode: show minimal or no output, but never hide the fact that
+        # decoders are running without any isolation.
         if self.quiet:
             if self.prefer_strategy != 'auto':
                 # User selected a specific strategy - show validation
                 print(f"Strategy: {self.strategy} (selected and validated)")
+            if self.sandbox_mode == 'none':
+                print("WARNING: sandbox: none - media decoders run with full "
+                      "user privileges", file=sys.stderr)
             # else: completely silent for auto detection in quiet mode
             return
 
@@ -615,6 +679,7 @@ class FfmpegChooser:
             print("Acceleration: Disabled (CPU encoding)")
 
         print(f"Strategy:     {self.strategy}")
+        print(f"Sandbox:      {self.describe_sandbox()}")
         print("="*60 + "\n")
 
 
@@ -689,6 +754,10 @@ class FfmpegChooser:
 
             # Stream information (for subtitle filtering)
             streams=[],
+
+            # Private per-job output directory (created by JobHandler).  The
+            # container mounts only this directory read-write.
+            temp_dir=None,
         )
 
         # Apply overrides
@@ -777,17 +846,27 @@ class FfmpegChooser:
         input_basename = input_path.name
 
         # 2. Docker Wrapper logic
+        temp_dir = getattr(params, 'temp_dir', None)
         if self.use_docker:
-            # Use the same identity/group arguments as the acceleration probe
-            # so a probe that passed predicts a working real encode.
+            # Mount the media read-only and make only the private per-job
+            # output directory writable.  ``:z`` relabels the bind mount for
+            # SELinux hosts; it is a no-op elsewhere.
+            if temp_dir and os.path.abspath(temp_dir) != os.path.abspath(workdir):
+                mounts = ['-v', f'{workdir}:{workdir}:ro,z',
+                          '-v', f'{temp_dir}:{temp_dir}:z']
+            else:
+                # Fallback when a private work directory could not be made.
+                mounts = ['-v', f'{workdir}:{workdir}:z']
+
             cmd.extend([
                 self.runtime, 'run', '--rm',
+                *self._container_hardening(
+                    use_acceleration=self.use_acceleration),
+                # Use the same identity/group arguments as the acceleration
+                # probe so a passing probe predicts a working real encode.
                 *self._docker_user_and_group_args(
                     self.render_device if self.use_acceleration else None),
-                # ``:z`` relabels the bind mount for SELinux hosts.  It is a
-                # no-op elsewhere, and avoids a denial when enforcing SELinux
-                # is active.  No host networking/IPC is needed for local files.
-                '-v', f'{workdir}:{workdir}:z',
+                *mounts,
                 '-w', workdir,
             ])
             if self.use_acceleration:
@@ -803,6 +882,10 @@ class FfmpegChooser:
             cmd.append('ffmpeg')
 
         cmd.extend('-y -progress pipe:2'.split())
+        # Do not read stdin and do not allow network protocols.  The whitelist
+        # is repeated before the subtitle input because format options apply
+        # to the next input only.
+        cmd.extend(['-nostdin', '-protocol_whitelist', Sandbox.PROTOCOL_WHITELIST])
 
         # 4. Hardware Initialization (Must be before -i)
         if self.use_acceleration:
@@ -827,7 +910,8 @@ class FfmpegChooser:
 
         if params.external_subtitle:
             sub_path = Path(params.external_subtitle)
-            cmd.extend(['-i', sub_path.name if self.use_docker else str(sub_path)])
+            cmd.extend(['-protocol_whitelist', Sandbox.PROTOCOL_WHITELIST,
+                        '-i', sub_path.name if self.use_docker else str(sub_path)])
 
         # 6. Stream Mapping (The Core Logic)
         # Map Video (v:0) and Audio (a?), copy audio
@@ -921,8 +1005,37 @@ class FfmpegChooser:
             cmd.extend(params.color_opts)
 
         # 9. Output
-        output_basename = Path(params.output_file).name if self.use_docker else params.output_file
-        cmd.append(output_basename)
+        if self.use_docker:
+            if temp_dir:
+                # The private directory is a subdirectory of the mounted media
+                # directory, so a relative path is stable inside the container.
+                output_arg = os.path.relpath(params.output_file, workdir)
+            else:
+                output_arg = Path(params.output_file).name
+        else:
+            output_arg = params.output_file
+        cmd.append(output_arg)
+
+        # 10. Local sandbox and resource limits.  The output file is
+        # pre-created by JobHandler, so ffmpeg truncates an existing inode
+        # instead of following a link planted in the media directory.
+        if not self.use_docker:
+            try:
+                input_size = os.path.getsize(params.input_file)
+            except OSError:
+                input_size = 0
+            fsize = (max(Sandbox.MIN_OUTPUT_LIMIT, input_size * 4)
+                     if input_size else None)
+            cmd = Sandbox.apply_limits(cmd, fsize=fsize)
+            cmd = Sandbox.wrap_local(
+                cmd,
+                input_dirs=[workdir],
+                outdir=temp_dir or workdir,
+                workdir=workdir,
+                allow_gpu=self.use_acceleration,
+                render_device=self.render_device,
+                strategy=getattr(self, 'sandbox_mode', 'none'),
+            )
 
         return cmd
 
@@ -980,7 +1093,8 @@ class FfmpegChooser:
             temp_chooser = FfmpegChooser(
                 image=self._image_for_run(),
                 prefer_strategy=strategy,
-                quiet=True
+                quiet=True,
+                sandbox=getattr(self, 'sandbox_preference', 'auto'),
             )
 
             # Build a unique output filename.  Never reuse (or unlink) a
@@ -1117,23 +1231,34 @@ class FfmpegChooser:
         workdir = str(input_path.parent)
         input_basename = input_path.name
 
+        # Media files are local.  Denying the network protocols blocks a
+        # crafted playlist/manifest from making ffprobe fetch remote data.
+        hardened = ['-protocol_whitelist', Sandbox.PROTOCOL_WHITELIST]
+
         # Build base command (docker/podman vs system)
         if self.use_docker:
             cmd.extend([
                 self.runtime, 'run', '--rm',
+                *self._container_hardening(use_acceleration=False),
+                *self._docker_user_and_group_args(None),
                 '-v', f'{workdir}:{workdir}:ro,z',
                 '-w', workdir,
                 '--entrypoint', 'ffprobe',
                 self._image_for_run(),
+                *hardened,
             ])
             cmd.append(input_basename)
         else:
-            cmd.append('ffprobe')
-            cmd.append(input_file)
+            cmd.extend(['ffprobe', *hardened, input_file])
 
         # Add extra arguments
         if extra_args:
             cmd.extend(extra_args)
+
+        if not self.use_docker:
+            cmd = Sandbox.wrap_local(
+                cmd, input_dirs=[workdir], workdir=workdir,
+                strategy=getattr(self, 'sandbox_mode', 'none'))
 
         return cmd
 
@@ -1228,6 +1353,12 @@ def main() -> int:
         help='Preferred encoding strategy (default: auto)'
     )
     parser.add_argument(
+        '--sandbox',
+        choices=Sandbox.SANDBOX_CHOICES,
+        default='auto',
+        help='Isolation for local ffmpeg/ffprobe (default: auto)'
+    )
+    parser.add_argument(
         '--test-encode',
         action='store_true',
         help='Show example encode command'
@@ -1255,7 +1386,8 @@ def main() -> int:
     chooser = FfmpegChooser(
         force_pull=args.force_pull,
         image=args.image,
-        prefer_strategy=prefer_strategy
+        prefer_strategy=prefer_strategy,
+        sandbox=args.sandbox,
     )
 
     # Run tests

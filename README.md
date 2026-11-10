@@ -195,6 +195,7 @@ usage: rmbloat.py [-h] [--ascii [BOOL]] [--glyphs {auto,ascii,unicode}]
                   [--no-full-speed] [-B] [--no-keep-backup] [-M]
                   [--no-merge-subtitles] [-H MAX_HEIGHT] [-m MIN_SHRINK_PCT]
                   [-p {auto,system_accel,docker_accel,system_cpu,docker_cpu}]
+                  [--sandbox {auto,container,bwrap,systemd,none}]
                   [-q QUALITY] [-t THREAD_CNT] [--use-trash]
                   [--no-use-trash] [-S] [--auto-hr AUTO_HR] [-s] [-L] [-T]
                   [files ...]
@@ -244,6 +245,9 @@ options:
   -p {auto,system_accel,system_cpu,docker_accel,docker_cpu},
       --prefer-strategy {auto,system_accel,system_cpu,docker_accel,docker_cpu}
                         FFmpeg strategy preference [dflt=auto]
+  --sandbox {auto,container,bwrap,systemd,none}
+                        isolation for local ffmpeg/ffprobe: auto, container,
+                        bwrap, systemd, or none [dflt=auto]
   -q QUALITY, --quality QUALITY
                         output quality (CRF) [dflt=28]
   -t THREAD_CNT, --thread-cnt THREAD_CNT
@@ -252,8 +256,8 @@ options:
                         [dflt=False]
   --no-use-trash        force deleting the original even if use-trash is the
                         saved default
-  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M/--use-trash
-                        options and file paths as defaults
+  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M/--use-trash/
+                        --sandbox options and file paths as defaults
   --auto-hr AUTO_HR     Auto mode: run unattended for specified hours,
                         auto-select [X] files and auto-start conversions
   -s, --sample          produce 30s samples called SAMPLE.{input-file}
@@ -807,6 +811,19 @@ By default, `ffmpeg` conversions are done with both `ionice` and `nice` lowering
 **Key behavior**: If you have system ffmpeg installed, `rmbloat` will always prefer it over Docker, even if system hardware acceleration isn't working. Docker is only used when system ffmpeg is completely unavailable.
 
 You can override the automatic selection with the `-p/--prefer-strategy` option if needed.
+
+### Security: Untrusted Media
+
+Media decoders process attacker-controlled bytes, so rmbloat treats `ffmpeg` and `ffprobe` as untrusted children:
+
+* **Container runs** are hardened with `--network none`, `--cap-drop ALL`, `--security-opt no-new-privileges`, a read-only root filesystem with tmpfs scratch space, a bounded PID count, and an enlarged `/dev/shm` for VA-API. The media directory is mounted read-only; only a private per-job directory is writable.
+* **Local runs** deny network protocols (`-protocol_whitelist file,pipe`), close stdin (`-nostdin`), reject FIFOs/device nodes, scrub `FFREPORT`/`LD_PRELOAD`-style environment variables, apply `RLIMIT_CORE`/`RLIMIT_FSIZE`, and terminate the whole process group on abort. If `bwrap` is installed and functional, `--sandbox auto` runs the local path with no network and a read-only root as well.
+* **Private output:** each job writes to a `.rmbloat-tmp-*` directory inside the media folder (mode 0700). It stays on the same filesystem so the final install remains atomic, and the scanner ignores it.
+* **`--sandbox`** selects `auto` (default), `container`, `bwrap`, `systemd`, or `none`. `systemd` is opt-in because its scope/stdio behaviour varies between releases. If no isolation is available, rmbloat says so at startup rather than implying the run is sandboxed.
+
+**Intentional behaviour change:** a file that depends on remote resources (for example an HLS playlist pointing at `http://`) will now fail to probe or convert. That is the point of the whitelist; download such media locally first.
+
+**Residual risk:** with `--sandbox none`, an in-process ffmpeg exploit gains the invoking user's privileges. Killing rmbloat with `SIGKILL` can also orphan a local ffmpeg child; the normal `SIGTERM`/`SIGHUP` paths abort it cleanly.
 
 To test your hardware acceleration support:
 ```bash
