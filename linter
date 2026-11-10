@@ -2,30 +2,47 @@
 # Lint the package with pylint.
 #
 # Ruff is the primary linter; pylint is kept for errors that ruff does not model
-# (for example a duplicate method definition).  Usage:
+# (for example a duplicate method definition), so only errors are requested
+# (--errors-only).  Usage:
 #
 #     ./linter                 # lint ./rmbloat
 #     ./linter rmbloat tests   # lint explicit paths
 #
-# `python -m pylint` is preferred (so the interpreter that owns rmbloat's
-# dependencies is used); a `pylint` executable on PATH is the fallback.  Set
-# PYTHON to pick a specific interpreter.  The sibling console_window checkout
-# used to be added to sys.path unconditionally, which broke the script whenever
-# that checkout was absent (and the dependency is declared in pyproject.toml
-# anyway).  It is now used only when it actually exists, and every argument is
-# forwarded instead of just `$1`.
+# The interpreter must be able to import pylint *and* rmbloat's dependencies.
+# Running pylint under an interpreter that lacks them produced bogus E0401
+# import-errors (console_window, send2trash) and made a clean checkout fail, so
+# the checkout's own .venv is preferred when PYTHON is unset, and a missing
+# pylint is reported as a configuration error with the fix instead of silently
+# switching to another interpreter.  pylint is declared in the `dev` extra:
+#
+#     .venv/bin/python -m pip install -e '.[dev]'
+#
+# The sibling console_window checkout used to be added to sys.path
+# unconditionally, which broke the script whenever that checkout was absent (and
+# the dependency is declared in pyproject.toml anyway).  It is used only when it
+# actually exists, and every argument is forwarded instead of just `$1`.
 set -u
-PYTHON_BIN="${PYTHON:-python3}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 PROJECT_A_PATH="$SCRIPT_DIR/../console_window"
 
+if [ -n "${PYTHON:-}" ]; then
+    PYTHON_BIN="$PYTHON"
+elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
+else
+    PYTHON_BIN=python3
+fi
+
 [ "$#" -eq 0 ] && set -- rmbloat
 
-if "$PYTHON_BIN" -c 'import pylint' >/dev/null 2>&1; then
-    PYLINT_CMD=("$PYTHON_BIN" -m pylint)
-else
-    PYLINT_CMD=(pylint)
+if ! "$PYTHON_BIN" -c 'import pylint' >/dev/null 2>&1; then
+    echo "linter: pylint is not importable by $PYTHON_BIN" >&2
+    echo "linter: install the dev extra, e.g. $PYTHON_BIN -m pip install -e '.[dev]'" >&2
+    # EX_CONFIG: the tool is missing, so the failure is not about the code.
+    exit 78
 fi
+
+PYLINT_CMD=("$PYTHON_BIN" -m pylint --errors-only)
 
 if [ -d "$PROJECT_A_PATH" ]; then
     "${PYLINT_CMD[@]}" --init-hook="import sys; sys.path.insert(0, '$PROJECT_A_PATH')" "$@"

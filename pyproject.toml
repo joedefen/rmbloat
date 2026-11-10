@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "rmbloat"
-version = "0.8.5"
+version = "1.0.0"
 readme = "README.md"
 description = "An intelligent FFmpeg utility for prioritizing and converting inefficient video files (BLOAT score)."
 authors = [
@@ -36,6 +36,16 @@ text = "MIT"
 [project.scripts]
 rmbloat = "rmbloat.rmbloat:main"
 rmbloatd = "rmbloat.rmbloatd:main"
+
+# Development gates.  `./linter` requires pylint to be importable by the same
+# interpreter that has the runtime dependencies, so pylint lives here rather
+# than being borrowed from another interpreter on PATH:
+#     python -m pip install -e '.[dev]'
+[project.optional-dependencies]
+dev = [
+    "pylint>=3.0",
+    "ruff>=0.6",
+]
 
 [tool.ruff]
 target-version = "py311"

@@ -78,11 +78,15 @@ class IniManager:
         """
         Returns the conventional per-user configuration directory for ``app_name``.
 
-        This is the single source of truth for where rmbloat keeps its
-        ``config.ini``, ``state.json``, and probe cache (and therefore the
-        probe-cache lock file).  Callers that need to locate those files
-        without constructing an :class:`IniManager` (e.g. the ``rmbloatd``
-        wrapper) should use this helper too.
+        This directory holds the durable user settings only: ``config.ini``
+        written by :meth:`_determine_config_path`, and ``state.json`` used by
+        :class:`rmbloat.PersistentState`.  The probe cache and its
+        single-instance lock are not configuration -- they are derived,
+        discardable data -- so they live in the cache directory instead
+        (:func:`rmbloat.ProbeCache.default_cache_dir`, i.e.
+        ``$XDG_CACHE_HOME/rmbloat``).  Callers that need the configuration
+        paths without constructing an :class:`IniManager` should use this
+        helper too.
         """
         return Path.home() / ".config" / app_name
 

@@ -10,6 +10,15 @@ import time
 from pathlib import Path
 
 
+HISTORY_EXPORT_PREFIX = 'rmbloat-export-'
+HISTORY_EXPORT_SUFFIX = '.txt'
+# A copy used to leave one file in the cache directory forever, so a session
+# spent reading History accumulated media paths and ffmpeg output without
+# bound.  Only the newest few, and nothing older than a week, are kept.
+HISTORY_EXPORT_MAX_FILES = 20
+HISTORY_EXPORT_MAX_AGE_SECS = 7 * 24 * 60 * 60
+
+
 def history_export_dir():
     """Return the per-user cache directory for clipboard fallback exports.
 
@@ -22,16 +31,70 @@ def history_export_dir():
     return os.path.join(base, 'rmbloat')
 
 
+def _is_history_export(name):
+    """Return True for a name this module owns (never for a planted symlink)."""
+    return name.startswith(HISTORY_EXPORT_PREFIX) and name.endswith(HISTORY_EXPORT_SUFFIX)
+
+
+def _prune_history_exports(export_dir, keep=HISTORY_EXPORT_MAX_FILES,
+                           max_age=HISTORY_EXPORT_MAX_AGE_SECS, now=None,
+                           protect=None):
+    """Delete old ``rmbloat-export-*.txt`` files; return how many were removed.
+
+    The exports are throwaway copies of log entries that contain media paths and
+    ffmpeg output, so a bounded store is both a privacy and a disk-usage fix.
+    The newest ``keep`` files survive, as does anything younger than ``max_age``;
+    everything else is unlinked.  ``protect`` names the file that must never be
+    removed (the export just written), which also disambiguates equal mtimes.
+
+    Only regular files created by :func:`write_history_export` are considered,
+    and every failure is ignored: housekeeping must never fail a copy.
+    """
+    now = time.time() if now is None else now
+    candidates = []
+    try:
+        with os.scandir(export_dir) as entries:
+            for entry in entries:
+                if not _is_history_export(entry.name):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    candidates.append(
+                        (entry.stat(follow_symlinks=False).st_mtime, entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+
+    # Newest first, with the protected file pinned to the front.  mtimes can
+    # collide within one second, so ``protect`` cannot rely on sorting alone.
+    candidates.sort(key=lambda item: (item[1] != protect, -item[0]))
+    removed = 0
+    for index, (mtime, path) in enumerate(candidates):
+        if index < keep and now - mtime <= max_age:
+            continue
+        try:
+            os.unlink(path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def write_history_export(text):
     """Write ``text`` to a new private export file and return its path.
 
     ``tempfile.mkstemp`` creates the file with mode 0600 and a unique name, so
     the export can never clobber or follow a path planted by another user.
+    Previous exports are pruned after the new one is durable, so the directory
+    keeps a bounded number of recent copies instead of growing forever.
     """
     export_dir = history_export_dir()
     os.makedirs(export_dir, mode=0o700, exist_ok=True)
     fd, export_path = tempfile.mkstemp(
-        prefix='rmbloat-export-', suffix='.txt', dir=export_dir, text=True)
+        prefix=HISTORY_EXPORT_PREFIX, suffix=HISTORY_EXPORT_SUFFIX,
+        dir=export_dir, text=True)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(text)
@@ -43,6 +106,7 @@ def write_history_export(text):
         except OSError:
             pass
         raise
+    _prune_history_exports(export_dir, protect=export_path)
     return export_path
 
 

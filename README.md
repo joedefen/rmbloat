@@ -2,6 +2,8 @@
 
 `rmbloat` is an intelligent, interactive video converter designed specifically for media server owners to reclaim massive amounts of disk space effortlessly, while maintaining high visual quality. It identifies the most inefficient videos in your collection and lets you convert them in prioritized, low-impact background batches.
 
+> Note: v1 (1.0.0) addressed bugs and security preserving v0.8.5 features.
+
 ![rmbloat-demo](https://raw.githubusercontent.com/joedefen/rmbloat/main/images/rmbloat-2026-01-09-13-30.gif)
 
 ## Quick Start
@@ -194,10 +196,10 @@ usage: rmbloat.py [-h] [--ascii [BOOL]] [--glyphs {auto,ascii,unicode}]
                   [--no-color] [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F]
                   [--no-full-speed] [-B] [--no-keep-backup] [-M]
                   [--no-merge-subtitles] [-H MAX_HEIGHT] [-m MIN_SHRINK_PCT]
-                  [-p {auto,system_accel,docker_accel,system_cpu,docker_cpu}]
-                  [--sandbox {auto,container,bwrap,systemd,none}]
-                  [-q QUALITY] [-t THREAD_CNT] [--use-trash]
-                  [--no-use-trash] [-S] [--auto-hr AUTO_HR] [-s] [-L] [-T]
+                  [-p {auto,system_accel,system_cpu,docker_accel,docker_cpu}]
+                  [-q QUALITY] [--sandbox {auto,container,bwrap,systemd,none}]
+                  [-t THREAD_CNT] [--use-trash] [--no-use-trash] [-S]
+                  [--auto-hr AUTO_HR] [-s] [-L] [-T]
                   [files ...]
 
 CLI/curses bulk Video converter for media servers
@@ -219,15 +221,15 @@ options:
   --no-color            draw the semantic roles with attributes instead of
                         color; wins over --theme, and NO_COLOR does the same
                         when the switch is absent
-  -a {x26*,x265,all}, --allowed-codecs {x26*,x265,all}
+  -a, --allowed-codecs {x26*,x265,all}
                         allowed codecs [dflt=x265]
-  -b BLOAT_THRESH, --bloat-thresh BLOAT_THRESH
+  -b, --bloat-thresh BLOAT_THRESH
                         bloat threshold to convert [dflt=1600,min=500]
-  -F, --full-speed      force full speed (do NOT set nice -n19 and ionice
-                        -c3) [dflt=False]
+  -F, --full-speed      force full speed: do NOT set nice -n19 and ionice -c3
+                        [dflt=False]
   --no-full-speed       force nice/ionice even if full speed is the saved
                         default
-  -B, --keep-backup     force keeping backups (rename to ORIG.{videofile})
+  -B, --keep-backup     force keeping backups: rename to ORIG.{videofile}
                         [dflt=False]
   --no-keep-backup      force recycling the original even if backups are the
                         saved default
@@ -236,21 +238,20 @@ options:
                         output [dflt=False]
   --no-merge-subtitles  force ignoring external subtitles even if merging is
                         the saved default
-  -H MAX_HEIGHT, --max-height MAX_HEIGHT
+  -H, --max-height MAX_HEIGHT
                         Maximum video height in pixels; videos taller than
                         this will be scaled down [dflt=65536,range=1-65536]
-  -m MIN_SHRINK_PCT, --min-shrink-pct MIN_SHRINK_PCT
-                        minimum conversion reduction percent for
-                        replacement [dflt=10,range=0-100]
-  -p {auto,system_accel,system_cpu,docker_accel,docker_cpu},
-      --prefer-strategy {auto,system_accel,system_cpu,docker_accel,docker_cpu}
+  -m, --min-shrink-pct MIN_SHRINK_PCT
+                        minimum conversion reduction percent for replacement
+                        [dflt=10,range=0-100]
+  -p, --prefer-strategy {auto,system_accel,system_cpu,docker_accel,docker_cpu}
                         FFmpeg strategy preference [dflt=auto]
+  -q, --quality QUALITY
+                        output quality (CRF, 0-51) [dflt=28]
   --sandbox {auto,container,bwrap,systemd,none}
                         isolation for local ffmpeg/ffprobe: auto, container,
                         bwrap, systemd, or none [dflt=auto]
-  -q QUALITY, --quality QUALITY
-                        output quality (CRF, 0-51) [dflt=28]
-  -t THREAD_CNT, --thread-cnt THREAD_CNT
+  -t, --thread-cnt THREAD_CNT
                         thread count for ffmpeg conversions (0 = let ffmpeg
                         decide); applies to the software encoders only, the
                         VAAPI hardware path ignores it [dflt=4,range=0-256]
@@ -258,11 +259,12 @@ options:
                         [dflt=False]
   --no-use-trash        force deleting the original even if use-trash is the
                         saved default
-  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M/--use-trash/
-                        --sandbox options and file paths as defaults
-  --auto-hr AUTO_HR     Auto mode: run unattended for specified hours,
-                        auto-select [X] files and auto-start conversions
-  -s, --sample          produce 30s samples called SAMPLE.{input-file}
+  -S, --save-defaults   save the -B/-b/-p/-q/-a/-F/-H/-m/-M options and file
+                        paths as defaults
+  --auto-hr AUTO_HR     Auto mode: run unattended for specified hours, auto-
+                        select [X] files and auto-start conversions
+  -s, --sample          produce 30s samples named SAMPLE.<crf>.<output> next
+                        to each input file
   -L, --logs            view the logs (requires 'less')
   -T, --chooser-tests   run tests on ffmpeg choices w 120s cvt of 1st given
                         video
