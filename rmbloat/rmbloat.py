@@ -424,6 +424,21 @@ class Converter:
 
             return
 
+    def _conversion_active(self):
+        """True while the Convert screen is current or beneath an overlay.
+
+        The Convert screen stays on the back stack when History/Help/Theme is
+        pushed on top, so the whole stack is inspected. Any other base screen
+        (notably Select) means the conversion engine must stay idle.
+        """
+        if not self.stack:
+            return False
+        curr = getattr(self.stack, 'curr', None)
+        if curr is not None and curr.num == CONVERT_ST:
+            return True
+        frames = getattr(self.stack, 'stack', ())
+        return any(getattr(frame, 'num', None) == CONVERT_ST for frame in frames)
+
     def advance_jobs(self):
         """Process ongoing conversion jobs (Threaded Version)"""
         # Safety: If we don't have a handler, we can't do work
@@ -471,9 +486,12 @@ class Converter:
                 self.job = None
 
         # B. Start New Jobs / Handle Queue
-        # Logic remains the same, but simplified to call JobHandler
-        # if not self.job and self.stack.curr.num == CONVERT_ST:
-        if not self.job and self.stack.curr.num != SELECT_ST:
+        # Only run the engine while the Convert screen is actually active
+        # (current, or under a History/Help/Theme overlay). Requiring the
+        # Convert screen specifically - rather than merely "not Select" -
+        # stops a stale job_handler from resuming queued conversions after the
+        # user has quit back to Select and then opened another screen.
+        if not self.job and self._conversion_active():
             self._manage_queue_and_auto_mode()
 
 
@@ -1121,9 +1139,28 @@ class SelectScreen(RmbloatScreen):
 class ConvertScreen(RmbloatScreen):
     """Conversion progress screen - shows encoding progress"""
 
-    def screen_escape_ACTION(self):
-        """ESC key - Return to previous screen"""
+    def _stop_conversions(self):
+        """Abort the running job and tear down the conversion engine.
+
+        Clearing ``job_handler`` is what tells ``advance_jobs()`` to stay
+        idle. It must happen even when no job is active (for example, the
+        short gap between queued jobs): otherwise merely visiting History or
+        Help after leaving Convert would silently resume the queue.
+        """
+        app = self.app
         self.kill_any_job()
+        app.job = None
+        app.job_handler = None
+
+        # An interrupted run must not auto-transition straight back into
+        # Convert on the next event-loop iteration.
+        if app.auto_mode_enabled:
+            app.auto_mode_enabled = False
+            app.options_suffix = app.build_options_suffix()
+
+    def screen_escape_ACTION(self):
+        """ESC key - Return to previous screen (stop conversions)"""
+        self._stop_conversions()
         self.app.stack.pop()
 
     def draw_screen(self):
@@ -1175,17 +1212,8 @@ class ConvertScreen(RmbloatScreen):
 
     def quit_ACTION(self):
         """'q' key - Return to select screen (stop conversions)"""
-        app = self.app
-        if app.job:
-            self.kill_any_job()
-            app.job = None
-
-        # Disable auto mode when user interrupts
-        if app.auto_mode_enabled:
-            app.auto_mode_enabled = False
-            app.options_suffix = app.build_options_suffix()
-
-        app.stack.pop()
+        self._stop_conversions()
+        self.app.stack.pop()
 
 
 class HelpScreen(RmbloatScreen):
