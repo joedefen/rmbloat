@@ -373,28 +373,34 @@ class JobHandler:
 
     def start_transcode_job(self, vid: Vid, retry_with_error_tolerance=False,
                             force_software=False):
-        """Start a transcoding job using the Threaded TranscodeThread."""
-        os.chdir(os.path.dirname(vid.filepath))
-        basename = os.path.basename(vid.filepath)
+        """Start a transcoding job using the Threaded TranscodeThread.
+
+        All paths are resolved against the source video's directory.  The old
+        implementation called ``os.chdir()`` here and never restored the
+        process working directory, which is unsafe once the TUI and ffmpeg
+        worker threads run concurrently.
+        """
+        video_path = os.path.abspath(vid.filepath)
+        video_dir = os.path.dirname(video_path)
+        basename = os.path.basename(video_path)
         probe = vid.probe0
 
         # ... [Subtitle and Path Logic] ...
         merged_external_subtitle = None
         if self.opts.merge_subtitles:
-            subtitle_path = Path(vid.filepath).with_suffix('.en.srt')
+            subtitle_path = Path(video_path).with_suffix('.en.srt')
             if subtitle_path.exists() and self.validate_srt_file(subtitle_path):
                 merged_external_subtitle = str(subtitle_path)
                 vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
 
-        # Samples are written next to the source file (we chdir'd there above)
-        # so --sample works on any machine instead of relying on a developer's
-        # hardcoded /heap/samples directory.
+        # Samples are written next to the source file so --sample works on any
+        # machine instead of relying on a developer's hardcoded /heap/samples
+        # directory.  Absolute paths also keep the exit handler independent of
+        # whatever directory happens to be current when cleanup runs.
         prefix = f'SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
-        temp_file = f"{prefix}.{vid.standard_name}"
-        # Keep the cleanup path absolute: an exit handler may run after the
-        # working directory used for the encode has changed.
-        self.temp_file = os.path.abspath(temp_file)
-        orig_backup_file = f"ORIG.{basename}"
+        temp_file = os.path.join(video_dir, f"{prefix}.{vid.standard_name}")
+        self.temp_file = temp_file
+        orig_backup_file = os.path.join(video_dir, f"ORIG.{basename}")
 
         if os.path.exists(temp_file):
             os.unlink(temp_file)
@@ -429,7 +435,7 @@ class JobHandler:
 
         # 3. Build FFmpeg Parameters
         params = self.chooser.make_namespace(
-            input_file=basename,
+            input_file=video_path,
             output_file=temp_file,
             use_10bit=self.should_use_10bit(probe.pix_fmt, probe.codec),
             error_tolerant=retry_with_error_tolerance
@@ -559,7 +565,7 @@ class JobHandler:
                 vid.doit = 'ERR'
         elif success and self.opts.sample:
             # Keep only the filename: the UI shows basename1 in place of the
-            # source name, and temp_file is relative to the video's directory.
+            # source name, never the absolute temp path used internally.
             vid.basename1 = os.path.basename(job.temp_file)
 
         # 4. Handle Vitals for Auto Mode
@@ -684,10 +690,12 @@ class JobHandler:
 
         #######################
 
-        basename = os.path.basename(vid.filepath)
+        original_path = os.path.abspath(vid.filepath)
+        video_dir = os.path.dirname(original_path)
+        basename = os.path.basename(original_path)
 
         # 1. Preserve timestamps from the original file
-        timestamps = FileOps.preserve_timestamps(basename)
+        timestamps = FileOps.preserve_timestamps(original_path)
 
         # 2. Verify the output *before* touching the original. A zero-byte or
         #    missing temp file must never cost us the original.
@@ -704,8 +712,9 @@ class JobHandler:
 
         # 3. Compute the final name and refuse to overwrite a pre-existing file.
         finalize_standard_name(vid, job)
-        final_name = vid.standard_name
-        same_path = os.path.abspath(final_name) == os.path.abspath(basename)
+        final_name = (vid.standard_name if os.path.isabs(vid.standard_name)
+                      else os.path.join(video_dir, vid.standard_name))
+        same_path = os.path.abspath(final_name) == original_path
 
         if not same_path and os.path.lexists(final_name):
             vid.ops.append(
@@ -719,11 +728,12 @@ class JobHandler:
                 rollback_file = _unique_path(job.orig_backup_file)
             else:
                 rollback_file = _unique_path(
-                    f".rmbloat-rollback-{uuid.uuid4().hex}.{basename}")
-            os.rename(basename, rollback_file)
-            vid.ops.append(f"rename {basename!r} {rollback_file!r}")
+                    os.path.join(video_dir,
+                                 f".rmbloat-rollback-{uuid.uuid4().hex}.{basename}"))
+            os.rename(original_path, rollback_file)
+            vid.ops.append(f"rename {original_path!r} {rollback_file!r}")
         except OSError as e:
-            vid.ops.append(f"ERROR: could not move original {basename!r} aside: {e}")
+            vid.ops.append(f"ERROR: could not move original {original_path!r} aside: {e}")
             return False
 
         # 5. Install the transcoded file. Prefer a hard link so an existing
@@ -750,13 +760,13 @@ class JobHandler:
                 os.rename(job.temp_file, final_name)
                 vid.ops.append(f"rename {job.temp_file!r} {final_name!r}")
         except FileExistsError:
-            restore_original(rollback_file, basename)
+            restore_original(rollback_file, original_path)
             vid.ops.append(
                 f"ERROR: destination {final_name!r} appeared during the swap; refusing to overwrite")
             vid.ops.append(f"Transcoded output kept at {job.temp_file!r}")
             return False
         except OSError as e:
-            restore_original(rollback_file, basename)
+            restore_original(rollback_file, original_path)
             vid.ops.append(f"ERROR during swap of {vid.filepath}: {e}")
             vid.ops.append(
                 f"Transcoded output kept at {job.temp_file!r}; original preserved")
@@ -795,12 +805,12 @@ class JobHandler:
         # 8. Handle bulk rename if needed (e.g., matching subtitle files)
         if vid.do_rename:
             trashes = {os.path.basename(rollback_file)}
-            vid.ops += FileOps.bulk_rename(basename, final_name, trashes)
+            vid.ops += FileOps.bulk_rename(original_path, final_name, trashes)
 
         # 9. Restore original timestamps to the new file
         if not FileOps.apply_timestamps(final_name, timestamps):
             vid.ops.append(f"WARNING: could not restore timestamps on {final_name!r}")
 
         # 10. Update Vid object for UI reference
-        vid.basename1 = final_name
+        vid.basename1 = os.path.basename(final_name)
         return True

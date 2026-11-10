@@ -15,69 +15,18 @@ verify that:
 * ``finish_transcode_job()`` downgrades a failed swap to ``ERR``.
 """
 
-import contextlib
-import importlib
 import os
-import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-
-class _Dummy:
-    """Minimal stand-in for console_window classes."""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-
-@contextlib.contextmanager
-def stubbed_runtime_dependencies():
-    """Install fake third-party modules for the duration of the import."""
-    previous = {}
-
-    def install(name, **attributes):
-        previous[name] = sys.modules.get(name)
-        module = types.ModuleType(name)
-        for key, value in attributes.items():
-            setattr(module, key, value)
-        sys.modules[name] = module
-        return module
-
-    console_window = install('console_window')
-    for name in ('ConsoleWindow', 'OptionSpinner', 'Screen', 'ScreenStack',
-                 'ConsoleWindowOpts', 'IncrementalSearchBar', 'Context',
-                 'Theme'):
-        setattr(console_window, name, type(name, (_Dummy,), {}))
-
-    ruamel = install('ruamel')
-    ruamel_yaml = install('ruamel.yaml', YAML=_Dummy)
-    ruamel.yaml = ruamel_yaml
-
-    install('send2trash', send2trash=lambda *args, **kwargs: None)
-
-    try:
-        yield
-    finally:
-        for name, module in previous.items():
-            if module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
-
+from tests.runtime_stubs import stubbed_runtime_dependencies
 
 with stubbed_runtime_dependencies():
     from rmbloat import JobHandler as JobHandlerModule
     from rmbloat import rmbloat as RmbloatModule
-
-
-def purge_rmbloat_modules():
-    """Drop cached rmbloat modules so tests never share mutable state."""
-    for name in list(sys.modules):
-        if name == 'rmbloat' or name.startswith('rmbloat.'):
-            sys.modules.pop(name, None)
 
 
 class FileSwapTests(unittest.TestCase):
@@ -174,6 +123,34 @@ class FileSwapTests(unittest.TestCase):
         self.assertEqual((self.root / self.temp_name).read_bytes(), b'new-data')
         self.assertEqual((self.root / self.final_name).read_bytes(), b'occupied')
         self.assertEqual(self.rollback_files(), [])
+
+    def test_swap_uses_video_directory_not_process_cwd(self):
+        self.write_file(self.original_name, b'original')
+        self.write_file(self.temp_name, b'new-data')
+        self.write_file('movie.en.srt', b'subs')
+
+        vid = self.make_vid()
+        vid.do_rename = True
+        job = self.make_job()
+        job.temp_file = str(self.root / self.temp_name)
+        job.orig_backup_file = str(self.root / 'ORIG.movie.mkv')
+
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        self.addCleanup(os.chdir, str(self.root))
+        os.chdir(other.name)
+
+        ok = self.handler._execute_file_swap(vid, job)
+
+        self.assertTrue(ok)
+        self.assertEqual((self.root / self.final_name).read_bytes(), b'new-data')
+        self.assertFalse((self.root / self.original_name).exists())
+        self.assertFalse((self.root / self.temp_name).exists())
+        self.assertEqual(
+            (self.root / 'movie.crf28.recode.en.srt').read_bytes(), b'subs')
+        # The unrelated working directory must remain untouched and current.
+        self.assertEqual(list(Path(other.name).iterdir()), [])
+        self.assertEqual(os.getcwd(), other.name)
 
     def test_missing_or_empty_temp_aborts_without_touching_original(self):
         self.write_file(self.original_name, b'original')
@@ -291,7 +268,6 @@ class FileSwapTests(unittest.TestCase):
 
         def finish_failed_swap(_job):
             vid.doit = 'ERR'
-            return None
 
         converter.job_handler.finish_transcode_job.side_effect = finish_failed_swap
         converter._log_job_final = mock.Mock()
@@ -367,17 +343,27 @@ class SampleOutputTests(unittest.TestCase):
         vid.start_new_run = start_new_run
         return vid
 
-    def test_sample_output_is_relative_to_source_directory(self):
+    def test_sample_output_is_absolute_without_changing_cwd(self):
         vid = self.make_vid()
+        cwd_before = os.getcwd()
         with mock.patch.object(JobHandlerModule, 'TranscodeThread'):
             job = self.handler.start_transcode_job(vid)
 
-        expected = f'SAMPLE.28.{self.standard_name}'
+        expected = str(self.root / f'SAMPLE.28.{self.standard_name}')
         self.assertEqual(job.temp_file, expected)
         self.assertEqual(self.handler.temp_file, expected)
-        self.assertFalse(os.path.isabs(job.temp_file))
+        self.assertTrue(os.path.isabs(job.temp_file))
+        self.assertEqual(os.path.dirname(job.temp_file), str(self.root))
+        # Job startup must never change process-wide state.
+        self.assertEqual(os.getcwd(), cwd_before)
+        self.assertEqual(job.orig_backup_file,
+                         str(self.root / f'ORIG.{self.original_name}'))
         self.assertEqual(
-            os.path.dirname(os.path.abspath(job.temp_file)), str(self.root))
+            self.chooser.make_namespace.call_args.kwargs['input_file'],
+            vid.filepath)
+        self.assertEqual(
+            self.chooser.make_namespace.call_args.kwargs['output_file'],
+            expected)
 
     def test_finish_sample_keeps_only_the_basename_for_display(self):
         vid = self.make_vid()

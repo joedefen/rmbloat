@@ -157,11 +157,13 @@ def apply_timestamps(filepath, timestamps):
 
 def bulk_rename(old_file_name: str, new_file_name: str, trashes: set):
     """
-    Renames files and directories in the current working directory (CWD).
+    Renames companion files and directories beside ``old_file_name``.
 
     It finds all items whose non-extension part matches the non-extension part
     of `old_file_name`, and renames them using the non-extension part of
-    `new_file_name`, preserving the original file extensions.
+    `new_file_name`, preserving the original file extensions.  The search is
+    rooted at the old file's directory rather than the process working
+    directory, so callers never need a global ``os.chdir()``.
 
     Args:
         old_file_name: A sample filename (e.g., 'oldie.mp4') used to define
@@ -174,13 +176,14 @@ def bulk_rename(old_file_name: str, new_file_name: str, trashes: set):
         List of operation strings describing what was done
     """
     ops = []
-    old_base_name, _ = os.path.splitext(old_file_name)
-    new_base_name, _ = os.path.splitext(new_file_name)
+    old_dir = os.path.dirname(os.path.abspath(old_file_name))
+    old_base_name, _ = os.path.splitext(os.path.basename(old_file_name))
+    new_base_name, _ = os.path.splitext(os.path.basename(new_file_name))
 
     # Define the special suffix to look for (case-insensitive search)
     special_ext = ".REFERENCE.srt"
-    # 2. Use os.walk for recursive traversal starting from the current directory ('.')
-    for root, dirs, files in os.walk('.', topdown=False):
+    # 2. Walk the source video's directory tree.
+    for root, dirs, files in os.walk(old_dir, topdown=False):
 
         # Combine files and directories for unified processing.
         items_to_check = files + dirs
