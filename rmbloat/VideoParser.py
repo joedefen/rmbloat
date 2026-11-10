@@ -95,7 +95,7 @@ class VideoParser():
         r'^(.*?)\s+\(((?:19|20)\d\d)\)(?:\s+([a-zA-Z]{2}))?$',
         re.IGNORECASE)
     season_regex = r'^season\s*(\d+)$'
-    specials_regex = (r'^(:?special|other|trailer|short|scene|interview'
+    specials_regex = (r'^(?:special|other|trailer|short|scene|interview'
                       +r'|featurette|deleted scene|behind the scene)s?\b')
     seasondir_pat = re.compile(season_regex, re.IGNORECASE)  # season folder pattern
     specialsdir_pat = re.compile(specials_regex, re.IGNORECASE)  # specials folder
@@ -192,8 +192,8 @@ class VideoParser():
         return bool(self.year is not None and not self.is_tv_episode())
 
     def is_same_episode(self, rhs) -> bool:
-        """Return True if season and epsiode agree (and are non-None)."""
-        return (self.is_tv_episode() and rhs.is_tv_episode
+        """Return True if season and episode agree (and are non-None)."""
+        return (self.is_tv_episode() and rhs.is_tv_episode()
                 and self.season == rhs.season and self.episode == rhs.episode)
 
     def is_same_movie_year(self, rhs) -> bool:
@@ -284,8 +284,6 @@ class VideoParser():
                 # Check if parent directory is named 'Season 0' or similar
                 mat = VideoParser.seasondir_pat.match(parentd)
                 if mat and int(mat.group(1)) == 0:
-                    self.is_special = True
-                elif VideoParser.specialsdir_pat.match(parentd):
                     self.is_special = True
 
     def _parse(self, expect_episode: bool = None, expect_movie: bool = None):

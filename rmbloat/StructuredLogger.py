@@ -96,6 +96,9 @@ class LogEntry:
             Compact time string (e.g., '2h30m', '5d', '45s')
         """
         ago = int(max(0, abs(seconds)))
+        if ago == 0:
+            return '0s'
+
         divs = (60, 60, 24, 7, 52, 9999999)
         units = ('s', 'm', 'h', 'd', 'w', 'y')
         vals = (ago % 60, int(ago / 60))  # seed with secs, mins
@@ -108,8 +111,11 @@ class LogEntry:
             uidx += 1
 
         rv = '-' if signed and seconds < 0 else ''
-        rv += f'{vals[1]}{units[uidx]}' if vals[1] else ''
-        rv += f'{vals[0]:d}{units[uidx-1]}'
+        if vals[1]:
+            rv += f'{vals[1]}{units[uidx]}'
+        # Omit a zero minor unit so exact units stay compact ('1h', '5d').
+        if vals[0]:
+            rv += f'{vals[0]:d}{units[uidx-1]}'
         return rv
 
     def format_ago(self) -> str:

@@ -174,5 +174,66 @@ class HistorySearchRefreshTests(RmbloatModuleTestCase):
         self.assertEqual(screen.search_matches, set())
 
 
+class OpsNoteTests(RmbloatModuleTestCase):
+    """Swap/cleanup problems in ``Vid.ops`` must reach the TUI rows."""
+
+    @staticmethod
+    def make_vid(doit, ops):
+        return SimpleNamespace(
+            doit=doit,
+            doit_auto=doit,
+            codec='h264',
+            basename1='movie.mkv',
+            filepath='/videos/movie.mkv',
+            height=1080,
+            res_ok=True,
+            bloat_ok=True,
+            codec_ok=True,
+            duration=60.0,
+            net='0%',
+            bloat=1800,
+            gb=1.0,
+            probe0=SimpleNamespace(gb=1.0),
+            probe1=None,
+            ops=ops,
+        )
+
+    def make_converter(self, vids):
+        converter = self.rmbloat.Converter.__new__(self.rmbloat.Converter)
+        converter.vids = vids
+        converter.todo_vids = []
+        converter.job = None
+        converter.search_re = None
+        converter.spins = SimpleNamespace(
+            filter=None, mangle=False, directory=False)
+        converter.opts = SimpleNamespace(sample=False)
+        return converter
+
+    def test_swap_error_is_shown_in_row(self):
+        vid = self.make_vid('ERR', [
+            'rename "/videos/movie.mkv" "/videos/.rollback.mkv"',
+            'ERROR: destination appeared during the swap; refusing to overwrite',
+        ])
+
+        lines, _, _ = self.make_converter([vid]).make_lines()
+
+        self.assertTrue(any('[!] ERROR: destination appeared' in line
+                            for line in lines))
+
+    def test_routine_ops_do_not_clutter_rows(self):
+        vid = self.make_vid(' OK', ['link ...', 'trash ...'])
+
+        lines, _, _ = self.make_converter([vid]).make_lines()
+
+        self.assertFalse(any('[!]' in line for line in lines))
+
+    def test_note_is_truncated(self):
+        vid = self.make_vid('ERR', ['ERROR: ' + ('x' * 200)])
+
+        note = self.make_converter([vid])._ops_note(vid, limit=40)
+
+        self.assertEqual(note, 'ERROR: ' + ('x' * 30) + '...')
+
+
 if __name__ == '__main__':
     unittest.main()

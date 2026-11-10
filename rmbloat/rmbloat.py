@@ -247,6 +247,23 @@ class Converter:
                 print(f"Warning: could not abort active job: {exc}")
             self.job = None
 
+    @staticmethod
+    def _ops_note(vid, limit=96):
+        """Return a compact TUI note for the latest notable Vid operation.
+
+        ``Vid.ops`` records file-swap and cleanup actions. Routine entries
+        (rename/link/trash) are ignored, but a swap failure or trash warning
+        must be visible in the UI instead of only in the serialized job log.
+        """
+        prefixes = ('ERROR', 'CRITICAL', 'WARNING', 'REJECTED')
+        for op in reversed(getattr(vid, 'ops', ()) or ()):
+            text = str(op).strip()
+            if text.startswith(prefixes):
+                if limit and len(text) > limit:
+                    return text[:max(0, limit - 3)] + '...'
+                return text
+        return ''
+
     def make_lines(self, doit_skips=None):
         """Generate display lines and stats for video list"""
         lines, self.visible_vids, short_list = [], [], []
@@ -302,6 +319,9 @@ class Converter:
             line += f'   {basename}'
             if self.spins.directory:
                 line += f' ---> {dirname}'
+            note = self._ops_note(vid)
+            if note:
+                line += f'  [!] {note}'
             if self.search_re:
                 pattern = self.search_re
                 if self.spins.mangle:
