@@ -1464,7 +1464,8 @@ def main(args=None):
                     help='Auto mode: run unattended for specified hours, '
                          'auto-select [X] files and auto-start conversions')
         parser.add_argument('-s', '--sample', action='store_true',
-                    help='produce 30s samples called SAMPLE.{input-file}')
+                    help='produce 30s samples named SAMPLE.<crf>.<output> '
+                         'next to each input file')
         parser.add_argument('-L', '--logs', action='store_true',
                     help='view the logs')
         parser.add_argument('-T', '--chooser-tests', action='store_true',

@@ -31,6 +31,8 @@ The architecture is sensible: clear module boundaries, dataclass models, argv-li
 
 - **H3. Probe cache key collision** — Resolved in [`ProbeCache`](rmbloat/ProbeCache.py:51). Entries are now keyed by absolute file path followed by size (`abs_path -> {size -> probe}`) instead of basename + size, via [`_cache_key()`](rmbloat/ProbeCache.py:97), so `same.mp4` of equal size in different folders keeps separate metadata. [`load()`](rmbloat/ProbeCache.py:286) migrates existing basename-keyed cache files by rebuilding each path from the stored `folder`, and [`move_entry()`](rmbloat/ProbeCache.py:498) now re-keys all size entries for the exact old path. Verified with two same-named/same-sized files in separate folders (each retains its own codec, height, and folder) and with a managed rename; regression coverage lives in [`tests/test_input_validation.py`](tests/test_input_validation.py).
 
+- **H4. `--sample` wrote to `/heap/samples` and leaked an absolute path** — Resolved in [`start_transcode_job()`](rmbloat/JobHandler.py:353). The sample temp file is now named `SAMPLE.{quality}.{standard_name}` relative to the source video's own directory (the method already `chdir`s there), so no developer-specific directory is required and no extra directory needs creating. [`finish_transcode_job()`](rmbloat/JobHandler.py:474) stores only [`os.path.basename()`](rmbloat/JobHandler.py:527) in `vid.basename1`, so the UI never displays an absolute temp path. Regression coverage lives in [`tests/test_file_swap.py`](tests/test_file_swap.py) (`SampleOutputTests`): the sample output resolves inside the source directory, and `basename1` remains a bare filename even if the temp path is absolute.
+
 ---
 
 # Critical findings
@@ -86,7 +88,7 @@ In [`finish_transcode_job()`](rmbloat/JobHandler.py:593):
 
 3. **Probe cache key collision.** [`_get_valid_entry()`](rmbloat/ProbeCache.py:362) keys only on basename + size, and rewrites the stored `folder`. Reproduced with two different files named `same.mp4` of equal size in different folders: looking up the second returned the first file’s cached metadata. This can assign wrong codec/resolution/duration/subtitle info and confuse [`move_entry()`](rmbloat/ProbeCache.py:473). **Resolved** — see the H3 entry under “Resolved findings”.
 
-4. **Sample mode writes to a hardcoded developer path.** [`start_transcode_job()`](rmbloat/JobHandler.py:457) uses `prefix = '/heap/samples/SAMPLE...'` and never creates the directory. `--sample` will fail on any normal machine and leaves an absolute temp path in `vid.basename1` ([`JobHandler.py:612`](rmbloat/JobHandler.py:612)).
+4. **Sample mode writes to a hardcoded developer path.** [`start_transcode_job()`](rmbloat/JobHandler.py:457) used `prefix = '/heap/samples/SAMPLE...'` and never created the directory, so `--sample` failed on any normal machine. **Resolved** — see the H4 entry under “Resolved findings”.
 
 5. **Stdin/TTY reopen closes the new stdin.** In [`create_video_file_list()`](rmbloat/rmbloat.py:445), `sys.stdin.close()` frees fd 0; `os.open('/dev/tty')` therefore typically returns fd 0; then [`os.close(tty_fd)`](rmbloat/rmbloat.py:459) closes fd 0 again, leaving `sys.stdin` backed by a closed descriptor. Piped `-` input is therefore likely to break the interactive session. Only close `tty_fd` if it differs from 0.
 

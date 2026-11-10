@@ -365,7 +365,10 @@ class JobHandler:
                 merged_external_subtitle = str(subtitle_path)
                 vid.standard_name = str(Path(vid.standard_name).with_suffix('.sb.mkv'))
 
-        prefix = f'/heap/samples/SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
+        # Samples are written next to the source file (we chdir'd there above)
+        # so --sample works on any machine instead of relying on a developer's
+        # hardcoded /heap/samples directory.
+        prefix = f'SAMPLE.{self.opts.quality}' if self.opts.sample else 'TEMP'
         self.temp_file = temp_file = f"{prefix}.{vid.standard_name}"
         orig_backup_file = f"ORIG.{basename}"
 
@@ -519,7 +522,9 @@ class JobHandler:
                 success = False
                 vid.doit = 'ERR'
         elif success and self.opts.sample:
-            vid.basename1 = job.temp_file
+            # Keep only the filename: the UI shows basename1 in place of the
+            # source name, and temp_file is relative to the video's directory.
+            vid.basename1 = os.path.basename(job.temp_file)
 
         # 4. Handle Vitals for Auto Mode
         if self.auto_mode_enabled:

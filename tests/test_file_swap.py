@@ -307,5 +307,97 @@ class FileSwapTests(unittest.TestCase):
         self.assertEqual(vid.doit_auto, 'ERR')
 
 
+class SampleOutputTests(unittest.TestCase):
+    """Regression tests for audit finding H4: no hardcoded sample directory."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+
+        self.original_name = 'movie.mkv'
+        self.standard_name = 'movie.crf28.recode.mkv'
+        self.opts = types.SimpleNamespace(
+            keep_backup=False,
+            use_trash=False,
+            sample=True,
+            merge_subtitles=False,
+            quality=28,
+            allowed_codecs='x265',
+            min_shrink_pct=10,
+            full_speed=False,
+            thread_cnt=0,
+            max_height=1080,
+            progress_secs_max=5,
+        )
+        self.probe_cache = mock.Mock()
+        self.chooser = mock.Mock()
+        self.chooser.use_acceleration = True
+        self.chooser.make_namespace.return_value = types.SimpleNamespace()
+        self.chooser.make_ffmpeg_cmd.return_value = [
+            'ffmpeg', '-i', self.original_name, f'SAMPLE.28.{self.standard_name}']
+        self.handler = JobHandlerModule.JobHandler(
+            self.opts, chooser=self.chooser, probe_cache=self.probe_cache,
+            auto_mode_enabled=False)
+
+    def make_vid(self):
+        vid = types.SimpleNamespace(
+            filepath=str(self.root / self.original_name),
+            standard_name=self.standard_name,
+            basename1=None,
+            doit=' OK',
+            doit_auto=' OK',
+            gb=1.0,
+            net='  - ',
+            ops=[],
+            runs=[],
+            probe0=types.SimpleNamespace(
+                duration=600.0, height=1080, width=1920,
+                pix_fmt='yuv420p', codec='h264', streams=[],
+                color_spt='bt709,bt709,bt709'),
+        )
+
+        def start_new_run(command=None):
+            vid.runs.append(types.SimpleNamespace(
+                command=command, descr=None, return_code=None, texts=[]))
+
+        vid.start_new_run = start_new_run
+        return vid
+
+    def test_sample_output_is_relative_to_source_directory(self):
+        vid = self.make_vid()
+        with mock.patch.object(JobHandlerModule, 'TranscodeThread'):
+            job = self.handler.start_transcode_job(vid)
+
+        expected = f'SAMPLE.28.{self.standard_name}'
+        self.assertEqual(job.temp_file, expected)
+        self.assertEqual(self.handler.temp_file, expected)
+        self.assertFalse(os.path.isabs(job.temp_file))
+        self.assertEqual(
+            os.path.dirname(os.path.abspath(job.temp_file)), str(self.root))
+
+    def test_finish_sample_keeps_only_the_basename_for_display(self):
+        vid = self.make_vid()
+        # Simulate an absolute temp path anyway: basename1 must never leak it.
+        temp_path = str(self.root / f'SAMPLE.28.{self.standard_name}')
+        vid.runs = [types.SimpleNamespace(
+            command='-crf 28', return_code=0, texts=[], descr='initial run')]
+        job = types.SimpleNamespace(
+            vid=vid,
+            temp_file=temp_path,
+            thread=types.SimpleNamespace(is_alive=lambda: False),
+        )
+        self.probe_cache.get.return_value = types.SimpleNamespace(gb=0.5)
+
+        probe = self.handler.finish_transcode_job(job)
+
+        self.assertIsNotNone(probe)
+        self.assertEqual(vid.basename1, f'SAMPLE.28.{self.standard_name}')
+        self.assertFalse(os.path.isabs(vid.basename1))
+
+
 if __name__ == '__main__':
     unittest.main()
