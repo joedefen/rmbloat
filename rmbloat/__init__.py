@@ -6,4 +6,4 @@ release gate reads it without importing the package, and every built artifact
 reports it.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
