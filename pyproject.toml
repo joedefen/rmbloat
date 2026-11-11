@@ -1,9 +1,12 @@
 [build-system]
 # flit_core 3.12 is the first release that understands the PEP 639 `license`
 # expression and `license-files` keys used below.  The upper bound matters:
-# flit_core 4.x writes Metadata 2.5, which only twine >= 7 and packaging >= 26
-# accept -- exactly the floors the shared release gate checks for.
-requires = ["flit_core>=3.12,<5"]
+# flit_core 4.x writes Metadata 2.5 (and the 2.5-only `Import-Name` field).
+# twine 7 / packaging 26 accept that locally, so `twine check --strict` passes,
+# but PyPI's upload API rejects Metadata 2.5 with an opaque HTTP 400 -- the
+# build succeeds and the upload does not.  Staying below 4 keeps the artifacts
+# at Metadata 2.4, which PyPI accepts.
+requires = ["flit_core>=3.12,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
