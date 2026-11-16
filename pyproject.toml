@@ -27,7 +27,10 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-    "console-window==2.2.2",
+    # Pin the 3.1 line: 3.1.0 is the published release, while later 3.1.x
+    # patches are API-compatible.  The upper bound keeps a future 3.2 from
+    # changing the Screen-owned content model without an explicit review.
+    "console-window~=3.1.0",
     "ruamel.yaml>=0.18.16",
     "ruamel.yaml.clib>=0.2.15",
     "Send2Trash>=1.8.3",

@@ -31,22 +31,31 @@ def stubbed_runtime_dependencies():
         sys.modules[name] = module
         return module
 
-    appearance = install(
-        'console_window.appearance',
-        resolve_appearance=lambda **kwargs: ('default', True),
-        set_colors_enabled=lambda enabled: None,
-        colors_enabled=lambda: True,
-        semantic_attr=lambda key: 0,
-    )
+    appearance = type('Appearance', (Dummy,), {})
+    appearance.resolve_appearance = staticmethod(lambda **kwargs: 'default')
+    appearance.set_colors_enabled = classmethod(lambda cls, enabled: None)
+    appearance.colors_enabled = classmethod(lambda cls: True)
+    appearance.semantic_attr = staticmethod(lambda key: 0)
 
-    console_window = install('console_window', appearance=appearance)
+    glyphs = type('Glyphs', (Dummy,), {})
+    glyphs.get = classmethod(
+        lambda cls, name: {'star_glow': 'S ', 'circle_filled': '@'}.get(name, ''))
+
+    console_window = install(
+        'console_window', Appearance=appearance, Glyphs=glyphs)
     for name in ('ConsoleWindow', 'OptionSpinner', 'Screen', 'ScreenStack',
                  'ConsoleWindowOpts', 'IncrementalSearchBar', 'Context'):
         setattr(console_window, name, type(name, (Dummy,), {}))
+    # HelpScreen combines the library's help page with the app's base screen;
+    # the stub needs a draw method so that partnership is importable.
+    basic_help = type('BasicHelpScreen', (Dummy,), {
+        'draw_screen': lambda self: None,
+    })
+    console_window.BasicHelpScreen = basic_help
 
     theme_cls = type('Theme', (Dummy,), {})
-    theme_cls.list_all = classmethod(lambda cls: ('default',))
-    theme_cls.set_active = classmethod(lambda cls, name: None)
+    theme_cls.list_all = classmethod(lambda cls: ('default', 'mono'))
+    theme_cls.set_active = classmethod(lambda cls, name: name)
     theme_cls.resolve = classmethod(lambda cls, name: name or 'default')
     theme_cls.create_picker_screen = classmethod(
         lambda cls, base, **kwargs: type('PickerScreen', (base,), {}))
@@ -54,7 +63,6 @@ def stubbed_runtime_dependencies():
                  'WARNING'):
         setattr(theme_cls, attr, attr)
     console_window.Theme = theme_cls
-    console_window.MONO_THEME = 'mono'
 
     cli = install('console_window.cli',
                   add_display_arguments=lambda *args, **kwargs: None,

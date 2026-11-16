@@ -192,9 +192,8 @@ The output will show which strategies work and recommend the best one. `rmbloat`
 `rmbloat` requires a list of files or directories to scan for conversion candidates (or uses saved defaults if configured).  The full list of options are:
 ```
 usage: rmbloat.py [-h] [--version] [--ascii [BOOL]]
-                  [--glyphs {auto,ascii,unicode}]
-                  [--theme {dark-mono,light-mono,default,solarized-dark,solarized-light,gruvbox,nord}]
-                  [--no-color] [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F]
+                  [--glyphs {auto,ascii,unicode}] [--theme THEME]
+                  [-a {x26*,x265,all}] [-b BLOAT_THRESH] [-F]
                   [--no-full-speed] [-B] [--no-keep-backup] [-M]
                   [--no-merge-subtitles] [-H MAX_HEIGHT] [-m MIN_SHRINK_PCT]
                   [-p {auto,system_accel,system_cpu,docker_accel,docker_cpu}]
@@ -218,11 +217,10 @@ options:
                         symbol mode: auto detects the terminal, ascii forces
                         the fallback, unicode forces the full set (same thing
                         as --ascii / --ascii=no)
-  --theme {dark-mono,light-mono,default,solarized-dark,solarized-light,gruvbox,nord}
-                        color theme
-  --no-color            draw the semantic roles with attributes instead of
-                        color; wins over --theme, and NO_COLOR does the same
-                        when the switch is absent
+  --theme THEME         color theme: dark, light, default, solarized-dark,
+                        solarized-light, gruvbox, nord, mono. mono uses the
+                        terminal colors and bold/reverse attributes; NO_COLOR
+                        selects it when no theme is given
   -a, --allowed-codecs {x26*,x265,all}
                         allowed codecs [dflt=x265]
   -b, --bloat-thresh BLOAT_THRESH
@@ -275,7 +273,7 @@ options:
   * Boolean switches are explicit: `-F`, `-B`, `-M`, and `--use-trash` always force the feature on, while the matching `--no-*` flags force it off, regardless of the saved default. When both forms are given, the last one on the command line wins.
   * Setting the default for `--prefer-strategy` will speed startup once you have tested and found the best strategy.
   * `--save-defaults` includes saving your video collection root paths, so you don't need to specify them every time you run `rmbloat`. File paths are automatically sanitized: converted to absolute paths, non-existing paths removed, and redundant paths (subdirectories of other saved paths) eliminated. Non-video files in the given files and directories are simply ignored.
-  * Press `t` on the SELECT/CONVERT screen to open the theme picker, then `t` again to cycle themes. The last choice, `mono`, turns color off exactly like `--no-color` (and `NO_COLOR`) while leaving the palette selected underneath it.
+  * Press `t` on the SELECT/CONVERT screen to open the theme picker, then `t` again to cycle themes. The last choice, `mono`, is a real theme (it turns semantic color off and uses bold/reverse attributes); `NO_COLOR` selects it when no theme is given.
 
   **Resolution Control**: By default, `rmbloat` processes videos of any height (max-height defaults to 65536 pixels). Videos taller than the max-height setting will be automatically downscaled while preserving aspect ratio. To limit conversions to a specific resolution:
   * For 1080p max: `rmbloat --max-height 1080 /path/to/videos`

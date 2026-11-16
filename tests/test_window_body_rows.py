@@ -1,9 +1,9 @@
-"""Regression test for the console-window body-row hint.
+"""Regression test for the console-window row-size hints.
 
-``do_window_mode()`` used to request ``max(10 + len(vids), 10000)`` rows.
-In console-window 2.2.2 ``body_rows`` is only an advisory hint: the pads are
-viewport-sized and the content model grows on demand up to ``max_rows``.  The
-hint should stay small even for collections with thousands of videos.
+console-window 3.x sizes the pads to the viewport and treats ``max_rows`` as
+the only content ceiling, so ``head_rows``/``body_rows`` are no longer needed.
+A large collection must not reintroduce an upfront row hint; the hard minimum
+size is the only geometry the app should pass.
 """
 
 import importlib
@@ -14,8 +14,8 @@ from unittest import mock
 from tests.runtime_stubs import purge_rmbloat_modules, stubbed_runtime_dependencies
 
 
-class WindowBodyRowsTests(unittest.TestCase):
-    """A large collection must not select a large upfront body hint."""
+class WindowRowHintTests(unittest.TestCase):
+    """The app passes a minimum size, not advisory row counts."""
 
     def setUp(self):
         dependencies = stubbed_runtime_dependencies()
@@ -31,9 +31,9 @@ class WindowBodyRowsTests(unittest.TestCase):
         self.addCleanup(
             setattr, self.rmbloat.Converter, 'singleton', previous_singleton)
 
-    def test_large_collection_uses_small_advisory_hint(self):
+    def test_window_options_omit_advisory_row_counts(self):
         converter = self.rmbloat.Converter.__new__(self.rmbloat.Converter)
-        converter.opts = SimpleNamespace(theme=None, no_color=False)
+        converter.opts = SimpleNamespace(theme=None)
         converter.persistent_state = mock.Mock()
         converter.vids = [SimpleNamespace() for _ in range(5000)]
         captured = {}
@@ -51,11 +51,13 @@ class WindowBodyRowsTests(unittest.TestCase):
                     self.rmbloat, 'ConsoleWindow', side_effect=StopAfterOptions), \
                 mock.patch.object(
                     self.rmbloat, 'settle_appearance',
-                    return_value=('default', True)), \
+                    return_value='default'), \
                 self.assertRaises(StopAfterOptions):
             converter.do_window_mode()
 
-        self.assertEqual(captured['body_rows'], 128)
+        self.assertNotIn('body_rows', captured)
+        self.assertNotIn('head_rows', captured)
+        self.assertEqual(captured['min_cols_rows'], (60, 10))
 
 
 if __name__ == '__main__':

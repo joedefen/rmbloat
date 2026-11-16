@@ -26,15 +26,17 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 from console_window import (
+    Appearance,
+    BasicHelpScreen,
     ConsoleWindow,
     ConsoleWindowOpts,
     Context,
+    Glyphs,
     IncrementalSearchBar,
     OptionSpinner,
     Screen,
     ScreenStack,
     Theme,
-    appearance,
 )
 from console_window import cli as display_cli
 
@@ -64,37 +66,29 @@ HELP_ST = 3
 THEME_ST = 4
 SCREEN_NAMES = ('SELECT', 'CONVERT', 'HISTORY', 'HELP', 'THEME')
 
-# The theme picker offers the library palettes plus rmbloat's own "mono"
-# pseudo-theme.  ``mono`` is not a palette: it turns semantic color off for the
-# process (exactly like ``--no-color``) and leaves the installed palette alone.
-# Keeping it last makes ``t`` step from the final palette into mono and wrap
-# back to the first palette.
-MONO_THEME = 'mono'
-THEME_CHOICES = (*Theme.list_all(), MONO_THEME)
+# ``mono`` is a real console-window theme in 3.x, so the library's list is the
+# whole choice set: cycling past the last palette lands on mono and wraps back.
+THEME_CHOICES = tuple(Theme.list_all())
 
 
 
 
-def settle_appearance(cli_theme=None, no_color=False, saved_theme='',
-                      saved_colors=True):
-    """Turn the color switches and the remembered choice into process state.
+def settle_appearance(cli_theme=None, saved_theme=''):
+    """Turn the theme switches and the remembered choice into process state.
 
-    ``resolve_appearance()`` returns the two halves of the decision -- which
-    palette and whether to use it -- from ``--no-color``, ``--theme``, the
-    ``NO_COLOR`` convention and the remembered choice.  This helper applies
-    that decision to the process-wide switch and records the palette the first
-    window should install.  Returns the ``(theme, colors)`` it applied.
+    ``Appearance.resolve_appearance()`` returns one theme name from an explicit
+    ``--theme``, the ``NO_COLOR`` convention and the remembered choice.  Since
+    ``mono`` is a real theme in 3.x, applying that name through
+    ``Theme.set_active()`` also synchronizes the color switch.  Returns the
+    chosen theme name, or ``''`` when the library default should stand.
     """
-    theme, colors = appearance.resolve_appearance(
+    theme = Appearance.resolve_appearance(
         cli_theme=cli_theme,
-        no_color=no_color,
         saved_theme=saved_theme,
-        saved_colors=saved_colors,
     )
-    appearance.set_colors_enabled(colors)
     if theme:
         Theme.set_active(theme)
-    return theme, colors
+    return theme
 
 # File operation functions moved to FileOps.py
 sanitize_file_paths = FileOps.sanitize_file_paths
@@ -205,9 +199,9 @@ class Converter:
         self.stack = None
         self.need_freeze_draw = False
         self.persistent_state = PersistentState()
-        # The preference to write back.  It stays on the remembered palette
-        # when a per-run switch (--no-color / --theme) changes only the display,
-        # and follows the picker when the user chooses a palette or mono.
+        # The preference to write back.  It stays on the remembered theme when a
+        # per-run switch (--theme / NO_COLOR) changes only the display, and
+        # follows the picker when the user chooses a palette or mono.
         self.remembered_theme = 'default'
 
     def build_options_suffix(self):
@@ -228,19 +222,13 @@ class Converter:
     def apply_theme_choice(self, choice):
         """Make a theme-picker choice live.
 
-        ``mono`` is a color mode, not a palette: it flips the process-wide
-        switch and leaves the installed theme where it was (the same way
-        ``--no-color`` keeps ``--theme``).  Choosing a real palette is a request
-        for color, so it lifts the switch again and installs the palette.  This
-        is the one place the choice becomes window state, whichever screen the
-        key was pressed on.
+        ``mono`` is an ordinary theme in 3.x: ``set_theme()`` installs it,
+        records it on the window and lets ``Theme.set_active()`` turn semantic
+        color off.  This is the one place the choice becomes window state,
+        whichever screen the key was pressed on.
         """
         self.opts.theme = choice
         self.remembered_theme = choice
-        if choice == MONO_THEME:
-            appearance.set_colors_enabled(False)
-            return
-        appearance.set_colors_enabled(True)
         if self.win:
             self.win.set_theme(choice)
 
@@ -338,7 +326,9 @@ class Converter:
                 line += f' ---> {dirname}'
             note = self._ops_note(vid)
             if note:
-                line += f'  [!] {note}'
+                # A two-cell attention emoji, chosen through the glyph registry
+                # so the row still degrades to its two-cell ASCII fallback.
+                line += f'  {Glyphs.get("star_glow")} {note}'
             if self.search_re:
                 pattern = self.search_re
                 if self.spins.mangle:
@@ -819,37 +809,21 @@ class Converter:
 
     def do_window_mode(self):
         """Main UI loop using Screen-based architecture"""
-        # Capture the explicit switches before the remembered choice is
-        # restored: resolve_appearance() gives --no-color and --theme
-        # precedence over the saved theme.
+        # Capture the explicit switch before the remembered choice is
+        # restored: resolve_appearance() gives --theme precedence over the
+        # saved theme, and NO_COLOR selects mono when neither is given.
         cli_theme = getattr(self.opts, 'theme', None)
-        cli_no_color = bool(getattr(self.opts, 'no_color', False))
         self.persistent_state.restore_updated_opts(self.opts)
         saved_theme = getattr(self.opts, 'theme', None) or 'default'
-        saved_mono = saved_theme == MONO_THEME
-        self.remembered_theme = (MONO_THEME if saved_mono
-                                 else Theme.resolve(saved_theme))
-        theme, colors = settle_appearance(
-            cli_theme=cli_theme,
-            no_color=cli_no_color,
-            saved_theme='' if saved_mono else saved_theme,
-            saved_colors=not saved_mono,
-        )
-        # The picker names the choice in effect, so color off means mono even
-        # when a palette stays installed underneath (the SampleApp convention).
-        self.opts.theme = (MONO_THEME if not colors
-                           else (theme or Theme.resolve(
-                               None if saved_mono else saved_theme)))
+        self.remembered_theme = Theme.resolve(saved_theme)
+        theme = settle_appearance(cli_theme=cli_theme, saved_theme=saved_theme)
+        self.opts.theme = theme or Theme.resolve(saved_theme)
 
-        # Create ConsoleWindow
+        # Create ConsoleWindow.  Row counts are unnecessary in 3.x: the pads
+        # are viewport-sized and max_rows is the only content ceiling, so the
+        # app supplies only the hard minimum size.
         win_opts = ConsoleWindowOpts(
             head_line=True,
-            head_rows=4,
-            # console-window 2.2.2 treats body_rows as an advisory hint only:
-            # the body grows on demand up to max_rows (32767 by default) and
-            # the curses pads stay viewport-sized.  A small hint is enough for
-            # collections with several thousand videos.
-            body_rows=128,
             min_cols_rows=(60,10),
             ctrl_c_terminates=False,
             theme=(theme or None),
@@ -864,21 +838,20 @@ class Converter:
             THEME_ST: ThemeScreen(self),
         }
         self.stack = ScreenStack(self.win, None, SCREEN_NAMES, self.screens)
-        # Setup OptionSpinner
-        self.spinner = spin = OptionSpinner(stack=self.stack)
+        # Setup OptionSpinner.  The spinner registers the built-in quit
+        # (q/^C) and escape (ESC, ^J, ENTER) actions before the app registers
+        # anything; this app wants ESC alone to mean "back", so it narrows the
+        # escape key set instead of registering a second ESC action.
+        self.spinner = spin = OptionSpinner(stack=self.stack, escape_keys=(27,))
         spin.default_obj = self.opts
-        spin.add_key('screen_escape', 'ESC - return to previous screen',
-                     keys=27, genre="action")
-        spin.add_key('quit', 'q - quit converting OR exit app', genre='action',
-                     keys={ord('q'), 0x3})
         spin.add_key('help_mode', '? - Help Screen', genre="action")
         spin.add_key('history', 'h - History Screen', genre='action',
                      scope=[SELECT_ST, CONVERT_ST])
         spin.add_key('theme_screen', 't - Theme Picker', genre='action',
                      scope=[SELECT_ST, CONVERT_ST])
 
-        # On the picker (and HELP) the same key cycles every choice, ending at
-        # mono.  A cycle option keeps the spinner's help list truthful.
+        # On the picker (and HELP) the same key cycles every choice.  ``mono``
+        # is a real theme, so the library's list is the whole cycle.
         spin.add_key('theme', 't - next theme', vals=list(THEME_CHOICES),
                      scope=[THEME_ST, HELP_ST])
 
@@ -922,14 +895,15 @@ class Converter:
 
 
         # Start in select screen
-        win.set_pick_mode(True, 1)
+        win.set_pick_mode(True)
 
-        # Main event loop
+        # Main event loop: clear() adopts the screen for the pass, draw_screen()
+        # rebuilds its content, render() paints, and prompt() reads one key.
         force_redraw = False
         while True:
-            # Draw current screen
             if not spins.freeze or self.need_freeze_draw:
                 current_screen = self.screens[self.stack.curr.num]
+                current_screen.clear()
                 current_screen.draw_screen()
                 redraw = bool(time.monotonic() - self.redraw_mono >= 60) or force_redraw
                 self.redraw_mono = time.monotonic() if redraw else self.redraw_mono
@@ -979,22 +953,17 @@ class Converter:
                         self.probe_cache,
                         auto_mode_enabled=self.auto_mode_enabled
                     )
-                    self.stack.push(CONVERT_ST, win.pick_pos)
+                    self.stack.push(CONVERT_ST)
                 else:
                     # Nothing to convert: an unattended run must exit, not idle
                     self._exit_auto_mode('no videos selected for conversion')
 
             # Process jobs
             self.advance_jobs()
-            # Persist only the remembered choice, not a per-run override such
-            # as --no-color (which displays mono but must not become the saved
-            # preference).  The picker updates it through apply_theme_choice().
+            # Persist the choice the picker made; a per-run --theme or NO_COLOR
+            # never overwrites the remembered preference.
             self.persistent_state.set('theme', self.remembered_theme)
             self.persistent_state.sync()
-
-            # Clear screen for next render
-            if not spins.freeze or self.need_freeze_draw:
-                win.clear()
 
     def main_loop(self):
         """ TBD """
@@ -1030,8 +999,8 @@ class RmbloatScreen(Screen):
     app: 'Converter'  # Type hint for IDE
     prompt_timeout = 3.0  # Default timeout in seconds for win.prompt()
 
-    def screen_escape_ACTION(self):
-        """ESC key - Return to previous screen"""
+    def escape_ACTION(self):
+        """ESC key - Return to previous screen (built-in escape action)."""
         if self.app.stack.curr.num != SELECT_ST:
             self.app.stack.pop()
 
@@ -1039,7 +1008,7 @@ class RmbloatScreen(Screen):
         """? - enter help mode"""
         app = self.app
         if app.stack.curr.num != HELP_ST:
-            app.stack.push(HELP_ST, app.win.pick_pos)
+            app.stack.push(HELP_ST)
 
     def history_ACTION(self):
         """h - go to History Screen"""
@@ -1051,13 +1020,13 @@ class RmbloatScreen(Screen):
         """t - go to Theme Screen"""
         app = self.app
         if app.stack.curr.num in (SELECT_ST, CONVERT_ST):
-            app.stack.push(THEME_ST, app.win.pick_pos)
+            app.stack.push(THEME_ST)
 
     def kill_any_job(self):
         """ TBD """
         job = self.app.job
         if job:
-            self.app.win.flash('Patiently wait for job to abort...')
+            self.win.flash('Patiently wait for job to abort...')
             vid = job.vid
             job.abort()
             job = None
@@ -1067,21 +1036,21 @@ class RmbloatScreen(Screen):
             self.app.job = None
 
     def get_color_pair(self, line):
-        """Attribute for one status row, honoring the no-color switch."""
+        """Attribute for one status row, honoring the active theme."""
         wds = line.lstrip().split(maxsplit=1)
         if not wds:
             return None
         word0 = wds[0]
         if word0.startswith('OK') or word0 == 'DUN':
-            return appearance.semantic_attr(Theme.OLD_SUCCESS)
+            return Appearance.semantic_attr(Theme.OLD_SUCCESS)
         if word0 == 'IP':
-            return appearance.semantic_attr(Theme.HOTSWAP)
+            return Appearance.semantic_attr(Theme.HOTSWAP)
         if word0.startswith('Er') or word0 == 'ERR':
-            return appearance.semantic_attr(Theme.ERROR)
+            return Appearance.semantic_attr(Theme.ERROR)
         if word0 == '[X]':
-            return appearance.semantic_attr(Theme.INFO)
+            return Appearance.semantic_attr(Theme.INFO)
         if word0 == '---':
-            return appearance.semantic_attr(Theme.PROGRESS)
+            return Appearance.semantic_attr(Theme.PROGRESS)
         return None
 
 
@@ -1103,21 +1072,20 @@ class SelectScreen(RmbloatScreen):
 
     def _on_search_accept(self, text):
         """Called when ENTER pressed in search - keep filter active, exit input mode."""
-        self.app.win.passthrough_mode = False
+        self.win.passthrough_mode = False
         self.app.search_re = text
 
     def _on_search_cancel(self, original_text):
         """Called when ESC pressed in search - restore and exit search mode."""
         self.app.search_re = original_text
-        self.app.win.passthrough_mode = False
+        self.win.passthrough_mode = False
 
     def draw_screen(self):
         """Draw the video selection screen"""
         app = self.app
-        win = app.win
         spins = app.spins
 
-        app.win.set_pick_mode(True)
+        self.set_pick_mode(True)
 
         # Get video list and stats
         lines, stats, co_wid = app.make_lines()
@@ -1128,35 +1096,35 @@ class SelectScreen(RmbloatScreen):
 
         # Show incremental search bar if active, otherwise show current filter
         # Use HOTSWAP color (orange) for entire header when actively editing search
-        if self.search_bar.is_active or app.win.passthrough_mode:
+        if self.search_bar.is_active or self.win.passthrough_mode:
             # Add search display to header
             search_display = self.search_bar.get_display_string(prefix=' /', suffix='')
             head += search_display
             # Use plain header (no fancy parsing) with HOTSWAP color for entire line
-            win.add_header(head,
-                           attr=appearance.semantic_attr(Theme.HOTSWAP) | curses.A_BOLD)
+            self.add_header(head,
+                            attr=Appearance.semantic_attr(Theme.HOTSWAP) | curses.A_BOLD)
         else:
             # Add static search pattern if present
             if app.search_re:
                 shown = Mangler.mangle(app.search_re) if spins.mangle else app.search_re
                 head += f' /{shown}'
             # Use fancy header with normal colors
-            win.add_fancy_header(head, app.opts.fancy_hdr)
+            self.add_fancy_header(head, app.opts.fancy_hdr)
 
         # Stats header
         cpu_status = app.cpu.get_status_string()
-        win.add_header(f'     Picked={stats.picked}/{stats.total}'
-                      f'  GB={stats.gb}({stats.delta_gb})'
-                      f'  {cpu_status}'
-                      + ('  >>> PAUSED <<<' if spins.freeze else ''))
+        self.add_header(f'     Picked={stats.picked}/{stats.total}'
+                       f'  GB={stats.gb}({stats.delta_gb})'
+                       f'  {cpu_status}'
+                       + ('  >>> PAUSED <<<' if spins.freeze else ''))
 
         # Column headers
-        win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
-                      f'{"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{app.options_suffix}')
+        self.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
+                       f'{"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{app.options_suffix}')
 
         # Video list
         for line in lines:
-            win.add_body(line, attr=self.get_color_pair(line))
+            self.add_body(line, attr=self.get_color_pair(line))
 
     def reset_all_ACTION(self):
         """'r' key - Reset all checkboxes"""
@@ -1175,18 +1143,17 @@ class SelectScreen(RmbloatScreen):
     def toggle_ACTION(self):
         """Space key - Toggle current line state"""
         app = self.app
-        idx = app.win.pick_pos
+        idx = self.pick_pos
         if 0 <= idx < len(app.visible_vids):
             vid = app.visible_vids[idx]
             if vid:
                 app.toggle_doit(vid)
-                app.win.pick_pos += 1
+                self.pick_pos += 1
 
     def skip_ACTION(self):
         """'s' key - Skip/unskip current video"""
         app = self.app
-        win = app.win
-        idx = win.pick_pos
+        idx = self.pick_pos
         if 0 <= idx < len(app.visible_vids):
             vid = app.visible_vids[idx]
             if vid:
@@ -1203,7 +1170,7 @@ class SelectScreen(RmbloatScreen):
                         vid.doit_auto = '[ ]'
                     vid.doit = vid.doit_auto
                     app.probe_cache.set_anomaly(vid.filepath, None)
-                win.pick_pos += 1
+                self.pick_pos += 1
 
     def go_ACTION(self):
         """'g' key - Go to convert screen"""
@@ -1223,7 +1190,7 @@ class SelectScreen(RmbloatScreen):
                 app.probe_cache,
                 auto_mode_enabled=app.auto_mode_enabled
             )
-            app.stack.push(CONVERT_ST, app.win.pick_pos)
+            app.stack.push(CONVERT_ST)
 
     def quit_ACTION(self):
         """'q' key - Quit application"""
@@ -1234,7 +1201,7 @@ class SelectScreen(RmbloatScreen):
         """'/' key - Start incremental search"""
         # Start with current search pattern
         self.search_bar.start(self.app.search_re if self.app.search_re else "")
-        self.app.win.passthrough_mode = True
+        self.win.passthrough_mode = True
 
 
 class ConvertScreen(RmbloatScreen):
@@ -1259,7 +1226,7 @@ class ConvertScreen(RmbloatScreen):
             app.auto_mode_enabled = False
             app.options_suffix = app.build_options_suffix()
 
-    def screen_escape_ACTION(self):
+    def escape_ACTION(self):
         """ESC key - Return to previous screen (stop conversions)"""
         self._stop_conversions()
         self.app.stack.pop()
@@ -1267,10 +1234,9 @@ class ConvertScreen(RmbloatScreen):
     def draw_screen(self):
         """Draw the conversion progress screen"""
         app = self.app
-        win = app.win
         spins = app.spins
 
-        app.win.set_pick_mode(False)
+        self.set_pick_mode(False)
 
         # Get video list and stats
         lines, stats, co_wid = app.make_lines()
@@ -1287,19 +1253,19 @@ class ConvertScreen(RmbloatScreen):
                 f'  GB={stats.gb}({stats.delta_gb})'
                 f'  {cpu_status}'
                 + ('  >>> PAUSED <<<' if spins.freeze else ''))
-        win.add_fancy_header(head, app.opts.fancy_hdr)
+        self.add_fancy_header(head, app.opts.fancy_hdr)
 
         # Column headers
-        win.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
-                      f'{"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{app.options_suffix}')
+        self.add_header(f'CVT {"NET":>4} {"BLOAT":>{co_wid}}  {"RES":>5}  '
+                       f'{"CODEC":>5}  {"MINS":>4} {"MB":>6}   VIDEO{app.options_suffix}')
 
         # Set scroll position to show current job
-        win.pick_pos = stats.progress_idx
-        win.scroll_pos = stats.progress_idx - win.scroll_view_size + 2
+        self.pick_pos = stats.progress_idx
+        self.scroll_pos = stats.progress_idx - self.win.scroll_view_size + 2
 
         # Video list
         for line in lines:
-            win.add_body(line, attr=self.get_color_pair(line))
+            self.add_body(line, attr=self.get_color_pair(line))
 
     def skip_ACTION(self):
         """'s' key - Skip current conversion job"""
@@ -1317,37 +1283,33 @@ class ConvertScreen(RmbloatScreen):
         self.app.stack.pop()
 
 
-class HelpScreen(RmbloatScreen):
-    """Help screen showing keyboard shortcuts"""
+class HelpScreen(BasicHelpScreen, RmbloatScreen):
+    """Help page: navigation, the spinner body, notes, fonts and CLI args.
+
+    ``BasicHelpScreen`` supplies the 3.x help shape (nav block, keys for the
+    pushed screen, instructions, and the built-in one-time Fonts check); this
+    subclass only appends rmbloat's saved CLI arguments.
+    """
 
     def draw_screen(self):
-        """Draw the help screen"""
+        """Draw the standard help page, then the saved CLI arguments."""
+        super().draw_screen()
         app = self.app
-        win = app.win
-        win.set_pick_mode(on=False)
-        app.spinner.show_help_nav_keys(app.win)
-        app.spinner.show_help_body(app.win)
-        if app.ini:
-            win.add_body('--- CLI ARGS ---')
-            clis = vars(app.ini.vals)
-            for key in clis:
-                win.add_body(f'  ● {key}: {clis[key]}')
+        if not app.ini:
+            return
+        self.add_body('--- CLI ARGS ---')
+        bullet = Glyphs.get('circle_filled')
+        clis = vars(app.ini.vals)
+        for key, value in clis.items():
+            self.add_body(f'  {bullet} {key}: {value}')
 
 
 class ThemeScreen(Theme.create_picker_screen(RmbloatScreen, cycle_key='t')):
-    """Theme picker that also offers rmbloat's ``mono`` pseudo-theme.
+    """Theme picker over the library palettes, including ``mono``.
 
-    The generated picker draws the library palettes and paints its swatches
-    through the appearance layer.  rmbloat adds ``mono`` to the cycle on the
-    picker itself (the ``theme`` spinner option), so selecting it turns color
-    off exactly like ``--no-color`` while the header names that choice instead
-    of the palette still installed underneath it.
+    ``mono`` is a real theme in 3.x, so the generated picker previews it and
+    names it in the header without any application pseudo-theme.
     """
-
-    def theme_label(self, theme_name):
-        if not appearance.colors_enabled():
-            return MONO_THEME
-        return super().theme_label(theme_name)
 
 
 class HistoryScreen(RmbloatScreen):
@@ -1379,14 +1341,14 @@ class HistoryScreen(RmbloatScreen):
 
     def _on_search_accept(self, text):
         """Called when ENTER pressed in search - keep filter active, exit input mode."""
-        self.app.win.passthrough_mode = False
+        self.win.passthrough_mode = False
         # Filter remains active - just exit typing mode
         self.prev_filter = text
 
     def _on_search_cancel(self, original_text):
         """Called when ESC pressed in search - restore and exit search mode."""
         self._filter_entries(original_text)
-        self.app.win.passthrough_mode = False
+        self.win.passthrough_mode = False
 
     def _refresh_entries(self):
         """Refresh cached log entries and re-apply the active search.
@@ -1465,8 +1427,8 @@ class HistoryScreen(RmbloatScreen):
     def draw_screen(self):
         """Draw the history screen"""
         app = self.app
-        win = app.win
-        win.set_pick_mode(True)
+        win = self.win
+        self.set_pick_mode(True)
 
         # Refresh the window, cached entries, and the active filter together so
         # a new log entry cannot leave stale search results on screen.
@@ -1484,8 +1446,8 @@ class HistoryScreen(RmbloatScreen):
         if search_display:
             header_line += f'{search_display}'
         header_line += '  >>> PAUSED <<<' if app.spins.freeze else ''
-        win.add_fancy_header(header_line)
-        win.add_header(f'Log file: {lg.log_file}')
+        self.add_fancy_header(header_line)
+        self.add_header(f'Log file: {lg.log_file}')
 
         # Build display
         self.visible_lines = []
@@ -1524,16 +1486,17 @@ class HistoryScreen(RmbloatScreen):
 
             # Choose color based on log level
             if level == 'ERR':
-                level_attr = appearance.semantic_attr(Theme.ERROR) | curses.A_BOLD
+                level_attr = Appearance.semantic_attr(Theme.ERROR) | curses.A_BOLD
             elif level == 'WARN':
-                level_attr = appearance.semantic_attr(Theme.WARNING) | curses.A_BOLD
+                level_attr = Appearance.semantic_attr(Theme.WARNING) | curses.A_BOLD
             else:
                 level_attr = curses.A_BOLD
 
             if app.spins.mangle:
                 summary = Mangler.mangle_title(summary)
             line = f"{timestamp_display} [{level:>3}] {summary}{deep_indicator}"
-            win.add_body(line, attr=level_attr, context=Context("header", timestamp=timestamp))
+            self.add_body(line, attr=level_attr,
+                          context=Context("header", timestamp=timestamp))
             self.visible_lines.append(timestamp)
 
             # Handle expansion
@@ -1560,23 +1523,21 @@ class HistoryScreen(RmbloatScreen):
                         wraps = textwrap.wrap(line, width=win.cols-3,
                                       subsequent_indent=' '*(sz+3), max_lines=3)
                         for wrap in wraps:
-                            win.add_body(f"  {wrap}", context=
-                                         Context("body", timestamp=timestamp))
+                            self.add_body(f"  {wrap}", context=
+                                          Context("body", timestamp=timestamp))
                         self.visible_lines.append(None)  # Placeholder for expanded lines
 
                 except (json.JSONDecodeError, ValueError):
-                    win.add_body("  (invalid JSON)")
+                    self.add_body("  (invalid JSON)")
                     self.visible_lines.append(None)
 
             # Empty line between entries
-            win.add_body("", context=Context("DECOR"))
+            self.add_body("", context=Context("DECOR"))
             self.visible_lines.append(None)
 
     def expand_ACTION(self):
         """'e' key - Expand/collapse current entry"""
-        app = self.app
-        win = app.win
-        ctx = win.get_picked_context()
+        ctx = self.win.get_picked_context()
 
         if ctx and hasattr(ctx, 'timestamp'):
             timestamp = ctx.timestamp
@@ -1588,22 +1549,21 @@ class HistoryScreen(RmbloatScreen):
                 # Back to collapsed, remove from dict
                 if timestamp in self.expands:
                     del self.expands[timestamp]
-                pos = win.pick_pos
+                pos = self.pick_pos
                 while pos >= 1:
                     # set position back to header
-                    prev = win.body.contexts[pos-1]
+                    prev = self.body.contexts[pos-1]
                     if prev and getattr(prev, 'timestamp', '') == timestamp:
                         pos -= 1
                         continue
                     break
-                win.pick_pos = pos
+                self.pick_pos = pos
             else:
                 self.expands[timestamp] = next_state
 
     def copy_log_ACTION(self):
         """'c' key - Copy entire log entry to clipboard (OSC 52) or export to file"""
-        app = self.app
-        win = app.win
+        win = self.win
         ctx = win.get_picked_context()
 
         if ctx and hasattr(ctx, 'timestamp'):
@@ -1665,7 +1625,7 @@ class HistoryScreen(RmbloatScreen):
     def hist_search_ACTION(self):
         """ Handle '/' key - start incremental filter search """
         self.search_bar.start("")
-        self.app.win.passthrough_mode = True
+        self.win.passthrough_mode = True
 
 
 def bounded_int(low, high, label):
@@ -1734,7 +1694,7 @@ def main(args=None) -> int:
         parser.add_argument('--version', action='version',
                     version=VERSION_BANNER,
                     help='show the release number and exit')
-        # Standard display switches: --ascii/--glyphs, --theme and --no-color.
+        # Standard display switches: --ascii/--glyphs and --theme.
         # apply_display_arguments() below acts on them before any window exists.
         display_cli.add_display_arguments(parser, prog='rmbloat')
         # config options
@@ -1848,10 +1808,10 @@ def main(args=None) -> int:
             files_help += f' [dflt: {", ".join(vals.files)}]'
         parser.add_argument('files', nargs='*', help=files_help)
         opts = parser.parse_args(args)
-        # Decide the glyph mode, seed an explicit --theme and honor an explicit
-        # --no-color before anything is drawn.  The remembered theme/color
-        # decision is settled later in do_window_mode(), where the saved state
-        # is available and can be combined with these switches.
+        # Decide the glyph mode and seed an explicit --theme (or a NO_COLOR
+        # selection of mono) before anything is drawn.  The remembered theme is
+        # settled later in do_window_mode(), where the saved state is available
+        # and can be combined with these switches.
         display_cli.apply_display_arguments(opts, prog='rmbloat')
             # Fake as option ... if this needs tuning (which I doubt)
             # then make it an actual option.  It is the max time allowed

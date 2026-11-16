@@ -217,15 +217,16 @@ class OpsNoteTests(RmbloatModuleTestCase):
 
         lines, _, _ = self.make_converter([vid]).make_lines()
 
-        self.assertTrue(any('[!] ERROR: destination appeared' in line
+        self.assertTrue(any('ERROR: destination appeared' in line
                             for line in lines))
 
     def test_routine_ops_do_not_clutter_rows(self):
         vid = self.make_vid(' OK', ['link ...', 'trash ...'])
 
         lines, _, _ = self.make_converter([vid]).make_lines()
+        marker = self.rmbloat.Glyphs.get('star_glow')
 
-        self.assertFalse(any('[!]' in line for line in lines))
+        self.assertFalse(any(marker in line for line in lines))
 
     def test_note_is_truncated(self):
         vid = self.make_vid('ERR', ['ERROR: ' + ('x' * 200)])
