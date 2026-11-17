@@ -109,6 +109,9 @@ class DockerAccelerationParityTests(unittest.TestCase):
         self.assertTrue(supported)
         cmd = fake_run.calls[-1]
         self.assertEqual(cmd[0], 'docker')
+        image_at = cmd.index('test-image:latest')
+        self.assertEqual(cmd[image_at - 2:image_at],
+                         ['--entrypoint', 'ffmpeg'])
         self.assertIn('--user', cmd)
         self.assertIn('--group-add', cmd)
         self.assertIn('--device=/dev/dri:/dev/dri', cmd)
@@ -137,6 +140,10 @@ class DockerAccelerationParityTests(unittest.TestCase):
         self.assertTrue(chooser.vaapi_supports_10bit)
 
         accel_cmd, ten_bit_cmd = fake_run.calls[0], fake_run.calls[1]
+        for probe_cmd in (accel_cmd, ten_bit_cmd):
+            image_at = probe_cmd.index('test-image:latest')
+            self.assertEqual(probe_cmd[image_at - 2:image_at],
+                             ['--entrypoint', 'ffmpeg'])
         self.assertIn('--user', accel_cmd)
         self.assertIn('--group-add', accel_cmd)
         self.assertIn('--user', ten_bit_cmd)

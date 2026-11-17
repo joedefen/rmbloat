@@ -74,6 +74,50 @@ class DockerHardeningTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-v') + 1], f'{workdir}:{workdir}:z')
         self.assertIn('test-image:latest', cmd)
 
+    def test_low_priority_encode_names_ionice_as_the_entrypoint(self):
+        """Word order must not depend on the image's ENTRYPOINT/CMD.
+
+        An older ``v0`` image ran whatever followed the image reference as the
+        container command, so ``ionice -c3 nice -n20`` after the image worked
+        there.  ffmpeg-vaapi-docker declares ``ENTRYPOINT ["ffmpeg"]``, which
+        handed those words to ffmpeg instead and failed with
+        ``Unrecognized option 'c3'`` (exit 8).  ``--entrypoint`` overrides both
+        layouts, and the wrapper stays in front of the binary it wraps.
+        """
+        chooser = self.make_chooser()
+        params = chooser.make_namespace(
+            input_file='input.mp4',
+            output_file='output.mkv',
+            validate_input_exists=False,
+        )
+
+        cmd = chooser.make_ffmpeg_cmd(params)
+
+        image_at = cmd.index('test-image:latest')
+        self.assertEqual(cmd[image_at - 2:image_at],
+                         ['--entrypoint', 'ionice'])
+        self.assertEqual(cmd[image_at + 1:image_at + 5],
+                         ['-c3', 'nice', '-n20', 'ffmpeg'])
+        # The wrapper must precede the ffmpeg flags, never follow them.
+        self.assertLess(cmd.index('ffmpeg'), cmd.index('-y'))
+
+    def test_full_speed_encode_calls_ffmpeg_without_a_wrapper(self):
+        chooser = self.make_chooser()
+        params = chooser.make_namespace(
+            input_file='input.mp4',
+            output_file='output.mkv',
+            use_nice_ionice=False,
+            validate_input_exists=False,
+        )
+
+        cmd = chooser.make_ffmpeg_cmd(params)
+
+        image_at = cmd.index('test-image:latest')
+        self.assertEqual(cmd[image_at - 2:image_at],
+                         ['--entrypoint', 'ffmpeg'])
+        self.assertNotIn('ionice', cmd)
+        self.assertNotIn('nice', cmd)
+
     def test_ffprobe_mount_is_read_only_and_labelled(self):
         chooser = self.make_chooser(image_ref='registry/repo@sha256:abc')
 

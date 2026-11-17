@@ -331,6 +331,7 @@ class FfmpegChooser:
                 *self._container_hardening(use_acceleration=True),
                 '--device=/dev/dri:/dev/dri',
                 *self._docker_user_and_group_args(self.render_device),
+                '--entrypoint', 'ffmpeg',
                 self._image_for_run(),
                 *args,
             ]
@@ -576,6 +577,7 @@ class FfmpegChooser:
             *self._container_hardening(use_acceleration=True),
             '--device=/dev/dri:/dev/dri',
             *self._docker_user_and_group_args(render_device),
+            '--entrypoint', 'ffmpeg',
             self._image_for_run(),
             '-y',
             '-init_hw_device', f'vaapi=va:{render_device}',
@@ -740,7 +742,10 @@ class FfmpegChooser:
             color_opts: Color space options (default: [])
             subtitle_codec: Subtitle codec (default: 'copy')
             thread_count: Thread limit, 0=auto (default: 0)
-            use_nice_ionice: Use nice/ionice for low priority (default: True)
+            use_nice_ionice: Use nice/ionice for low priority.  For a container
+                run this requires ``ionice`` and ``nice`` inside the image; the
+                default ffmpeg-vaapi-docker image (and its older
+                no-entrypoint ``v0`` layout) provides both (default: True)
             pre_input_opts: Options before -i (default: [])
             post_input_opts: Options after -i (default: [])
             error_tolerant: Add flags for corrupt/problematic videos (default: False)
@@ -872,6 +877,9 @@ class FfmpegChooser:
         cmd = []
 
         # 1. Global / Process Options
+        # For a local ffmpeg the wrapper is simply prefixed.  A container's
+        # encoder is started by the runtime, so the wrapper has to name the
+        # program explicitly instead (see the docker branch below).
         if params.use_nice_ionice and not self.use_docker:
             cmd.extend(['ionice', '-c3', 'nice', '-n20'])
 
@@ -906,10 +914,21 @@ class FfmpegChooser:
             if self.use_acceleration:
                 cmd.extend(['--device=/dev/dri:/dev/dri'])
 
+            # ``docker run`` hands everything after the image reference to the
+            # image's ENTRYPOINT.  Splicing ``ionice -c3 nice -n20`` in there
+            # only worked for images that treat it as a command (the older
+            # ``v0`` layout); ffmpeg-vaapi-docker declares
+            # ``ENTRYPOINT ["ffmpeg"]``, which made those words ffmpeg
+            # arguments and failed with "Unrecognized option 'c3'" (exit 8).
+            # Naming the program with ``--entrypoint`` overrides the image's
+            # ENTRYPOINT/CMD, so the same command works with both layouts and
+            # with any image that carries the ffmpeg (and, when low priority is
+            # requested, ionice/nice) binaries on PATH.
+            cmd.extend(['--entrypoint',
+                        'ionice' if params.use_nice_ionice else 'ffmpeg'])
             cmd.append(self._image_for_run())
-
             if params.use_nice_ionice:
-                cmd.extend(['ionice', '-c3', 'nice', '-n20'])
+                cmd.extend(['-c3', 'nice', '-n20', 'ffmpeg'])
 
         # 3. FFmpeg Base
         if not self.use_docker:
