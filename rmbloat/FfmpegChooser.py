@@ -19,6 +19,38 @@ from typing import Any, Dict, List, Optional
 
 from . import Sandbox
 
+# Lines of ffmpeg's ``-progress`` stream, which say nothing about why a run
+# failed and would otherwise be quoted as the reason.
+_PROGRESS_KEYS = ('frame=', 'fps=', 'bitrate=', 'total_size=', 'out_time=',
+                  'out_time_ms=', 'out_time_us=', 'dup_frames=',
+                  'drop_frames=', 'speed=', 'progress=')
+
+
+def _failure_reason(stderr: bytes, limit: int = 240) -> str:
+    """Return the most useful line of a captured ffmpeg stderr.
+
+    The tail of stderr is the least informative part of it: it ends with
+    ``-progress`` key=value updates, and when the output cannot be opened it
+    ends with the muxer's metadata dump (copied ``_STATISTICS_*`` tags and
+    the like).  Quoting the *start* of that tail therefore reported metadata
+    while the reason sat unread further along -- which is how a failed run
+    once printed "Failed: 17151" instead of "No such file or directory".
+
+    Prefer the last line that names an error, then fall back to the last line
+    that is not progress output.
+    """
+    text = stderr.decode('utf-8', errors='replace')
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return '(no stderr output)'
+    for line in reversed(lines):
+        if 'error' in line.lower() and not line.startswith(_PROGRESS_KEYS):
+            return line[:limit]
+    for line in reversed(lines):
+        if not line.startswith(_PROGRESS_KEYS):
+            return line[:limit]
+    return '(stderr held only progress output)'
+
 
 class FfmpegChooser:
     """
@@ -1029,10 +1061,20 @@ class FfmpegChooser:
             fsize = (max(Sandbox.MIN_OUTPUT_LIMIT, input_size * 4)
                      if input_size else None)
             cmd = Sandbox.apply_limits(cmd, fsize=fsize)
+            # The sandbox makes exactly one directory writable, so it has to be
+            # the one the output is written to.  ``temp_dir or workdir`` bound
+            # the *media* directory whenever a caller left ``temp_dir`` unset,
+            # which both widened the sandbox and left the real output directory
+            # unwritable: the chooser's own tests write to a fresh mkdtemp under
+            # /tmp, and bwrap's ``--tmpfs /tmp`` hides that directory, so ffmpeg
+            # failed with "No such file or directory" while the identical
+            # command worked outside the sandbox.
+            outdir = temp_dir or os.path.dirname(
+                os.path.abspath(params.output_file))
             cmd = Sandbox.wrap_local(
                 cmd,
                 input_dirs=[workdir],
-                outdir=temp_dir or workdir,
+                outdir=outdir,
                 workdir=workdir,
                 allow_gpu=self.use_acceleration,
                 render_device=self.render_device,
@@ -1146,14 +1188,14 @@ class FfmpegChooser:
                     }
                     print(f"  ✓ Success: {elapsed:.1f}s, {file_size / 1024 / 1024:.1f}MB")
                 else:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')[-500:]
+                    error_msg = _failure_reason(result.stderr)
                     results[strategy] = {
                         'success': False,
                         'time': elapsed,
                         'size': 0,
                         'error': error_msg
                     }
-                    print(f"  ✗ Failed: {error_msg[:100]}...")
+                    print(f"  ✗ Failed: {error_msg}")
 
             except subprocess.TimeoutExpired:
                 results[strategy] = {

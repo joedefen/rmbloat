@@ -238,6 +238,11 @@ def wrap_local(argv: Sequence[str], input_dirs: Sequence[str] = (),
     libraries and fonts resolve) with only ``outdir`` writable.  The media
     directory is therefore readable but not writable, and the network is
     unshared.  systemd-run gets the equivalent properties.
+
+    ``outdir`` must be the directory the output file is actually written
+    into, and it must exist on the host: it is the single writable path
+    inside the sandbox, so binding anything else leaves ffmpeg unable to
+    create its output.
     """
     argv = list(argv)
     if strategy == 'bwrap' and _bwrap_works():
@@ -248,7 +253,26 @@ def wrap_local(argv: Sequence[str], input_dirs: Sequence[str] = (),
             '--proc', '/proc',
             '--tmpfs', '/tmp',
         ]
+        # Paths hidden by the tmpfs mounts above have to be re-exposed, or
+        # media that happens to live under /tmp (or /run) becomes invisible and
+        # bwrap cannot even chdir to it.  Only masked paths are re-bound
+        # read-only; everything else is already visible through ``--ro-bind /``.
+        seen = set()
+        for path in (*input_dirs, workdir):
+            if not path:
+                continue
+            real = os.path.abspath(path)
+            if real in seen:
+                continue
+            if any(real == m or real.startswith(m + '/') for m in ('/tmp', '/run')):
+                seen.add(real)
+                wrapped.extend(['--ro-bind', real, real])
         if outdir:
+            # The bind must follow the ``--tmpfs /tmp`` above: mounts are
+            # applied in order, so a bind of a path under /tmp placed earlier
+            # would be covered by the empty tmpfs, and the output directory
+            # would silently not exist inside the sandbox.
+            outdir = os.path.abspath(outdir)
             wrapped.extend(['--bind', outdir, outdir])
         if allow_gpu and render_device:
             dri_dir = os.path.dirname(render_device)
