@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+# runner.py
+# Located in the top-level <svr rmbloat> directory
+
+import runpy
+import sys
+
+# Ensure the package's top directory is on the path so 'rmbloat' can be found.
+# This is usually necessary for debuggers to work correctly.
+# sys.path.insert(0, '.')
+
+# Execute the main module of your package.
+# This mimics the behavior of the 'python -m rmbloat.rmbloat' command.
+# This assumes your main execution logic (main() function) is in rmbloat/rmbloat.py
+if __name__ == '__main__':
+    # You pass the full module path: 'package_name.module_name'
+    sys.argv[0] = 'rmbloat' # This makes sys.argv look like the real command execution
+    runpy.run_module('rmbloat.rmbloat', run_name='__main__', alter_sys=True)

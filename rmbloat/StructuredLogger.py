@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""Structured Logger with JSON Lines format and weighted-age trimming.
+ERR entries age 10x slower than other entries, so they persist longer.
+"""
+import inspect
+import json
+import os
+import sys
+import tempfile
+from collections import OrderedDict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+def default_log_dir(app_name: str = 'rmbloat') -> Path:
+    """Return the per-user state directory used for structured logs.
+
+    Logs contain absolute media paths and ffmpeg output,
+    so they belong in ``$XDG_STATE_HOME`` rather than the configuration directory.
+    The default is ``~/.local/state/<app_name>``;
+    callers that pass ``log_dir`` explicitly still control the parent directory.
+    """
+    base = os.environ.get('XDG_STATE_HOME') or os.path.join(
+        os.path.expanduser('~'), '.local', 'state')
+    return Path(base) / app_name
+
+# ============================================================================
+# Data Classes for Structured Logging
+# ============================================================================
+
+@dataclass
+class LogEntry:
+    """Structured log entry for JSON Lines format."""
+    timestamp: str
+    level: str  # 'ERR', 'OK', 'MSG', 'DBG', etc.
+    file: str
+    line: int
+    function: str
+    module: str = ""
+    message: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    session_id: str = ""
+    _raw: str = ""  # Original raw message
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        result = asdict(self)
+        result.pop('_raw', None)
+        return result
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> 'LogEntry':
+        """Safely create LogEntry from dict, filtering unknown fields."""
+        # Only extract known fields to avoid TypeError from extra fields
+        known_fields = {
+            'timestamp', 'level', 'file', 'line', 'function',
+            'module', 'message', 'data', 'session_id'
+        }
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return LogEntry(**filtered)
+
+    @property
+    def location(self) -> str:
+        """Short location string for display."""
+        return f"{self.file}:{self.line}"
+
+    @property
+    def display_summary(self) -> str:
+        """Extract display-friendly summary from message.
+
+        If message contains JSON with 'filebase' or 'filepath', use that.
+        Otherwise return truncated message or location.
+        """
+        if not self.message:
+            return f"{self.file}:{self.line} {self.function}()"
+
+        if '{' in self.message:
+            try:
+                json_start = self.message.index('{')
+                json_str = self.message[json_start:]
+                data = json.loads(json_str)
+                filebase = data.get('filebase', data.get('filepath', None))
+                if filebase:
+                    return filebase
+            except (json.JSONDecodeError, ValueError, KeyError):
+                pass
+
+        return self.message[:70]
+
+    @staticmethod
+    def format_time_delta(seconds: float, signed: bool = False) -> str:
+        """Format time delta in compact form (e.g., '18h39m', '5d3h').
+
+        Args:
+            seconds: Time difference in seconds
+            signed: If True, include '-' prefix for negative values
+
+        Returns:
+            Compact time string (e.g., '2h30m', '5d', '45s')
+        """
+        ago = int(max(0, abs(seconds)))
+        if ago == 0:
+            return '0s'
+
+        divs = (60, 60, 24, 7, 52, 9999999)
+        units = ('s', 'm', 'h', 'd', 'w', 'y')
+        vals = (ago % 60, int(ago / 60))  # seed with secs, mins
+        uidx = 1  # best units
+
+        for div in divs[1:]:
+            if vals[1] < div:
+                break
+            vals = (vals[1] % div, int(vals[1] / div))
+            uidx += 1
+
+        rv = '-' if signed and seconds < 0 else ''
+        if vals[1]:
+            rv += f'{vals[1]}{units[uidx]}'
+        # Omit a zero minor unit so exact units stay compact ('1h', '5d').
+        if vals[0]:
+            rv += f'{vals[0]:d}{units[uidx-1]}'
+        return rv
+
+    def format_ago(self) -> str:
+        """Format this entry's timestamp as relative time (e.g., '5m', '2h39m').
+
+        Returns:
+            Compact relative time string, or '???' if timestamp is invalid
+        """
+        try:
+            ts = datetime.fromisoformat(self.timestamp)
+            now = datetime.now()
+            delta = now - ts
+            return LogEntry.format_time_delta(delta.total_seconds())
+        except (ValueError, AttributeError):
+            return "???"
+
+
+class StructuredLogger:
+    """Structured logger using JSON Lines format with single log
+    file and weighted-age trimming (ERR entries age 10x slower).
+    """
+
+    # Size limits (adjust as needed)
+    MAX_LOG_SIZE = 50 * 1024 * 1024  # 50 MB
+    TRIM_TO_RATIO = 0.67  # Trim to 67% when max exceeded
+    ERR_AGE_WEIGHT = 10  # ERR entries age 10x slower
+
+    # Compression for archived logs
+    COMPRESS_ARCHIVES = True
+    ARCHIVE_DAYS_TO_KEEP = 30
+
+    def __init__(self, app_name: str = 'rmbloat',
+                 log_dir: Path | None = None,
+                 session_id: str = ""):
+        """Initialize the structured logger.
+
+        Args:
+            app_name: Application name for log directory
+            log_dir: Optional override for log directory
+            session_id: Optional session identifier for log correlation
+        """
+        self.app_name = app_name
+        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._setup_paths(log_dir)
+
+        self.stats = {
+            'entries_written': 0,
+            'last_trim': datetime.now()
+        }
+
+    @staticmethod
+    def _chmod_private(path: Path, mode: int) -> None:
+        """Tighten ``path`` permissions, ignoring filesystems that refuse it."""
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+    def _setup_paths(self, log_dir: Path | None) -> None:
+        """Set up private log directory and file paths."""
+        try:
+            if log_dir:
+                self.log_dir = Path(log_dir) / self.app_name
+            else:
+                self.log_dir = default_log_dir(self.app_name)
+
+            # Logs (and archives) contain media paths and ffmpeg output,
+            # so only the owning user may traverse the directory.
+            self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._chmod_private(self.log_dir, 0o700)
+
+            # Single log file (JSON Lines format)
+            self.log_file = self.log_dir / "events.jsonl"
+            if self.log_file.exists():
+                self._chmod_private(self.log_file, 0o600)
+
+            self.archive_dir = self.log_dir / "archive"
+            self.archive_dir.mkdir(exist_ok=True, mode=0o700)
+            self._chmod_private(self.archive_dir, 0o700)
+
+        except Exception as e:
+            print(f"FATAL: Cannot setup log directory: {e}", file=sys.stderr)
+            # Fallback to current directory
+            self.log_dir = Path.cwd()
+            self.log_file = Path("events.jsonl")
+            self.archive_dir = Path("archive")
+
+    def _get_caller_info(self, depth: int = 3) -> tuple:
+        """Get caller information from stack frame."""
+        try:
+            frame = inspect.currentframe()
+            for _ in range(depth):
+                if frame:
+                    frame = frame.f_back
+
+            if frame:
+                return (
+                    Path(frame.f_code.co_filename).name,
+                    frame.f_lineno,
+                    frame.f_code.co_name,
+                    frame.f_code.co_filename.split('/')[-2] if '/' in frame.f_code.co_filename else ""
+                )
+        except Exception:
+            pass
+        return ("unknown", 0, "unknown", "")
+
+    def _create_log_entry(self, level: str, *args,
+                         data: dict | None = None,
+                         **kwargs) -> LogEntry:
+        """Create a structured log entry."""
+        file, line, function, module = self._get_caller_info()
+        timestamp = datetime.now().isoformat()
+        message = " ".join(str(arg) for arg in args)
+
+        return LogEntry(
+            timestamp=timestamp,
+            level=level,
+            file=file,
+            line=line,
+            function=function,
+            module=module,
+            message=message,
+            data=data or {},
+            session_id=self.session_id,
+            _raw=message
+        )
+
+    def _append_log(self, entry: LogEntry) -> None:
+        """Append entry to log file, trimming if necessary.
+
+        Args:
+            entry: Log entry to append
+        """
+        if self.log_file.exists() and self.log_file.stat().st_size >= self.MAX_LOG_SIZE:
+            self._trim_log_file()
+
+        try:
+            fd = os.open(self.log_file,
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'a', encoding='utf-8') as f:
+                json_line = json.dumps(entry.to_dict())
+                f.write(json_line + '\n')
+
+            self.stats['entries_written'] += 1
+
+        except Exception as e:
+            print(f"LOG WRITE ERROR: {e}", file=sys.stderr)
+
+    def _atomic_rewrite(self, lines) -> None:
+        """Replace the log file with ``lines`` without truncating it in place.
+
+        Survivors are written to a 0600 sibling created by
+        ``mkstemp`` and then installed with ``os.replace()``,
+        exactly like the config, state and probe-cache stores.
+        A crash or a full disk therefore leaves the existing
+        history untouched instead of reducing it to a prefix.
+        """
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(self.log_file.parent),
+            prefix=f'.{self.log_file.name}.',
+            suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._chmod_private(temp_path, 0o600)
+            os.replace(temp_path, self.log_file)
+        except BaseException:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
+    def _trim_log_file(self) -> None:
+        """Trim log file by removing oldest entries (by weighted
+        age) until size < MAX_LOG_SIZE * TRIM_TO_RATIO.
+        ERR entries have age/ERR_AGE_WEIGHT, so they're kept longer.
+        """
+        if not self.log_file.exists():
+            return
+
+        try:
+            # Read all entries.
+            # Malformed lines are preserved verbatim: a corrupt or externally edited line
+            # is not a reason to delete data that the operator may still want to inspect.
+            entries = []  # (timestamp, level, line, line_size)
+            unparsed = []  # lines kept exactly as found
+            with open(self.log_file, encoding='utf-8') as f:
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            timestamp = datetime.fromisoformat(data['timestamp'])
+                            level = data.get('level', 'OK')
+                            line_size = len(line.encode('utf-8'))
+                            entries.append((timestamp, level, line, line_size))
+                        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                            unparsed.append(line)
+
+            # Calculate effective age for each entry.
+            # ``index`` preserves the original file order
+            # for stable tie-breaking between equal ages.
+            now = datetime.now()
+            weighted = []  # (effective_age_seconds, timestamp, index, line, line_size)
+            for index, (timestamp, level, line, line_size) in enumerate(entries):
+                age_seconds = (now - timestamp).total_seconds()
+                # ERRs age slower (kept longer)
+                effective_age = age_seconds / self.ERR_AGE_WEIGHT if level == 'ERR' else age_seconds
+                weighted.append((effective_age, timestamp, index, line, line_size))
+
+            # Sort by effective age (newest first = lowest age).
+            # This order is only used to decide which entries survive;
+            # it is NOT chronological because ERR entries age slower than everything else.
+            weighted.sort(key=lambda item: item[0])
+
+            # Target: keep newest entries until total size <= MAX_LOG_SIZE * TRIM_TO_RATIO
+            target_size = int(self.MAX_LOG_SIZE * self.TRIM_TO_RATIO)
+            kept = []  # (timestamp, index, line)
+            total_size = 0
+
+            for _age, timestamp, index, line, line_size in weighted:
+                if total_size + line_size <= target_size:
+                    kept.append((timestamp, index, line))
+                    total_size += line_size
+
+            # Write back in real chronological order.
+            # The weighted order used to choose survivors is not chronological,
+            # while get_window_of_entries()/refresh_window()
+            # read the file expecting chronological order.
+            kept.sort(key=lambda item: (item[0], item[1]))
+            self._atomic_rewrite(
+                [line for _timestamp, _index, line in kept] + unparsed)
+
+            self.stats['last_trim'] = datetime.now()
+
+        except Exception as e:
+            print(f"TRIM ERROR: {e}", file=sys.stderr)
+
+
+    def event(self, *args, data: dict | None = None, **kwargs) -> None:
+        """Log an event (successful operation)."""
+        entry = self._create_log_entry("OK", *args, data=data, **kwargs)
+        self._append_log(entry)
+
+    def error(self, *args, data: dict | None = None, **kwargs) -> None:
+        """Log an error."""
+        entry = self._create_log_entry("ERR", *args, data=data, **kwargs)
+        self._append_log(entry)
+
+        # Also print to stderr for immediate visibility
+        print(f"ERROR: {args[0] if args else ''}", file=sys.stderr)
+        if data:
+            print(f"  Data: {json.dumps(data, indent=2)[:200]}...", file=sys.stderr)
+
+    def info(self, *args, data: dict | None = None, **kwargs) -> None:
+        """Log informational message."""
+        entry = self._create_log_entry("MSG", *args, data=data, **kwargs)
+        self._append_log(entry)
+
+    def debug(self, *args, data: dict | None = None, **kwargs) -> None:
+        """Log debug message."""
+        entry = self._create_log_entry("DBG", *args, data=data, **kwargs)
+        self._append_log(entry)
+
+    # Backward Compatibility Aliases (for RotatingLogger API)
+
+    def lg(self, *args, **kwargs) -> None:
+        """Alias for info() - backward compatibility with RotatingLogger.
+
+        Logs an ordinary message with a 'MSG' tag.
+        Supports both simple messages and lists of strings.
+        """
+        # Handle list of strings like RotatingLogger did
+        if args and isinstance(args[0], list):
+            list_message = '\n'.join(str(item) for item in args[0])
+            args = (list_message,) + args[1:]
+
+        self.info(*args, **kwargs)
+
+    def err(self, *args, **kwargs) -> None:
+        """Alias for error() - backward compatibility with RotatingLogger.
+
+        Logs an error message with an 'ERR' tag.
+        Supports both simple messages and lists of strings.
+        """
+        # Handle list of strings like RotatingLogger did
+        if args and isinstance(args[0], list):
+            list_message = '\n'.join(str(item) for item in args[0])
+            args = (list_message,) + args[1:]
+
+        self.error(*args, **kwargs)
+
+    def put(self, message_type: str, *args, **kwargs) -> None:
+        """Alias for custom level logging - backward compatibility with RotatingLogger.
+
+        Logs a message with an arbitrary MESSAGE_TYPE tag.
+        Supports both simple messages and lists of strings.
+        """
+        # Handle list of strings like RotatingLogger did
+        if args and isinstance(args[0], list):
+            list_message = '\n'.join(str(item) for item in args[0])
+            args = (list_message,) + args[1:]
+
+        # Extract 'data' so it is not passed twice to _create_log_entry()
+        data = kwargs.pop('data', None)
+
+        entry = self._create_log_entry(str(message_type).upper(), *args,
+                                      data=data, **kwargs)
+        self._append_log(entry)
+
+    def purge_at_or_before(self, timestamp: str, level_filter: str | None = None):
+        """TUI Support: Deletes entries older than or equal to the target timestamp.
+        Allows 'cleaning up' the history screen.
+        """
+        if not self.log_file.exists():
+            return
+
+        kept = []
+        try:
+            with open(self.log_file, encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                        # Delete if timestamp matches/older AND (no filter OR level matches)
+                        if data.get('timestamp', '') <= timestamp:
+                            if level_filter is None or data.get('level') == level_filter:
+                                continue
+                        kept.append(line)
+                    except (json.JSONDecodeError, AttributeError, TypeError):
+                        # A malformed line cannot be interpreted,
+                        # so it cannot be proven old enough to delete: keep it verbatim.
+                        kept.append(line)
+
+            self._atomic_rewrite(kept)
+        except Exception as e:
+            print(f"PURGE ERROR: {e}", file=sys.stderr)
+
+    # Filtering and Search Methods
+
+    @staticmethod
+    def filter_entries(entries: list[LogEntry], pattern: str,
+                      deep: bool = False) -> tuple[list[LogEntry], set]:
+        """Filter log entries by pattern (case-insensitive).
+
+        Args:
+            entries: List of LogEntry objects to filter
+            pattern: Search pattern (case-insensitive)
+            deep: If True, also search within JSON data in messages
+
+        Returns:
+            (filtered_entries, deep_match_timestamps): Tuple of filtered list and
+            set of timestamps that matched only in deep (JSON) search
+        """
+        if not pattern:
+            return entries, set()
+
+        pattern_lower = pattern.lower()
+        filtered = []
+        deep_matches = set()
+
+        for entry in entries:
+            # Build visible text (what shows in collapsed view)
+            timestamp_short = entry.timestamp[:19]
+            level = entry.level
+            summary = entry.display_summary
+
+            # Shallow search: check visible text
+            visible_text = f"{timestamp_short} {level} {summary}".lower()
+            shallow_match = pattern_lower in visible_text
+
+            # Deep search: check JSON content if requested
+            deep_match = False
+            if deep and '{' in entry.message:
+                try:
+                    json_start = entry.message.index('{')
+                    json_str = entry.message[json_start:]
+                    deep_match = pattern_lower in json_str.lower()
+                except (ValueError, IndexError):
+                    pass
+
+            if shallow_match or deep_match:
+                filtered.append(entry)
+                if deep_match and not shallow_match:
+                    deep_matches.add(entry.timestamp)
+
+        return filtered, deep_matches
+
+    # Query Methods - Window-based for efficient incremental reads
+
+    def get_window_of_entries(self, window_size: int = 1000):
+        """Get a window of log entries (newest first).  Returns: (entries_dict, window_state)
+            entries_dict: OrderedDict keyed by timestamp
+            window_state: dict with 'file_size' and 'last_position'
+        """
+
+        entries = OrderedDict()
+        if not self.log_file.exists():
+            return entries, {'file_size': 0, 'last_position': 0}
+
+        file_size = self.log_file.stat().st_size
+
+        try:
+            with open(self.log_file, encoding='utf-8') as f:
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        try:
+                            entry_dict = json.loads(line)
+                            entry = LogEntry.from_dict(entry_dict)
+                            entries[entry.timestamp] = entry
+                        except (json.JSONDecodeError, TypeError, KeyError):
+                            pass
+        except Exception:
+            pass
+
+        if len(entries) > window_size:
+            items = list(entries.items())
+            entries = OrderedDict(items[-window_size:])
+
+        window_state = {
+            'file_size': file_size,
+            'last_position': file_size  # Next read starts here
+        }
+
+        return entries, window_state
+
+    def refresh_window(self, window, window_state, window_size: int = 1000):
+        """Refresh window with new entries from log file.
+        Returns: updated (entries_dict, window_state)
+        """
+        if not self.log_file.exists():
+            return window, window_state
+
+        current_file_size = self.log_file.stat().st_size
+        last_file_size = window_state.get('file_size', 0)
+        last_position = window_state.get('last_position', 0)
+
+        # File was trimmed (size dropped), reset and re-read
+        if current_file_size < last_file_size:
+            return self.get_window_of_entries(window_size)
+
+        if current_file_size == last_position:
+            return window, window_state
+
+        try:
+            with open(self.log_file, encoding='utf-8') as f:
+                f.seek(last_position)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        try:
+                            entry_dict = json.loads(line)
+                            entry = LogEntry.from_dict(entry_dict)
+                            window[entry.timestamp] = entry
+                        except (json.JSONDecodeError, TypeError, KeyError):
+                            pass
+
+                new_position = f.tell()
+        except Exception:
+            new_position = last_position
+
+        if len(window) > window_size:
+            items = list(window.items())
+            window = OrderedDict(items[-window_size:])
+
+        window_state = {
+            'file_size': current_file_size,
+            'last_position': new_position
+        }
+
+        return window, window_state
+
+    @property
+    def log_paths(self) -> list[str]:
+        """Return list of log file paths (for backward compatibility with -L option)."""
+        return [str(self.log_file)]
+
+
+# Alias for standard use (matches RotatingLogger pattern: Log = RotatingLogger)
+Log = StructuredLogger
+
+
+def example_usage():
+    """Example/Test of the structured logger."""
+
+    # Create logger
+    logger = StructuredLogger(
+        app_name="VideoProcessor",
+        session_id="session_12345"
+    )
+
+    print(f"Logs will be written to: {logger.log_dir}")
+    print(f"Log file: {logger.log_file}")
+
+    logger.info("Starting video processing batch")
+
+    for i in range(5):
+        if i == 2:
+            # Log an error with structured data
+            logger.error(
+                "Failed to encode video",
+                data={
+                    "filepath": f"/videos/video_{i}.mp4",
+                    "error_code": 183,
+                    "ffmpeg_output": ["Error opening input", "Invalid data"],
+                    "attempts": 3
+                }
+            )
+        else:
+            logger.event(
+                f"Successfully encoded video_{i}",
+                data={
+                    "filepath": f"/videos/video_{i}.mp4",
+                    "original_size": 1000000,
+                    "encoded_size": 500000,
+                    "reduction": "50%",
+                    "duration_seconds": 120.5
+                }
+            )
+
+    logger.info("Batch processing complete")
+
+    print("\n" + "="*60)
+    print("Recent Log Entries (window-based access):")
+    window, _ = logger.get_window_of_entries(window_size=10)
+    for _, entry in window.items():
+        print(f"{entry.timestamp} [{entry.level}] {entry.location}: {entry.message}")
+        if entry.data:
+            print(f"  Data keys: {list(entry.data.keys())}")
+
+if __name__ == "__main__":
+    example_usage()
